@@ -1,0 +1,33 @@
+import { invoke } from "@tauri-apps/api/core";
+import type { QueryResult, HistoryEntry } from "@/types/database";
+
+export async function runQuery(
+  connectionId: string,
+  database: string,
+  queryText: string,
+  skip?: number,
+  pageSize?: number,
+): Promise<QueryResult> {
+  return invoke<QueryResult>("run_query", {
+    request: { connectionId, database, queryText, skip, pageSize },
+  });
+}
+
+export async function getQueryHistory(
+  connectionId: string,
+  limit?: number,
+  offset?: number,
+): Promise<HistoryEntry[]> {
+  return invoke<HistoryEntry[]>("get_query_history", { connectionId, limit, offset });
+}
+
+export async function searchQueryHistory(
+  connectionId: string,
+  keyword: string,
+): Promise<HistoryEntry[]> {
+  return invoke<HistoryEntry[]>("search_query_history", { connectionId, keyword });
+}
+
+export async function clearQueryHistory(connectionId: string): Promise<void> {
+  return invoke("clear_query_history", { connectionId });
+}
