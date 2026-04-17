@@ -12,14 +12,41 @@ on:
         default: 'v0.1.0'
 
 jobs:
-  build-macos:
-    name: Build macOS (universal)
-    runs-on: macos-latest
+  build:
+    name: Build ${{ matrix.name }}
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            name: macOS (universal)
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            args: --target universal-apple-darwin
+          - platform: ubuntu-22.04
+            name: Linux (x86_64)
+            rust-targets: ''
+            args: ''
+          - platform: windows-latest
+            name: Windows (x86_64)
+            rust-targets: ''
+            args: ''
+    runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -35,17 +62,18 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.rust-targets }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
+          key: ${{ matrix.platform }}
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build Tauri (universal macOS bundle)
+      - name: Build Tauri bundle
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -54,4 +82,4 @@ jobs:
           releaseName: 'MongoPilot ${{ github.event.inputs.tag || github.ref_name }}'
           releaseDraft: false
           prerelease: false
-          args: --target universal-apple-darwin
+          args: ${{ matrix.args }}
