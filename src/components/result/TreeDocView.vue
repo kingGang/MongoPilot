@@ -61,6 +61,11 @@ const someChecked = computed(() =>
   && selectableKeys.value.some((k) => props.selectedKeys!.has(k)),
 );
 
+/** 转发 DocumentViewer 的 editInTab —— 写在 script 里避免 template 泛型 < 被 vue-tsc 误读 */
+function forwardEditInTab(payload: { doc: Record<string, unknown>; queryText: string }) {
+  emit("editInTab", payload);
+}
+
 function toggleRow(docIdx: number) {
   const k = docKey(docIdx);
   if (!k) return;
@@ -394,7 +399,7 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
       :documents="documents"
       :initial-index="docViewerIndex"
       :collection="collection"
-      @edit-in-tab="(payload: { doc: Record<string, unknown>; queryText: string }) => emit('editInTab', payload)"
+      @edit-in-tab="forwardEditInTab"
     />
     <n-dropdown
       trigger="manual"

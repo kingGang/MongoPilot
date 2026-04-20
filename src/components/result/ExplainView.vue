@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { NIcon, NCollapse, NCollapseItem } from "naive-ui";
+import { NIcon } from "naive-ui";
 import {
   Leaf as StageIcon,
   HelpCircleOutline as HelpIcon,

@@ -113,6 +113,11 @@ function setSelectedKeys(keys: string[]) {
   selectedKeys.value = new Set(keys);
 }
 
+/** 转发子组件的 editInTab 事件 —— 写在 script 里避免 template 里内联泛型 (<) 被 vue-tsc 误读为 HTML 标签 */
+function forwardEditInTab(payload: { doc: Record<string, unknown>; queryText: string }) {
+  emit("editInTab", payload);
+}
+
 // 搜索栏与搜索状态绑定到当前结果 tab:
 //   · 翻页 / 换结果 / 关闭当前 result tab 都会让 resultTab 变化 -> 关掉搜索栏 + 清勾选
 watch(() => props.resultTab?.id, () => {
@@ -383,7 +388,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
           :match-doc-indexes="matchDocIndexes"
           @toggle-select="toggleSelect"
           @set-selection="setSelectedKeys"
-          @edit-in-tab="(p: { doc: Record<string, unknown>; queryText: string }) => emit('editInTab', p)"
+          @edit-in-tab="forwardEditInTab"
         />
         <TableView
           v-else-if="viewMode === 'table'"
@@ -399,7 +404,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
           :active-match-doc-index="activeMatchDocIndex"
           :match-doc-indexes="matchDocIndexes"
           @set-selection="setSelectedKeys"
-          @edit-in-tab="(p: { doc: Record<string, unknown>; queryText: string }) => emit('editInTab', p)"
+          @edit-in-tab="forwardEditInTab"
         />
         <JsonTreeView v-else :documents="pagedDocuments" :row-offset="rowOffset" />
       </div>

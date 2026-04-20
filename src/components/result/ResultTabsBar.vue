@@ -7,7 +7,7 @@ import {
 } from "@vicons/ionicons5";
 import type { ResultTab } from "@/types/database";
 
-const props = defineProps<{
+defineProps<{
   resultTabs: ResultTab[];
   activeResultTabId: string | null;
 }>();

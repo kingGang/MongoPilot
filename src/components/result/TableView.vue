@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, h, ref, nextTick, watch } from "vue";
 import { NDataTable, NTooltip, NDropdown, useMessage } from "naive-ui";
-import type { DataTableColumns } from "naive-ui";
+import type { DataTableColumns, DataTableColumn } from "naive-ui";
 import { getBsonType, formatBsonCell, getValueColor } from "@/utils/bson-format";
 import { highlightKeyword } from "@/utils/text-highlight";
 import * as docApi from "@/api/document";
@@ -27,6 +27,11 @@ const emit = defineEmits<{
   setSelection: [keys: string[]];
   editInTab: [payload: { doc: Record<string, unknown>; queryText: string }];
 }>();
+
+/** 转发 DocumentViewer 的 editInTab —— 写在 script 里避免 template 泛型 < 被 vue-tsc 误读 */
+function forwardEditInTab(payload: { doc: Record<string, unknown>; queryText: string }) {
+  emit("editInTab", payload);
+}
 
 const message = useMessage();
 
@@ -195,8 +200,8 @@ const columns = computed<DataTableColumns>(() => {
   if (props.documents.length === 0) return [];
 
   // 多选列 (仅当父组件传入 docKeyFn 时启用)
-  const selectionCol: Record<string, unknown> | null = props.docKeyFn
-    ? { type: "selection", width: 36, fixed: "left" as const }
+  const selectionCol: DataTableColumn | null = props.docKeyFn
+    ? ({ type: "selection", width: 36, fixed: "left" } as DataTableColumn)
     : null;
 
   // 序号列
@@ -452,7 +457,7 @@ async function handleCtxSelect(action: string) {
       :documents="documents"
       :initial-index="docViewerIndex"
       :collection="collection"
-      @edit-in-tab="(payload: { doc: Record<string, unknown>; queryText: string }) => emit('editInTab', payload)"
+      @edit-in-tab="forwardEditInTab"
     />
     <n-dropdown
       trigger="manual"

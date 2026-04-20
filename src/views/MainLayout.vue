@@ -333,7 +333,7 @@ const historyConnectionId = computed(() => activeTab.value?.connectionId ?? null
                               :connection-id="tab.connectionId"
                               :database="tab.database"
                               :collection="tab.collection"
-                              @edit-in-tab="(p: { queryText: string }) => handleEditInNewTab(tab, p.queryText)"
+                              @edit-in-tab="(p) => handleEditInNewTab(tab, p.queryText)"
                               @page-change="(page, size) => {
                                 const rt = activeResultOf(tab);
                                 if (rt) editorStore.fetchPage(tab.id, rt.id, page, size);
@@ -402,9 +402,9 @@ const historyConnectionId = computed(() => activeTab.value?.connectionId ?? null
 
     <!-- 导出 -->
     <ExportDialog
-      v-if="(activeTab && activeTab.result) || exportCollCtx"
+      v-if="(activeTab && editorStore.activeResultTab?.result) || exportCollCtx"
       v-model:show="showExportDialog"
-      :documents="activeTab?.result?.documents ?? []"
+      :documents="editorStore.activeResultTab?.result?.documents ?? []"
       :connection-id="exportCollCtx?.connId ?? activeTab?.connectionId ?? ''"
       :database="exportCollCtx?.db ?? activeTab?.database ?? ''"
       :collection="exportCollCtx?.coll ?? activeTab?.collection ?? ''"
