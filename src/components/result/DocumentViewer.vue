@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch } from "vue";
-import { NModal, NCard, NTabs, NTabPane, NButton, NIcon, NSpace } from "naive-ui";
+import { NModal, NCard, NButton, NIcon, NSpace } from "naive-ui";
 import {
   ChevronBack as PrevIcon,
   ChevronForward as NextIcon,
@@ -142,9 +142,110 @@ const shellText = computed(() => {
   }
 });
 
-const highlightedLines = computed(() =>
-  shellText.value.split("\n").map((line) => highlightLine(line)),
-);
+const rawLines = computed(() => shellText.value.split("\n"));
+
+const highlightedLines = computed(() => rawLines.value.map((line) => highlightLine(line)));
+
+/** 可折叠块: startLine/endLine 都是 rawLines 的 0 基下标, closeChar 是结束字符 */
+interface FoldRange {
+  startLine: number;
+  endLine: number;
+  closeChar: string; // } / ] / 引号
+}
+
+/** 扫 raw 文本, 找到跨行的 {...} / [...] / "..." 作为可折叠块 */
+const foldRanges = computed<FoldRange[]>(() => {
+  const lines = rawLines.value;
+  const out: FoldRange[] = [];
+  const stack: { ch: string; line: number }[] = [];
+  let inString = false;
+  let strCh = "";
+  let strStart = -1;
+
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
+    for (let ci = 0; ci < line.length; ci++) {
+      const ch = line[ci];
+      if (inString) {
+        if (ch === "\\") { ci++; continue; }
+        if (ch === strCh) {
+          if (strStart >= 0 && strStart < li) {
+            out.push({ startLine: strStart, endLine: li, closeChar: strCh });
+          }
+          inString = false;
+          strStart = -1;
+        }
+      } else {
+        if (ch === '"' || ch === "'") {
+          inString = true;
+          strCh = ch;
+          strStart = li;
+        } else if (ch === "{" || ch === "[") {
+          stack.push({ ch, line: li });
+        } else if (ch === "}" || ch === "]") {
+          const open = stack.pop();
+          if (open && open.line < li) {
+            out.push({
+              startLine: open.line,
+              endLine: li,
+              closeChar: ch,
+            });
+          }
+        }
+      }
+    }
+  }
+  return out;
+});
+
+/** startLine -> FoldRange 的映射, 便于 O(1) 查找 */
+const foldByStart = computed(() => {
+  const m = new Map<number, FoldRange>();
+  for (const f of foldRanges.value) m.set(f.startLine, f);
+  return m;
+});
+
+/** 当前处于折叠态的起始行集合 */
+const foldedStarts = ref<Set<number>>(new Set());
+
+/** 当前被任一折叠块隐藏的行集合 (start+1 ~ end, 含 end) */
+const hiddenLines = computed(() => {
+  const s = new Set<number>();
+  for (const startLine of foldedStarts.value) {
+    const f = foldByStart.value.get(startLine);
+    if (!f) continue;
+    for (let i = f.startLine + 1; i <= f.endLine; i++) s.add(i);
+  }
+  return s;
+});
+
+function toggleFold(line: number) {
+  if (!foldByStart.value.has(line)) return;
+  const next = new Set(foldedStarts.value);
+  if (next.has(line)) next.delete(line);
+  else next.add(line);
+  foldedStarts.value = next;
+}
+
+/** 折叠时, 把起始行末尾追加 ` … <close>` 让视觉上自洽 */
+function foldSuffix(line: number): string {
+  if (!foldedStarts.value.has(line)) return "";
+  const f = foldByStart.value.get(line);
+  if (!f) return "";
+  // 尝试带上原闭合行末尾的逗号
+  const endLine = rawLines.value[f.endLine] || "";
+  const trailingComma = /,\s*$/.test(endLine) ? "," : "";
+  return `<span class="fold-ellipsis"> … </span>${escapeHtmlInline(f.closeChar)}${trailingComma}`;
+}
+
+function escapeHtmlInline(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** 在每次切换文档时重置折叠状态 */
+watch(currentDoc, () => {
+  foldedStarts.value = new Set();
+});
 
 const rawJson = computed(() => {
   if (!currentDoc.value) return "";
@@ -186,23 +287,41 @@ function editInTab() {
       @close="emit('update:show', false)"
     >
       <div class="viewer-body">
-        <n-tabs v-model:value="activeViewTab" type="line" size="small">
-          <n-tab-pane name="json" tab="{ } JSON">
-            <div class="code-area">
-              <div
-                v-for="(html, i) in highlightedLines"
-                :key="i"
-                class="code-line"
-              >
-                <span class="line-num">{{ i + 1 }}</span>
-                <span class="line-content" v-html="html || '&nbsp;'"></span>
+        <div class="tabs-header">
+          <button
+            class="tab-btn"
+            :class="{ active: activeViewTab === 'json' }"
+            @click="activeViewTab = 'json'"
+          >{ } JSON</button>
+          <button
+            class="tab-btn"
+            :class="{ active: activeViewTab === 'value' }"
+            @click="activeViewTab = 'value'"
+          >value</button>
+        </div>
+        <div class="tab-body">
+          <div v-if="activeViewTab === 'json'" class="code-area">
+            <div
+              v-for="(html, i) in highlightedLines"
+              v-show="!hiddenLines.has(i)"
+              :key="i"
+              class="code-line"
+            >
+              <div class="line-num">{{ i + 1 }}</div>
+              <div class="line-content">
+                <span
+                  v-if="foldByStart.has(i)"
+                  class="fold-toggle"
+                  :title="foldedStarts.has(i) ? '展开' : '折叠'"
+                  @click="toggleFold(i)"
+                >{{ foldedStarts.has(i) ? '▶' : '▼' }}</span>
+                <span v-else class="fold-toggle-placeholder" />
+                <span v-html="(html || '&nbsp;') + foldSuffix(i)"></span>
               </div>
             </div>
-          </n-tab-pane>
-          <n-tab-pane name="value" tab="value">
-            <pre class="raw-json">{{ rawJson }}</pre>
-          </n-tab-pane>
-        </n-tabs>
+          </div>
+          <pre v-else class="raw-json">{{ rawJson }}</pre>
+        </div>
       </div>
 
       <template #footer>
@@ -236,31 +355,69 @@ function editInTab() {
 
 <style scoped>
 .viewer-body {
-  flex: 1;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-}
-.viewer-body :deep(.n-tabs) {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-}
-.viewer-body :deep(.n-tabs-pane-wrapper) {
-  flex: 1;
+  flex: 1 1 0;
   min-height: 0;
+  min-width: 0;
+  max-width: 100%;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
-.viewer-body :deep(.n-tab-pane) {
-  height: 100%;
-  padding: 0;
+/* Naive UI v2 里内容 slot 包裹类名是 .n-card-content (单横线, 不是 __content) */
+:deep(.n-card-content) {
+  flex: 1 1 0 !important;
+  min-height: 0 !important;
+  min-width: 0 !important;
+  max-width: 100%;
+  padding: 0 !important;
+  overflow: hidden !important;
+  display: flex;
+  flex-direction: column;
+}
+.tabs-header {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid #e0e0e0;
+  padding: 0 4px;
+  background: #fafafa;
+}
+.tab-btn {
+  background: transparent;
+  border: none;
+  padding: 8px 14px;
+  margin: 0;
+  font-size: 13px;
+  color: #666;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  font-family: inherit;
+}
+.tab-btn:hover { color: #333; background: #f0f0f0; }
+.tab-btn.active {
+  color: #18a058;
+  border-bottom-color: #18a058;
+  font-weight: 500;
+}
+.tab-body {
+  /* flex 占满 viewer-body 剩余高度, 作为内部 absolute 子项的定位参考 */
+  flex: 1 1 0;
+  min-height: 0;
+  position: relative;
   overflow: hidden;
 }
 
 .code-area {
-  height: 100%;
-  overflow-y: auto;
+  /* absolute: 相对于 .tab-body (position:relative) 铺满 */
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  align-content: start;
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  /* 只纵向滚动; 横向绝不滚, 强制换行 */
   overflow-x: hidden;
+  overflow-y: auto;
   background: #fafafa;
   border: 1px solid #e8e8e8;
   border-radius: 4px;
@@ -270,36 +427,60 @@ function editInTab() {
   line-height: 1.5;
 }
 .code-line {
-  display: flex;
-  align-items: flex-start;
-  padding: 0 8px 0 0;
+  display: contents;
 }
-.code-line:hover {
+.code-line:hover .line-num,
+.code-line:hover .line-content {
   background: #f0f4f8;
 }
 .line-num {
-  flex: 0 0 auto;
-  min-width: 40px;
   padding: 0 8px;
   text-align: right;
   color: #999;
   user-select: none;
   background: #f0f0f0;
   border-right: 1px solid #e0e0e0;
-  margin-right: 8px;
 }
 .line-content {
-  flex: 1 1 auto;
+  padding: 0 12px 0 8px;
   min-width: 0;
+  max-width: 100%;
   color: #333;
+  /* 保留缩进 + 强制任意处换行 (含长 URL / 不带空格的长串) */
   white-space: pre-wrap;
-  word-break: break-word;
+  word-break: break-all;
   overflow-wrap: anywhere;
+  box-sizing: border-box;
+}
+.fold-toggle {
+  display: inline-block;
+  width: 12px;
+  font-size: 9px;
+  color: #3875d7;
+  cursor: pointer;
+  user-select: none;
+  margin-right: 2px;
+  vertical-align: middle;
+}
+.fold-toggle:hover { color: #18a058; }
+.fold-toggle-placeholder {
+  display: inline-block;
+  width: 12px;
+  margin-right: 2px;
+}
+:deep(.fold-ellipsis) {
+  color: #999;
+  font-style: italic;
+  background: #f0f0f0;
+  padding: 0 4px;
+  margin: 0 2px;
+  border-radius: 3px;
 }
 .raw-json {
   margin: 0;
   padding: 12px;
-  height: 100%;
+  position: absolute;
+  inset: 0;
   overflow: auto;
   font-family: "Fira Code", "Consolas", monospace;
   font-size: 13px;
