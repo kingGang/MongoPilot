@@ -8,6 +8,7 @@ const editorStore = useEditorStore();
 
 const activeCount = computed(() => connStore.activeIds.size);
 const tab = computed(() => editorStore.activeTab);
+const resultTab = computed(() => editorStore.activeResultTab);
 
 const connLabel = computed(() => {
   if (!tab.value) return "";
@@ -16,16 +17,18 @@ const connLabel = computed(() => {
 });
 
 const pageInfo = computed(() => {
-  if (!tab.value) return "";
-  return `Page ${tab.value.currentPage} (${tab.value.pageSize}/page)`;
+  const rt = resultTab.value;
+  if (!rt) return "";
+  return `Page ${rt.currentPage} (${rt.pageSize}/page)`;
 });
 
 const execInfo = computed(() => {
-  const r = tab.value?.result;
+  const r = resultTab.value?.result;
   if (!r) return "";
   const ms = r.executionTimeMs;
   const time = ms >= 1000 ? `${(ms / 1000).toFixed(3)}s` : `${ms}ms`;
-  return `${r.count} rows / ${r.totalCount} total | ${time}`;
+  const totalText = r.totalCount < 0 ? "…" : r.totalCount;
+  return `${r.count} rows / ${totalText} total | ${time}`;
 });
 </script>
 
@@ -43,9 +46,9 @@ const execInfo = computed(() => {
       </template>
     </div>
     <div class="status-right">
-      <span v-if="tab?.loading" class="status-item loading-text">Executing...</span>
+      <span v-if="resultTab?.loading" class="status-item loading-text">Executing...</span>
       <span v-else-if="execInfo" class="status-item">{{ execInfo }}</span>
-      <span v-if="tab" class="status-item">{{ pageInfo }}</span>
+      <span v-if="resultTab" class="status-item">{{ pageInfo }}</span>
       <span class="status-item version">MongoPilot v0.1.0</span>
     </div>
   </div>

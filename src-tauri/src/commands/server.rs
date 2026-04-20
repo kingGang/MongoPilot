@@ -123,3 +123,84 @@ pub async fn explain_query(
     serde_json::to_value(&result)
         .map_err(|e| AppError::InvalidInput(format!("序列化失败: {e}")))
 }
+
+/// 从 shell 语法 `db.coll.find({...}).sort({...}).limit(N)` 中提取集合/过滤/排序/limit,
+/// 并在同一数据库下跑 `explain` 命令 (verbosity: executionStats).
+#[tauri::command]
+pub async fn explain_shell_query(
+    mgr: State<'_, ConnectionManager>,
+    connection_id: String,
+    database: String,
+    query_text: String,
+) -> Result<serde_json::Value, AppError> {
+    use crate::query::executor::{extract_parens, parse_chained_arg, parse_json_arg};
+
+    let query = query_text.trim();
+    let query = query.strip_prefix("db.").ok_or_else(|| {
+        AppError::InvalidInput("查询必须以 db. 开头，例如 db.collection.find({})".into())
+    })?;
+
+    // 解析 `getCollection("x")` 或直接的 `collName`
+    let (collection, rest) = if let Some(rest) = query.strip_prefix("getCollection(") {
+        let gc_end = rest.find(')').ok_or_else(|| {
+            AppError::InvalidInput("getCollection() 括号不匹配".into())
+        })?;
+        let inner = &rest[..gc_end];
+        let coll = inner.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        let after = &rest[gc_end + 1..];
+        let after = after.strip_prefix('.').unwrap_or(after);
+        (coll, after)
+    } else {
+        let dot_pos = query.find('.').ok_or_else(|| {
+            AppError::InvalidInput("语法错误：缺少 .find()".into())
+        })?;
+        let coll = query[..dot_pos].to_string();
+        (coll, &query[dot_pos + 1..])
+    };
+
+    if !rest.starts_with("find(") {
+        return Err(AppError::InvalidInput(
+            "目前 Explain 仅支持 find 查询 (find / findOne 暂不支持其他)".into(),
+        ));
+    }
+
+    let filter_str = extract_parens(rest, "find")?;
+    let filter: Document = parse_json_arg(&filter_str)?;
+
+    let after_find = &rest[rest.find(')').unwrap_or(rest.len()) + 1..];
+    let projection = parse_chained_arg(after_find, ".projection(");
+    let sort = parse_chained_arg(after_find, ".sort(");
+    let skip = parse_chained_arg(after_find, ".skip(");
+    let limit = parse_chained_arg(after_find, ".limit(");
+
+    let mut explain_args = doc! {
+        "find": &collection,
+        "filter": filter,
+    };
+    if let Some(proj_str) = projection {
+        let d: Document = parse_json_arg(&proj_str)?;
+        if !d.is_empty() { explain_args.insert("projection", d); }
+    }
+    if let Some(sort_str) = sort {
+        let d: Document = parse_json_arg(&sort_str)?;
+        if !d.is_empty() { explain_args.insert("sort", d); }
+    }
+    if let Some(s) = skip.and_then(|v| v.trim().parse::<i64>().ok()) {
+        explain_args.insert("skip", s);
+    }
+    if let Some(l) = limit.and_then(|v| v.trim().parse::<i64>().ok()) {
+        explain_args.insert("limit", l);
+    }
+
+    let cmd = doc! {
+        "explain": explain_args,
+        "verbosity": "executionStats",
+    };
+
+    let client = mgr.get_client(&connection_id).await?;
+    let db = client.database(&database);
+    let result = db.run_command(cmd).await.map_err(AppError::Mongo)?;
+
+    serde_json::to_value(&result)
+        .map_err(|e| AppError::InvalidInput(format!("序列化失败: {e}")))
+}

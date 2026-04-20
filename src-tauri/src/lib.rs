@@ -67,6 +67,7 @@ pub fn run() {
             commands::collection::drop_index,
             commands::server::get_server_status,
             commands::server::explain_query,
+            commands::server::explain_shell_query,
             commands::user::list_users,
             commands::user::create_user,
             commands::user::drop_user,

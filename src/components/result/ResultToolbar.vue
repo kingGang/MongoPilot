@@ -25,6 +25,8 @@ const props = defineProps<{
   totalCount: number;
   /** 本次返回的文档数（分页计算） */
   returnedCount: number;
+  /** 已勾选文档数 */
+  selectedCount?: number;
   pageSize: number;
   currentPage: number;
   viewMode: "tree" | "table" | "json";
@@ -45,10 +47,29 @@ const emit = defineEmits<{
   toggleSearch: [];
 }>();
 
-// 分页基于 totalCount（数据库真实总数）
-const totalPages = computed(() => Math.max(1, Math.ceil(props.totalCount / props.pageSize)));
-const rangeStart = computed(() => props.totalCount === 0 ? 0 : (props.currentPage - 1) * props.pageSize + 1);
-const rangeEnd = computed(() => Math.min(props.currentPage * props.pageSize, props.totalCount));
+// totalCount === -1 表示后端异步计数还没回来
+const isPendingCount = computed(() => props.totalCount < 0);
+
+// 分页基于 totalCount（数据库真实总数）; pending 时用当前页 + 本次 returned 估算,
+// 允许 Next/Last 按钮在满一页时继续翻, 不满一页时禁用.
+const totalPages = computed(() => {
+  if (isPendingCount.value) {
+    const est = props.currentPage + (props.returnedCount >= props.pageSize ? 1 : 0);
+    return Math.max(1, est);
+  }
+  return Math.max(1, Math.ceil(props.totalCount / props.pageSize));
+});
+const rangeStart = computed(() =>
+  (isPendingCount.value ? props.returnedCount === 0 : props.totalCount === 0)
+    ? 0
+    : (props.currentPage - 1) * props.pageSize + 1,
+);
+const rangeEnd = computed(() => {
+  if (isPendingCount.value) {
+    return (props.currentPage - 1) * props.pageSize + props.returnedCount;
+  }
+  return Math.min(props.currentPage * props.pageSize, props.totalCount);
+});
 
 const execTimeDisplay = computed(() => {
   const ms = props.executionTimeMs;
@@ -83,7 +104,17 @@ function goLast() { emit("update:currentPage", totalPages.value); }
       </span>
       <span class="info-item doc-count">
         <n-icon :size="12" style="margin-right:3px"><DocsIcon /></n-icon>
-        {{ returnedCount }}<template v-if="totalCount > returnedCount"> / {{ totalCount }}</template> Docs
+        {{ returnedCount }}
+        <template v-if="isPendingCount">
+          / <span class="pending-count" title="后端正在计数...">…</span>
+        </template>
+        <template v-else-if="totalCount > returnedCount">
+          / {{ totalCount }}
+        </template>
+        Docs
+      </span>
+      <span v-if="(selectedCount ?? 0) > 0" class="info-item selected-count">
+        已选 {{ selectedCount }}
       </span>
     </div>
 
@@ -124,11 +155,16 @@ function goLast() { emit("update:currentPage", totalPages.value); }
       </n-tooltip>
       <n-tooltip trigger="hover" :delay="500">
         <template #trigger>
-          <n-button size="tiny" quaternary @click="emit('deleteSelected')">
+          <n-button
+            size="tiny"
+            quaternary
+            :disabled="(selectedCount ?? 0) === 0"
+            @click="emit('deleteSelected')"
+          >
             <template #icon><n-icon :size="14"><DeleteIcon /></n-icon></template>
           </n-button>
         </template>
-        删除
+        {{ (selectedCount ?? 0) === 0 ? "先勾选要删除的文档" : `删除 ${selectedCount} 条` }}
       </n-tooltip>
 
       <div class="toolbar-divider" />
@@ -139,6 +175,7 @@ function goLast() { emit("update:currentPage", totalPages.value); }
         :options="pageSizeOptions"
         size="tiny"
         style="width: 64px"
+        :consistent-menu-width="false"
         @update:value="emit('update:pageSize', $event)"
       />
 
@@ -274,5 +311,20 @@ function goLast() { emit("update:currentPage", totalPages.value); }
   color: #666;
   margin-left: 4px;
   white-space: nowrap;
+}
+.pending-count {
+  display: inline-block;
+  color: #999;
+  font-style: italic;
+  animation: pending-pulse 1.2s ease-in-out infinite;
+}
+.selected-count {
+  color: #3875d7;
+  font-weight: 600;
+  font-size: 11px;
+}
+@keyframes pending-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
 }
 </style>

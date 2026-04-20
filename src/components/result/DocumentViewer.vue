@@ -8,16 +8,19 @@ import {
   Create as EditIcon,
 } from "@vicons/ionicons5";
 import { getBsonType, getValueColor } from "@/utils/bson-format";
+import { buildUpdateOneQuery } from "@/utils/mongo-shell-format";
 
 const props = defineProps<{
   show: boolean;
   documents: Record<string, unknown>[];
   initialIndex: number;
+  /** 集合名 —— 传入后 Edit in new tab 会拼成 `db.<coll>.updateOne(...)` */
+  collection?: string;
 }>();
 
 const emit = defineEmits<{
   "update:show": [value: boolean];
-  editInTab: [doc: Record<string, unknown>];
+  editInTab: [payload: { doc: Record<string, unknown>; queryText: string }];
 }>();
 
 const currentIndex = ref(0);
@@ -103,33 +106,31 @@ function colorSpan(text: string, color: string): string {
   return `<span style="color:${color}">${escHtml(text)}</span>`;
 }
 
-function highlightShell(text: string): string {
-  return text.split("\n").map((line) => {
-    const parts: string[] = [];
-    const tokenRe = /ObjectId\("[0-9a-fA-F]*"\)|ISODate\("[^"]*"\)|NumberLong\("[^"]*"\)|NumberDecimal\("[^"]*"\)|"(?:[^"\\]|\\.)*"(?=\s*:)|"(?:[^"\\]|\\.)*"|(?:true|false)\b|null\b|\d+(?:\.\d+)?|[a-zA-Z_$][a-zA-Z0-9_$]*(?=\s*:)/g;
-    let last = 0;
-    let m: RegExpExecArray | null;
-    while ((m = tokenRe.exec(line)) !== null) {
-      if (m.index > last) parts.push(escHtml(line.slice(last, m.index)));
-      last = m.index + m[0].length;
-      const token = m[0];
-      if (token.startsWith("ObjectId(")) parts.push(colorSpan(token, getValueColor("ObjectId")));
-      else if (token.startsWith("ISODate(")) parts.push(colorSpan(token, getValueColor("Date")));
-      else if (token.startsWith("NumberLong(")) parts.push(colorSpan(token, getValueColor("Int64")));
-      else if (token.startsWith("NumberDecimal(")) parts.push(colorSpan(token, getValueColor("Decimal128")));
-      else if (token === "true" || token === "false") parts.push(colorSpan(token, getValueColor("Boolean")));
-      else if (token === "null") parts.push(`<span style="color:#999;font-style:italic">null</span>`);
-      else if (token.startsWith('"')) {
-        const afterToken = line.slice(last).trimStart();
-        if (afterToken.startsWith(":")) parts.push(colorSpan(token, "#e06c75"));
-        else parts.push(colorSpan(token, getValueColor("String")));
-      }
-      else if (/^\d/.test(token)) parts.push(colorSpan(token, getValueColor("Int32")));
-      else parts.push(colorSpan(token, "#e06c75")); // unquoted key
+function highlightLine(line: string): string {
+  const parts: string[] = [];
+  const tokenRe = /ObjectId\("[0-9a-fA-F]*"\)|ISODate\("[^"]*"\)|NumberLong\("[^"]*"\)|NumberDecimal\("[^"]*"\)|"(?:[^"\\]|\\.)*"(?=\s*:)|"(?:[^"\\]|\\.)*"|(?:true|false)\b|null\b|\d+(?:\.\d+)?|[a-zA-Z_$][a-zA-Z0-9_$]*(?=\s*:)/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = tokenRe.exec(line)) !== null) {
+    if (m.index > last) parts.push(escHtml(line.slice(last, m.index)));
+    last = m.index + m[0].length;
+    const token = m[0];
+    if (token.startsWith("ObjectId(")) parts.push(colorSpan(token, getValueColor("ObjectId")));
+    else if (token.startsWith("ISODate(")) parts.push(colorSpan(token, getValueColor("Date")));
+    else if (token.startsWith("NumberLong(")) parts.push(colorSpan(token, getValueColor("Int64")));
+    else if (token.startsWith("NumberDecimal(")) parts.push(colorSpan(token, getValueColor("Decimal128")));
+    else if (token === "true" || token === "false") parts.push(colorSpan(token, getValueColor("Boolean")));
+    else if (token === "null") parts.push(`<span style="color:#999;font-style:italic">null</span>`);
+    else if (token.startsWith('"')) {
+      const afterToken = line.slice(last).trimStart();
+      if (afterToken.startsWith(":")) parts.push(colorSpan(token, "#e06c75"));
+      else parts.push(colorSpan(token, getValueColor("String")));
     }
-    if (last < line.length) parts.push(escHtml(line.slice(last)));
-    return parts.join("");
-  }).join("\n");
+    else if (/^\d/.test(token)) parts.push(colorSpan(token, getValueColor("Int32")));
+    else parts.push(colorSpan(token, "#e06c75")); // unquoted key
+  }
+  if (last < line.length) parts.push(escHtml(line.slice(last)));
+  return parts.join("");
 }
 
 const shellText = computed(() => {
@@ -141,8 +142,9 @@ const shellText = computed(() => {
   }
 });
 
-const highlightedHtml = computed(() => highlightShell(shellText.value));
-const lineCount = computed(() => shellText.value.split("\n").length);
+const highlightedLines = computed(() =>
+  shellText.value.split("\n").map((line) => highlightLine(line)),
+);
 
 const rawJson = computed(() => {
   if (!currentDoc.value) return "";
@@ -166,7 +168,10 @@ function reload() {
   setTimeout(() => { currentIndex.value = idx; }, 0);
 }
 function editInTab() {
-  if (currentDoc.value) emit("editInTab", currentDoc.value);
+  if (!currentDoc.value) return;
+  const coll = props.collection || "<collection>";
+  const queryText = buildUpdateOneQuery(coll, currentDoc.value);
+  emit("editInTab", { doc: currentDoc.value, queryText });
   emit("update:show", false);
 }
 </script>
@@ -174,7 +179,7 @@ function editInTab() {
 <template>
   <n-modal :show="props.show" @update:show="emit('update:show', $event)">
     <n-card
-      style="width: 750px; height: 80vh; display: flex; flex-direction: column"
+      style="width: min(1100px, 92vw); height: 82vh; display: flex; flex-direction: column"
       :title="title"
       :bordered="false"
       closable
@@ -184,10 +189,14 @@ function editInTab() {
         <n-tabs v-model:value="activeViewTab" type="line" size="small">
           <n-tab-pane name="json" tab="{ } JSON">
             <div class="code-area">
-              <div class="line-numbers">
-                <div v-for="n in lineCount" :key="n" class="line-num">{{ n }}</div>
+              <div
+                v-for="(html, i) in highlightedLines"
+                :key="i"
+                class="code-line"
+              >
+                <span class="line-num">{{ i + 1 }}</span>
+                <span class="line-content" v-html="html || '&nbsp;'"></span>
               </div>
-              <pre class="code-content" v-html="highlightedHtml"></pre>
             </div>
           </n-tab-pane>
           <n-tab-pane name="value" tab="value">
@@ -249,39 +258,43 @@ function editInTab() {
 }
 
 .code-area {
-  display: flex;
   height: 100%;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   background: #fafafa;
   border: 1px solid #e8e8e8;
   border-radius: 4px;
-}
-.line-numbers {
   padding: 8px 0;
-  background: #f0f0f0;
-  border-right: 1px solid #e0e0e0;
-  user-select: none;
-  min-width: 40px;
-  flex-shrink: 0;
+  font-family: "Fira Code", "Consolas", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.code-line {
+  display: flex;
+  align-items: flex-start;
+  padding: 0 8px 0 0;
+}
+.code-line:hover {
+  background: #f0f4f8;
 }
 .line-num {
+  flex: 0 0 auto;
+  min-width: 40px;
   padding: 0 8px;
   text-align: right;
-  font-family: "Fira Code", "Consolas", monospace;
-  font-size: 13px;
-  line-height: 1.5;
   color: #999;
+  user-select: none;
+  background: #f0f0f0;
+  border-right: 1px solid #e0e0e0;
+  margin-right: 8px;
 }
-.code-content {
-  flex: 1;
-  margin: 0;
-  padding: 8px 12px;
-  font-family: "Fira Code", "Consolas", monospace;
-  font-size: 13px;
-  line-height: 1.5;
+.line-content {
+  flex: 1 1 auto;
+  min-width: 0;
   color: #333;
-  overflow: auto;
-  white-space: pre;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 .raw-json {
   margin: 0;
@@ -295,6 +308,9 @@ function editInTab() {
   background: #fafafa;
   border: 1px solid #e8e8e8;
   border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .viewer-footer {

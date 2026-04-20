@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, h, ref, nextTick } from "vue";
+import { computed, h, ref, nextTick, watch } from "vue";
 import { NDataTable, NTooltip, NDropdown, useMessage } from "naive-ui";
 import type { DataTableColumns } from "naive-ui";
 import { getBsonType, formatBsonCell, getValueColor } from "@/utils/bson-format";
+import { highlightKeyword } from "@/utils/text-highlight";
 import * as docApi from "@/api/document";
 import ValueDetail from "./ValueDetail.vue";
 import DocumentViewer from "./DocumentViewer.vue";
@@ -13,10 +14,18 @@ const props = defineProps<{
   collection: string;
   documents: Record<string, unknown>[];
   rowOffset?: number;
+  docKeyFn?: (doc: Record<string, unknown>) => string | null;
+  selectedKeys?: Set<string>;
+  searchKeyword?: string;
+  matchCase?: boolean;
+  activeMatchDocIndex?: number;
+  matchDocIndexes?: number[];
 }>();
 
 const emit = defineEmits<{
   updated: [];
+  setSelection: [keys: string[]];
+  editInTab: [payload: { doc: Record<string, unknown>; queryText: string }];
 }>();
 
 const message = useMessage();
@@ -185,6 +194,11 @@ function objectPreview(val: unknown): string {
 const columns = computed<DataTableColumns>(() => {
   if (props.documents.length === 0) return [];
 
+  // 多选列 (仅当父组件传入 docKeyFn 时启用)
+  const selectionCol: Record<string, unknown> | null = props.docKeyFn
+    ? { type: "selection", width: 36, fixed: "left" as const }
+    : null;
+
   // 序号列
   const indexCol = {
     title: "#",
@@ -224,12 +238,15 @@ const columns = computed<DataTableColumns>(() => {
           : formatBsonCell(val);
         return h("span", {
           style: "color:#c678dd;cursor:pointer",
+          innerHTML: props.searchKeyword
+            ? highlightKeyword(oid, props.searchKeyword, !!props.matchCase)
+            : oid,
           onClick: (e: MouseEvent) => {
             e.stopPropagation();
             docViewerIndex.value = rowIdx;
             showDocViewer.value = true;
           },
-        }, oid);
+        });
       }
 
       // 内联编辑状态
@@ -292,6 +309,16 @@ const columns = computed<DataTableColumns>(() => {
 
       // 简单类型：双击进入编辑
       const text = formatBsonCell(val);
+      if (props.searchKeyword) {
+        return h("span", {
+          style: `${color ? `color:${color};` : ""}cursor:text`,
+          innerHTML: highlightKeyword(text, props.searchKeyword, !!props.matchCase),
+          onDblclick: (e: MouseEvent) => {
+            e.stopPropagation();
+            startEdit(rowIdx, key, val, type);
+          },
+        });
+      }
       return h("span", {
         style: `${color ? `color:${color};` : ""}cursor:text`,
         onDblclick: (e: MouseEvent) => {
@@ -301,7 +328,7 @@ const columns = computed<DataTableColumns>(() => {
       }, text);
     },
   }));
-  return [indexCol, ...dataCols];
+  return selectionCol ? [selectionCol, indexCol, ...dataCols] : [indexCol, ...dataCols];
 });
 
 const scrollX = computed(() => {
@@ -310,7 +337,21 @@ const scrollX = computed(() => {
   return Math.max(total, 800);
 });
 
-const data = computed(() => props.documents.map((doc, i) => ({ ...doc, __rowKey: i })));
+/** 每行的 row-key = docSelectionKey 返回值 (父组件指定), 失败时 fallback 为行号 */
+const data = computed(() => props.documents.map((doc, i) => {
+  const sel = props.docKeyFn ? props.docKeyFn(doc) : null;
+  return { ...doc, __rowKey: i, __selectKey: sel ?? `idx:${i}` };
+}));
+
+// NDataTable v-model:checked-row-keys 的绑定值, 跟父组件 selectedKeys 同步
+const checkedRowKeys = computed<string[]>(() => {
+  if (!props.selectedKeys) return [];
+  return Array.from(props.selectedKeys);
+});
+
+function onCheckedChange(keys: (string | number)[]) {
+  emit("setSelection", keys.map(String));
+}
 
 // ---- 右键菜单 ----
 const showCtxMenu = ref(false);
@@ -324,17 +365,36 @@ const ctxMenuOptions = [
   { label: "查看文档", key: "view-doc" },
 ];
 
+const matchSet = computed(() => new Set(props.matchDocIndexes ?? []));
+
 function rowProps(row: Record<string, unknown>) {
+  const rowIdx = row.__rowKey as number;
+  const classes: string[] = [];
+  if (props.searchKeyword && matchSet.value.has(rowIdx)) classes.push("row-matched");
+  if (props.searchKeyword && rowIdx === props.activeMatchDocIndex) classes.push("row-active-match");
   return {
+    class: classes.join(" ") || undefined,
+    "data-doc-index": String(rowIdx),
     onContextmenu: (e: MouseEvent) => {
       e.preventDefault();
-      ctxRowIdx.value = row.__rowKey as number;
+      ctxRowIdx.value = rowIdx;
       ctxMenuX.value = e.clientX;
       ctxMenuY.value = e.clientY;
       showCtxMenu.value = true;
     },
   };
 }
+
+// 当前匹配变化 -> 滚到对应行 (vdom 更新后)
+watch(
+  () => props.activeMatchDocIndex,
+  async (idx) => {
+    if (idx === undefined || idx < 0) return;
+    await nextTick();
+    const el = document.querySelector<HTMLElement>(`tr[data-doc-index="${idx}"]`);
+    el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  },
+);
 
 async function handleCtxSelect(action: string) {
   showCtxMenu.value = false;
@@ -365,14 +425,16 @@ async function handleCtxSelect(action: string) {
     <n-data-table
       :columns="columns"
       :data="data"
-      :row-key="(row: any) => row.__rowKey"
+      :row-key="(row: any) => row.__selectKey"
       :row-props="(row: any) => rowProps(row)"
       :scroll-x="scrollX"
+      :checked-row-keys="checkedRowKeys"
       flex-height
       style="height: 100%"
       striped
       virtual-scroll
       size="small"
+      @update:checked-row-keys="onCheckedChange"
     />
     <ValueDetail
       v-model:show="showDetail"
@@ -389,6 +451,8 @@ async function handleCtxSelect(action: string) {
       v-model:show="showDocViewer"
       :documents="documents"
       :initial-index="docViewerIndex"
+      :collection="collection"
+      @edit-in-tab="(payload: { doc: Record<string, unknown>; queryText: string }) => emit('editInTab', payload)"
     />
     <n-dropdown
       trigger="manual"
@@ -406,6 +470,23 @@ async function handleCtxSelect(action: string) {
 <style scoped>
 .table-view {
   height: 100%;
+}
+.table-view :deep(tr.row-matched > td) {
+  background: #fff8e1 !important;
+}
+.table-view :deep(tr.row-active-match > td) {
+  background: #ffe082 !important;
+  box-shadow: inset 3px 0 0 #ff8f00;
+}
+.table-view :deep(mark.kw-hit) {
+  background: #fff59d;
+  color: inherit;
+  padding: 0 1px;
+  border-radius: 2px;
+}
+.table-view :deep(tr.row-active-match mark.kw-hit) {
+  background: #ff8f00;
+  color: #fff;
 }
 .table-view :deep(.inline-editing) {
   border-left: 3px solid #e8a838;

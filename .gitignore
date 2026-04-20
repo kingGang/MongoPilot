@@ -35,3 +35,5 @@ docs/
 
 # Claude AI local config (never commit)
 .claude/
+CLAUDE.md
+src-tauri/icons/gen_icons.py

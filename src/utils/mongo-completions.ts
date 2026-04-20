@@ -908,7 +908,7 @@ export function registerMongoCompletions(arg?: CompletionOptions | (() => string
   const opts: CompletionOptions =
     typeof arg === "function" ? { collectionNames: arg } : (arg ?? {});
 
-  monaco.languages.registerCompletionItemProvider("javascript", {
+  const provider: monaco.languages.CompletionItemProvider = {
     triggerCharacters: [".", "$", '"', "'", "{"],
     provideCompletionItems: async (model, position) => {
       const textUntilPosition = model.getValueInRange({
@@ -1135,5 +1135,9 @@ export function registerMongoCompletions(arg?: CompletionOptions | (() => string
 
       return { suggestions };
     },
-  });
+  };
+
+  // 同时挂到 javascript 和 mongosh 两个 language id
+  monaco.languages.registerCompletionItemProvider("javascript", provider);
+  monaco.languages.registerCompletionItemProvider("mongosh", provider);
 }

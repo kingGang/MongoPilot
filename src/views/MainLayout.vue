@@ -14,6 +14,7 @@ import EditorTabs from "@/components/editor/EditorTabs.vue";
 import MonacoEditor from "@/components/editor/MonacoEditor.vue";
 import QueryToolbar from "@/components/editor/QueryToolbar.vue";
 import ResultPanel from "@/components/result/ResultPanel.vue";
+import ResultTabsBar from "@/components/result/ResultTabsBar.vue";
 import QueryHistory from "@/components/editor/QueryHistory.vue";
 import AiChatPanel from "@/components/ai/AiChatPanel.vue";
 import AiSettings from "@/components/ai/AiSettings.vue";
@@ -25,6 +26,7 @@ import { useEditorStore } from "@/stores/editor";
 import { useDatabaseStore } from "@/stores/database";
 import { createDefaultConnection } from "@/types/connection";
 import type { ConnectionConfig } from "@/types/connection";
+import type { EditorTab } from "@/types/database";
 
 const connStore = useConnectionStore();
 const editorStore = useEditorStore();
@@ -43,6 +45,21 @@ const sidebarCollapsed = ref(false);
 const activeTab = computed(() => editorStore.activeTab);
 const aiConnectionId = computed(() => activeTab.value?.connectionId ?? undefined);
 const aiDatabase = computed(() => activeTab.value?.database ?? undefined);
+
+/** 模板里取指定 editor tab 当前激活的结果 tab */
+function activeResultOf(tab: EditorTab) {
+  return tab.resultTabs.find((r) => r.id === tab.activeResultTabId) ?? null;
+}
+
+/** JSON Viewer 点 Edit in new tab → 开一个新编辑器 tab, 放入 updateOne 脚本 */
+function handleEditInNewTab(sourceTab: EditorTab, queryText: string) {
+  const newTabId = editorStore.createTab(
+    sourceTab.connectionId,
+    sourceTab.database,
+    sourceTab.collection,
+  );
+  editorStore.setContent(newTabId, queryText);
+}
 
 // 连接操作
 function handleCreateConnection() {
@@ -91,6 +108,21 @@ function handleEditorRun(statement: string) {
   }
 }
 
+/** 工具栏 Explain 按钮 → 直接用当前 tab 的整段内容跑 explain */
+function handleExplain() {
+  const tab = editorStore.activeTab;
+  if (!tab) {
+    msg.warning("请先打开一个查询页");
+    return;
+  }
+  const text = (tab.content || "").trim();
+  if (!text) {
+    msg.warning("编辑器内容为空");
+    return;
+  }
+  editorStore.executeExplain(tab.id, text);
+}
+
 function handleHistorySelect(queryText: string) {
   if (editorStore.activeTab) {
     editorStore.setContent(editorStore.activeTab.id, queryText);
@@ -116,12 +148,16 @@ function handleImport() {
 function handleImported(count: number) {
   msg.success(`导入成功，共 ${count} 条文档`);
   const tab = editorStore.activeTab;
-  if (tab) editorStore.executeQuery(tab.id, tab.lastQueryText || tab.content);
+  if (!tab) return;
+  const active = editorStore.activeResultTab;
+  const replayText = active?.queryText || tab.content;
+  editorStore.executeQuery(tab.id, replayText);
 }
 
 function handleExport() {
   const tab = editorStore.activeTab;
-  if (!tab || !tab.result || tab.result.documents.length === 0) {
+  const active = editorStore.activeResultTab;
+  if (!tab || !active?.result || active.result.documents.length === 0) {
     msg.warning("没有可导出的数据，请先执行查询");
     return;
   }
@@ -183,6 +219,9 @@ function handleMenuAction(key: string) {
       break;
     case "run.execute":
       handleRunQuery();
+      break;
+    case "run.explain":
+      handleExplain();
       break;
     case "tools.ai":
       showAiPanel.value = true;
@@ -248,14 +287,19 @@ const historyConnectionId = computed(() => activeTab.value?.connectionId ?? null
                   <template #default="{ tab }">
                     <div class="editor-area">
                       <QueryToolbar
-                        :loading="tab.loading"
-                        :execution-time="tab.result?.executionTimeMs"
-                        :result-count="tab.result?.count"
+                        :loading="activeResultOf(tab)?.loading ?? false"
+                        :execution-time="activeResultOf(tab)?.result?.executionTimeMs"
+                        :result-count="activeResultOf(tab)?.result?.count"
                         :connection-id="tab.connectionId"
                         :database="tab.database"
                         :collection="tab.collection"
-                        :error="tab.error"
+                        :error="activeResultOf(tab)?.error ?? null"
                         @run="handleRunQuery"
+                        @stop="() => {
+                          const rt = activeResultOf(tab);
+                          if (rt) editorStore.stopResultTab(tab.id, rt.id);
+                        }"
+                        @explain="handleExplain"
                         @import="handleImport"
                         @export="handleExport"
                         @history="showHistory = true"
@@ -272,19 +316,32 @@ const historyConnectionId = computed(() => activeTab.value?.connectionId ?? null
                           </div>
                         </template>
                         <template #2>
-                          <div class="split-pane">
+                          <div class="split-pane result-pane">
+                            <ResultTabsBar
+                              v-if="tab.resultTabs.length > 0"
+                              :result-tabs="tab.resultTabs"
+                              :active-result-tab-id="tab.activeResultTabId"
+                              @activate="editorStore.activateResultTab(tab.id, $event)"
+                              @close="editorStore.closeResultTab(tab.id, $event)"
+                              @close-left="editorStore.closeLeftOfResultTab(tab.id, $event)"
+                              @close-right="editorStore.closeRightOfResultTab(tab.id, $event)"
+                              @close-others="editorStore.closeOtherResultTabs(tab.id, $event)"
+                              @close-all="editorStore.closeAllResultTabs(tab.id)"
+                            />
                             <ResultPanel
-                              :result="tab.result"
-                              :error="tab.error"
-                              :loading="tab.loading"
+                              :result-tab="activeResultOf(tab)"
                               :connection-id="tab.connectionId"
                               :database="tab.database"
                               :collection="tab.collection"
-                              :query-text="tab.content"
-                              :current-page="tab.currentPage"
-                              :page-size="tab.pageSize"
-                              @page-change="(page, size) => editorStore.fetchPage(tab.id, page, size)"
-                              @refresh="editorStore.executeQuery(tab.id, tab.lastQueryText)"
+                              @edit-in-tab="(p: { queryText: string }) => handleEditInNewTab(tab, p.queryText)"
+                              @page-change="(page, size) => {
+                                const rt = activeResultOf(tab);
+                                if (rt) editorStore.fetchPage(tab.id, rt.id, page, size);
+                              }"
+                              @refresh="() => {
+                                const rt = activeResultOf(tab);
+                                editorStore.executeQuery(tab.id, rt?.queryText || tab.content);
+                              }"
                             />
                           </div>
                         </template>
@@ -403,5 +460,9 @@ const historyConnectionId = computed(() => activeTab.value?.connectionId ?? null
 .split-pane {
   height: 100%;
   overflow: hidden;
+}
+.split-pane.result-pane {
+  display: flex;
+  flex-direction: column;
 }
 </style>

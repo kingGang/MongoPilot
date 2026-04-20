@@ -1,14 +1,102 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
-import { NTooltip, NDropdown, useMessage } from "naive-ui";
+import { ref, computed, watch, nextTick } from "vue";
+import { NTooltip, NDropdown, NCheckbox, useMessage } from "naive-ui";
 import { getBsonType, formatTreeValue, extractIdDisplay, getTypeColor, getValueColor } from "@/utils/bson-format";
+import { highlightKeyword } from "@/utils/text-highlight";
 import ValueDetail from "./ValueDetail.vue";
 import DocumentViewer from "./DocumentViewer.vue";
 
 const props = defineProps<{
   documents: Record<string, unknown>[];
   rowOffset?: number;
+  collection?: string;
+  docKeyFn?: (doc: Record<string, unknown>) => string | null;
+  selectedKeys?: Set<string>;
+  searchKeyword?: string;
+  matchCase?: boolean;
+  activeMatchDocIndex?: number;
+  matchDocIndexes?: number[];
 }>();
+
+const emit = defineEmits<{
+  toggleSelect: [key: string];
+  setSelection: [keys: string[]];
+  editInTab: [payload: { doc: Record<string, unknown>; queryText: string }];
+}>();
+
+// 是否启用多选 UI (需父组件提供 key 函数)
+const selectionEnabled = computed(() => !!props.docKeyFn);
+
+function docKey(docIdx: number): string | null {
+  const fn = props.docKeyFn;
+  if (!fn) return null;
+  const doc = props.documents[docIdx];
+  return doc ? fn(doc) : null;
+}
+
+function isRowChecked(docIdx: number): boolean {
+  if (!props.selectedKeys) return false;
+  const k = docKey(docIdx);
+  return k !== null && props.selectedKeys.has(k);
+}
+
+// 全选状态: 仅统计有合法 id 的文档
+const selectableKeys = computed<string[]>(() => {
+  if (!props.docKeyFn) return [];
+  const out: string[] = [];
+  for (const d of props.documents) {
+    const k = props.docKeyFn(d);
+    if (k) out.push(k);
+  }
+  return out;
+});
+const allChecked = computed(() =>
+  selectableKeys.value.length > 0
+  && props.selectedKeys
+  && selectableKeys.value.every((k) => props.selectedKeys!.has(k)),
+);
+const someChecked = computed(() =>
+  !allChecked.value
+  && !!props.selectedKeys
+  && selectableKeys.value.some((k) => props.selectedKeys!.has(k)),
+);
+
+function toggleRow(docIdx: number) {
+  const k = docKey(docIdx);
+  if (!k) return;
+  emit("toggleSelect", k);
+}
+
+function toggleAll() {
+  if (allChecked.value) emit("setSelection", []);
+  else emit("setSelection", selectableKeys.value);
+}
+
+// ---- 搜索高亮 ----
+const matchSet = computed(() => new Set(props.matchDocIndexes ?? []));
+
+function hl(text: string): string {
+  if (!props.searchKeyword) return text;
+  return highlightKeyword(text, props.searchKeyword, !!props.matchCase);
+}
+
+// 发现 activeMatchDocIndex 改变 -> 自动展开该文档并滚动到可视区
+watch(
+  () => props.activeMatchDocIndex,
+  async (docIdx) => {
+    if (docIdx === undefined || docIdx < 0) return;
+    // 展开该文档, 方便看到内部哪一行匹配
+    const docPath = `doc:${docIdx}`;
+    if (!expanded.value.has(docPath)) {
+      const next = new Set(expanded.value);
+      next.add(docPath);
+      expanded.value = next;
+    }
+    await nextTick();
+    const el = document.querySelector<HTMLElement>(`tr[data-doc-index="${docIdx}"]`);
+    el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  },
+);
 
 const expanded = ref<Set<string>>(new Set());
 const selectedPath = ref<string | null>(null);
@@ -210,6 +298,15 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
     <table class="doc-table">
       <thead>
         <tr>
+          <th v-if="selectionEnabled" class="col-check">
+            <n-checkbox
+              :checked="!!allChecked"
+              :indeterminate="someChecked"
+              :disabled="selectableKeys.length === 0"
+              @update:checked="toggleAll"
+              @click.stop
+            />
+          </th>
           <th class="col-key">Key</th>
           <th class="col-value">Value</th>
           <th class="col-type">Type</th>
@@ -220,19 +317,30 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
           v-for="(row, rowIdx) in flatRows"
           :key="row.path"
           class="doc-row"
+          :data-doc-index="row.isDocRoot ? row.docIndex : undefined"
           :class="{
             expandable: row.expandable,
             'doc-root': row.isDocRoot,
             'row-even': rowIdx % 2 === 0,
             'row-selected': selectedPath === row.path,
+            'row-matched': searchKeyword && row.isDocRoot && matchSet.has(row.docIndex),
+            'row-active-match': searchKeyword && row.isDocRoot && row.docIndex === activeMatchDocIndex,
           }"
           @click="selectRow(row.path); row.expandable && toggle(row.path)"
           @contextmenu="handleCtxMenu($event, row)"
         >
+          <td v-if="selectionEnabled" class="col-check">
+            <n-checkbox
+              v-if="row.isDocRoot && docKey(row.docIndex) !== null"
+              :checked="isRowChecked(row.docIndex)"
+              @update:checked="toggleRow(row.docIndex)"
+              @click.stop
+            />
+          </td>
           <td class="col-key" :style="{ paddingLeft: `${row.depth * 18 + 6}px` }">
             <span v-if="row.expandable" class="toggle-icon">{{ isExpanded(row.path) ? '▼' : '▶' }}</span>
             <span v-else class="toggle-placeholder" />
-            <span class="key-name">{{ row.key }}</span>
+            <span class="key-name" v-html="hl(row.key)" />
           </td>
           <td class="col-value">
             <!-- 文档根行或 _id 字段：点击打开文档查看器 -->
@@ -240,14 +348,16 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
               <span
                 class="clickable-value"
                 @click.stop="openDocViewer(row.docIndex, $event)"
-              >{{ row.displayValue }}</span>
+                v-html="hl(row.displayValue)"
+              />
             </template>
             <template v-else-if="row.key === '_id'">
               <span
                 class="clickable-value"
                 style="color:#c678dd"
                 @click.stop="openDocViewer(row.docIndex >= 0 ? row.docIndex : 0, $event)"
-              >{{ row.displayValue }}</span>
+                v-html="hl(row.displayValue)"
+              />
             </template>
             <!-- Object/Array 字段：hover 预览，点击弹详情 -->
             <template v-else-if="row.isObjectField">
@@ -256,12 +366,17 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
                   <span
                     class="clickable-value"
                     @click.stop="openDetail(row.key, row.value, $event)"
-                  >{{ row.displayValue }}</span>
+                    v-html="hl(row.displayValue)"
+                  />
                 </template>
                 <pre class="tooltip-preview">{{ objectPreview(row.value, row.type) }}</pre>
               </n-tooltip>
             </template>
-            <span v-else :style="{ color: getValueColor(row.type) }">{{ row.displayValue }}</span>
+            <span
+              v-else
+              :style="{ color: getValueColor(row.type) }"
+              v-html="hl(row.displayValue)"
+            />
           </td>
           <td class="col-type">
             <span :style="{ color: getTypeColor(row.type) }">{{ row.type }}</span>
@@ -278,6 +393,8 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
       v-model:show="showDocViewer"
       :documents="documents"
       :initial-index="docViewerIndex"
+      :collection="collection"
+      @edit-in-tab="(payload: { doc: Record<string, unknown>; queryText: string }) => emit('editInTab', payload)"
     />
     <n-dropdown
       trigger="manual"
@@ -303,6 +420,14 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
 .doc-table {
   min-width: 100%;
   border-collapse: collapse;
+}
+.col-check {
+  width: 32px;
+  padding: 4px 4px;
+  text-align: center;
+}
+.col-check :deep(.n-checkbox) {
+  vertical-align: middle;
 }
 thead {
   position: sticky;
@@ -340,6 +465,25 @@ th {
 .doc-row.row-selected .toggle-icon,
 .doc-row.row-selected span {
   color: #fff !important;
+}
+
+/* 搜索命中高亮 */
+.doc-row.row-matched.doc-root {
+  background: #fff8e1;
+}
+.doc-row.row-active-match.doc-root {
+  background: #ffe082 !important;
+  box-shadow: inset 3px 0 0 #ff8f00;
+}
+:deep(mark.kw-hit) {
+  background: #fff59d;
+  color: inherit;
+  padding: 0 1px;
+  border-radius: 2px;
+}
+.doc-row.row-active-match :deep(mark.kw-hit) {
+  background: #ff8f00;
+  color: #fff;
 }
 
 td {
