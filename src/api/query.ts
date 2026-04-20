@@ -7,9 +7,10 @@ export async function runQuery(
   queryText: string,
   skip?: number,
   pageSize?: number,
+  queryId?: string,
 ): Promise<QueryResult> {
   return invoke<QueryResult>("run_query", {
-    request: { connectionId, database, queryText, skip, pageSize },
+    request: { connectionId, database, queryText, skip, pageSize, queryId },
   });
 }
 

@@ -10,9 +10,24 @@ pub struct QueryResult {
     pub documents: Vec<Document>,
     /// 本次返回的文档数
     pub count: i64,
-    /// 匹配条件的总文档数（不受 limit 限制）
+    /// 匹配条件的总文档数（不受 limit 限制）。值为 -1 表示后端正在异步计数，
+    /// 前端应等待 `query:count-ready` 事件到达后再显示精确总数。
     pub total_count: i64,
     pub execution_time_ms: i64,
+    /// 非 None 时表示调用方需要在后台补算 total_count（过滤非空时的延迟 count）。
+    /// 不序列化到前端。
+    #[serde(skip)]
+    pub pending_count: Option<PendingCount>,
+}
+
+/// 延迟计数任务的上下文：`run_query` 拿到后会 spawn 一个 tokio task
+/// 调用 `count_documents` 并通过 Tauri 事件推回前端。
+#[derive(Debug, Clone)]
+pub struct PendingCount {
+    pub collection_name: String,
+    pub filter: Document,
+    /// 用户原始 `.limit(N)`，用于 UI 侧 `min(count, limit)` 的效果计算。
+    pub user_limit: Option<i64>,
 }
 
 /// 分页参数
@@ -69,7 +84,7 @@ pub async fn execute_shell_query(
             .unwrap_or_default();
         let count = users.len() as i64;
         let elapsed = start.elapsed().as_millis() as i64;
-        return Ok(QueryResult { documents: users, count, total_count: count, execution_time_ms: elapsed });
+        return Ok(QueryResult { documents: users, count, total_count: count, execution_time_ms: elapsed, pending_count: None });
     }
 
     if query.starts_with("getRole(") {
@@ -95,7 +110,7 @@ pub async fn execute_shell_query(
             .unwrap_or_default();
         let count = roles.len() as i64;
         let elapsed = start.elapsed().as_millis() as i64;
-        return Ok(QueryResult { documents: roles, count, total_count: count, execution_time_ms: elapsed });
+        return Ok(QueryResult { documents: roles, count, total_count: count, execution_time_ms: elapsed, pending_count: None });
     }
 
     if query.starts_with("getUsers(") {
@@ -105,7 +120,7 @@ pub async fn execute_shell_query(
             .unwrap_or_default();
         let count = users.len() as i64;
         let elapsed = start.elapsed().as_millis() as i64;
-        return Ok(QueryResult { documents: users, count, total_count: count, execution_time_ms: elapsed });
+        return Ok(QueryResult { documents: users, count, total_count: count, execution_time_ms: elapsed, pending_count: None });
     }
 
     if query.starts_with("getRoles(") {
@@ -127,7 +142,7 @@ pub async fn execute_shell_query(
             .unwrap_or_default();
         let count = roles.len() as i64;
         let elapsed = start.elapsed().as_millis() as i64;
-        return Ok(QueryResult { documents: roles, count, total_count: count, execution_time_ms: elapsed });
+        return Ok(QueryResult { documents: roles, count, total_count: count, execution_time_ms: elapsed, pending_count: None });
     }
 
     if query.starts_with("dropUser(") {
@@ -136,7 +151,7 @@ pub async fn execute_shell_query(
         db.run_command(doc! { "dropUser": username }).await.map_err(AppError::Mongo)?;
         let result_doc = doc! { "ok": 1, "dropped": username };
         let elapsed = start.elapsed().as_millis() as i64;
-        return Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: elapsed });
+        return Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: elapsed, pending_count: None });
     }
 
     if query.starts_with("createUser(") {
@@ -151,7 +166,7 @@ pub async fn execute_shell_query(
         db.run_command(cmd).await.map_err(AppError::Mongo)?;
         let result_doc = doc! { "ok": 1, "user": user_doc.get_str("user").unwrap_or("") };
         let elapsed = start.elapsed().as_millis() as i64;
-        return Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: elapsed });
+        return Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: elapsed, pending_count: None });
     }
 
     // 支持 db.getCollection("name.with.dots").method() 和 db.collName.method()
@@ -237,16 +252,35 @@ async fn execute_find(
         if !d.is_empty() { sort_doc = Some(d); }
     }
 
-    // 查询总数（与 find 使用相同的 filter）
-    let total_count = collection
-        .count_documents(filter.clone())
-        .await
-        .map_err(AppError::Mongo)? as i64;
+    // 计数策略：
+    //  · 空 filter → 走 O(1) 的 estimated_document_count (读集合元数据)
+    //  · 非空 filter → 设 -1 哨兵, 让 run_query 在后台异步 count_documents
+    // 这样大集合 find 不再被前置的精确 count 卡几秒.
+    let (total_count, pending_count) = if filter.is_empty() {
+        let c = collection
+            .estimated_document_count()
+            .await
+            .map_err(AppError::Mongo)? as i64;
+        (c, None)
+    } else {
+        (
+            -1_i64,
+            Some(PendingCount {
+                collection_name: collection.name().to_string(),
+                filter: filter.clone(),
+                user_limit,
+            }),
+        )
+    };
 
-    // 计算有效总数（考虑用户 limit）
-    let effective_total = match user_limit {
-        Some(ul) => std::cmp::min(total_count, ul),
-        None => total_count,
+    // 计算有效总数（考虑用户 limit）。pending 时保留 -1.
+    let effective_total = if total_count < 0 {
+        -1
+    } else {
+        match user_limit {
+            Some(ul) => std::cmp::min(total_count, ul),
+            None => total_count,
+        }
     };
 
     let mut find = collection.find(filter);
@@ -284,7 +318,7 @@ async fn execute_find(
     }
 
     let count = docs.len() as i64;
-    Ok(QueryResult { documents: docs, count, total_count: effective_total, execution_time_ms: 0 })
+    Ok(QueryResult { documents: docs, count, total_count: effective_total, execution_time_ms: 0, pending_count })
 }
 
 async fn execute_find_one(
@@ -297,8 +331,8 @@ async fn execute_find_one(
     let result = collection.find_one(filter).await.map_err(AppError::Mongo)?;
 
     match result {
-        Some(doc) => Ok(QueryResult { documents: vec![doc], count: 1, total_count: 1, execution_time_ms: 0 }),
-        None => Ok(QueryResult { documents: vec![], count: 0, total_count: 0, execution_time_ms: 0 }),
+        Some(doc) => Ok(QueryResult { documents: vec![doc], count: 1, total_count: 1, execution_time_ms: 0, pending_count: None }),
+        None => Ok(QueryResult { documents: vec![], count: 0, total_count: 0, execution_time_ms: 0, pending_count: None }),
     }
 }
 
@@ -312,7 +346,7 @@ async fn execute_count(
     let count = collection.count_documents(filter).await.map_err(AppError::Mongo)? as i64;
 
     let result_doc = doc! { "count": count };
-    Ok(QueryResult { documents: vec![result_doc], count, total_count: count, execution_time_ms: 0 })
+    Ok(QueryResult { documents: vec![result_doc], count, total_count: count, execution_time_ms: 0, pending_count: None })
 }
 
 async fn execute_aggregate(
@@ -354,7 +388,7 @@ async fn execute_aggregate(
     }
 
     let count = docs.len() as i64;
-    Ok(QueryResult { documents: docs, count, total_count, execution_time_ms: 0 })
+    Ok(QueryResult { documents: docs, count, total_count, execution_time_ms: 0, pending_count: None })
 }
 
 // ---- distinct ----
@@ -378,7 +412,7 @@ async fn execute_distinct(
         doc! { "_index": i as i64, "value": v.clone() }
     }).collect();
     let count = docs.len() as i64;
-    Ok(QueryResult { documents: docs, count, total_count: count, execution_time_ms: 0 })
+    Ok(QueryResult { documents: docs, count, total_count: count, execution_time_ms: 0, pending_count: None })
 }
 
 // ---- insertOne / insertMany ----
@@ -392,7 +426,7 @@ async fn execute_insert_one(
     let result = collection.insert_one(doc_to_insert).await.map_err(AppError::Mongo)?;
     let id = result.inserted_id;
     let result_doc = doc! { "acknowledged": true, "insertedId": id };
-    Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: 0 })
+    Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: 0, pending_count: None })
 }
 
 async fn execute_insert_many(
@@ -408,7 +442,7 @@ async fn execute_insert_many(
     let result = collection.insert_many(docs).await.map_err(AppError::Mongo)?;
     let ids: Vec<mongodb::bson::Bson> = result.inserted_ids.values().cloned().collect();
     let result_doc = doc! { "acknowledged": true, "insertedCount": count, "insertedIds": ids };
-    Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: 0 })
+    Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: 0, pending_count: None })
 }
 
 // ---- updateOne / updateMany ----
@@ -432,7 +466,7 @@ async fn execute_update(
         let r = collection.update_one(filter, update).await.map_err(AppError::Mongo)?;
         doc! { "acknowledged": true, "matchedCount": r.matched_count as i64, "modifiedCount": r.modified_count as i64 }
     };
-    Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: 0 })
+    Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: 0, pending_count: None })
 }
 
 // ---- deleteOne / deleteMany ----
@@ -452,7 +486,7 @@ async fn execute_delete(
         collection.delete_one(filter).await.map_err(AppError::Mongo)?.deleted_count
     };
     let result_doc = doc! { "acknowledged": true, "deletedCount": deleted as i64 };
-    Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: 0 })
+    Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: 0, pending_count: None })
 }
 
 // ---- replaceOne ----
@@ -467,7 +501,7 @@ async fn execute_replace_one(
     let replacement: Document = parse_json_arg(&replacement_str)?;
     let r = collection.replace_one(filter, replacement).await.map_err(AppError::Mongo)?;
     let result_doc = doc! { "acknowledged": true, "matchedCount": r.matched_count as i64, "modifiedCount": r.modified_count as i64 };
-    Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: 0 })
+    Ok(QueryResult { documents: vec![result_doc], count: 1, total_count: 1, execution_time_ms: 0, pending_count: None })
 }
 
 /// 拆分函数参数中的两个顶层对象参数 (filter, update/replacement)
@@ -637,6 +671,15 @@ fn try_match_shell_type(chars: &[char], pos: usize, len: usize) -> Option<(Strin
     // NumberInt(42) → 直接输出数字
     if remaining.starts_with("NumberInt(") {
         let paren_start = pos + 10;
+        if let Some((arg, end)) = extract_paren_arg(chars, paren_start, len) {
+            let val = arg.trim().trim_matches(|c| c == '"' || c == '\'');
+            return Some((val.to_string(), end - pos));
+        }
+    }
+
+    // Double("3.4") / Double(3.4) → 直接输出数字 (serde_json 会当成 f64 解析)
+    if remaining.starts_with("Double(") {
+        let paren_start = pos + 7;
         if let Some((arg, end)) = extract_paren_arg(chars, paren_start, len) {
             let val = arg.trim().trim_matches(|c| c == '"' || c == '\'');
             return Some((val.to_string(), end - pos));
@@ -843,5 +886,27 @@ mod tests {
         let result = convert_shell_types(r#"{n: NumberInt(42)}"#);
         assert!(result.contains("42"));
         assert!(!result.contains("NumberInt"));
+    }
+
+    #[test]
+    fn convert_double_quoted() {
+        let result = convert_shell_types(r#"{n: Double("3.4")}"#);
+        assert!(result.contains("3.4"));
+        assert!(!result.contains("Double"));
+    }
+
+    #[test]
+    fn convert_double_unquoted() {
+        let result = convert_shell_types(r#"{n: Double(3.4)}"#);
+        assert!(result.contains("3.4"));
+        assert!(!result.contains("Double"));
+    }
+
+    #[test]
+    fn parse_double_in_set() {
+        let doc = parse_json_arg(r#"{count: Double("3.4")}"#).unwrap();
+        let v = doc.get("count").unwrap();
+        // 解析后应是 f64
+        assert!(v.as_f64().is_some());
     }
 }

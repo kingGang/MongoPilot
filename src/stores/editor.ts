@@ -1,14 +1,25 @@
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
-import type { EditorTab } from "@/types/database";
+import type { EditorTab, ResultTab, ResultTabKind } from "@/types/database";
 import * as queryApi from "@/api/query";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useConnectionStore } from "@/stores/connection";
+
+const MAX_RESULT_TABS = 10;
 
 export const useEditorStore = defineStore("editor", () => {
   const tabs = ref<EditorTab[]>([]);
   const activeTabId = ref<string | null>(null);
 
   const activeTab = computed(() => tabs.value.find((t) => t.id === activeTabId.value) ?? null);
+
+  /** 当前编辑器 tab 激活的结果 tab */
+  const activeResultTab = computed<ResultTab | null>(() => {
+    const t = activeTab.value;
+    if (!t) return null;
+    return t.resultTabs.find((r) => r.id === t.activeResultTabId) ?? null;
+  });
 
   function getHostLabel(connectionId: string): string {
     try {
@@ -42,12 +53,8 @@ export const useEditorStore = defineStore("editor", () => {
       database,
       collection: collection || "",
       content: "",
-      result: null,
-      error: null,
-      loading: false,
-      lastQueryText: "",
-      currentPage: 1,
-      pageSize: 50,
+      resultTabs: [],
+      activeResultTabId: null,
     };
     tabs.value.push(tab);
     activeTabId.value = id;
@@ -68,53 +75,226 @@ export const useEditorStore = defineStore("editor", () => {
     if (tab) tab.content = content;
   }
 
-  /** 执行查询（首次或新查询，从第 1 页开始） */
-  async function executeQuery(id: string, queryText?: string) {
-    const tab = tabs.value.find((t) => t.id === id);
+  // ---- 结果 tab 管理 ----
+  function buildResultTitle(kind: ResultTabKind, existing: ResultTab[]): string {
+    const base = kind === "find" ? "Find" : "Explain";
+    const same = existing.filter((r) => r.kind === kind).length;
+    return same === 0 ? base : `${base} (${same + 1})`;
+  }
+
+  function newResultTab(kind: ResultTabKind, queryText: string, existing: ResultTab[]): ResultTab {
+    return {
+      id: crypto.randomUUID(),
+      kind,
+      title: buildResultTitle(kind, existing),
+      queryText,
+      result: null,
+      explainResult: null,
+      error: null,
+      loading: true,
+      currentQueryId: null,
+      currentPage: 1,
+      pageSize: 50,
+      createdAt: Date.now(),
+      aborted: false,
+    };
+  }
+
+  /** 新增 result tab 并 set active; 超过上限就淘汰最早那个 */
+  function pushResultTab(editorTab: EditorTab, rt: ResultTab) {
+    editorTab.resultTabs.push(rt);
+    while (editorTab.resultTabs.length > MAX_RESULT_TABS) {
+      const removed = editorTab.resultTabs.shift();
+      if (removed && editorTab.activeResultTabId === removed.id) {
+        editorTab.activeResultTabId = editorTab.resultTabs[0]?.id ?? null;
+      }
+    }
+    editorTab.activeResultTabId = rt.id;
+  }
+
+  function activateResultTab(editorTabId: string, resultTabId: string) {
+    const tab = tabs.value.find((t) => t.id === editorTabId);
+    if (tab && tab.resultTabs.some((r) => r.id === resultTabId)) {
+      tab.activeResultTabId = resultTabId;
+    }
+  }
+
+  function closeResultTab(editorTabId: string, resultTabId: string) {
+    const tab = tabs.value.find((t) => t.id === editorTabId);
+    if (!tab) return;
+    const idx = tab.resultTabs.findIndex((r) => r.id === resultTabId);
+    if (idx === -1) return;
+    tab.resultTabs.splice(idx, 1);
+    if (tab.activeResultTabId === resultTabId) {
+      const nextIdx = Math.min(idx, tab.resultTabs.length - 1);
+      tab.activeResultTabId = nextIdx >= 0 ? tab.resultTabs[nextIdx].id : null;
+    }
+  }
+
+  function closeOtherResultTabs(editorTabId: string, keepId: string) {
+    const tab = tabs.value.find((t) => t.id === editorTabId);
+    if (!tab) return;
+    tab.resultTabs = tab.resultTabs.filter((r) => r.id === keepId);
+    tab.activeResultTabId = tab.resultTabs[0]?.id ?? null;
+  }
+
+  function closeLeftOfResultTab(editorTabId: string, resultTabId: string) {
+    const tab = tabs.value.find((t) => t.id === editorTabId);
+    if (!tab) return;
+    const idx = tab.resultTabs.findIndex((r) => r.id === resultTabId);
+    if (idx <= 0) return;
+    tab.resultTabs.splice(0, idx);
+    tab.activeResultTabId = resultTabId;
+  }
+
+  function closeRightOfResultTab(editorTabId: string, resultTabId: string) {
+    const tab = tabs.value.find((t) => t.id === editorTabId);
+    if (!tab) return;
+    const idx = tab.resultTabs.findIndex((r) => r.id === resultTabId);
+    if (idx < 0) return;
+    tab.resultTabs.splice(idx + 1);
+    tab.activeResultTabId = resultTabId;
+  }
+
+  function closeAllResultTabs(editorTabId: string) {
+    const tab = tabs.value.find((t) => t.id === editorTabId);
+    if (!tab) return;
+    tab.resultTabs = [];
+    tab.activeResultTabId = null;
+  }
+
+  // ---- 执行查询 ----
+  /** push 一个新结果 tab 并返回它在 reactive 数组里的代理引用 */
+  function spawnResultTab(
+    tab: EditorTab,
+    kind: ResultTabKind,
+    queryText: string,
+  ): ResultTab | null {
+    const draft = newResultTab(kind, queryText, tab.resultTabs);
+    draft.currentQueryId = crypto.randomUUID();
+    pushResultTab(tab, draft);
+    // 关键: push 后从数组里按 id 捞回 reactive 代理, 直接改 draft 不会触发响应式更新
+    return tab.resultTabs.find((r) => r.id === draft.id) ?? null;
+  }
+
+  /** 执行查询 —— 每次追加一个 Find 结果 tab */
+  async function executeQuery(editorTabId: string, queryText?: string) {
+    const tab = tabs.value.find((t) => t.id === editorTabId);
     if (!tab) return;
     const text = (queryText ?? tab.content).trim();
     if (!text) return;
 
-    tab.loading = true;
-    tab.error = null;
-    tab.result = null;
-    tab.lastQueryText = text;
-    tab.currentPage = 1;
+    const rt = spawnResultTab(tab, "find", text);
+    if (!rt) return;
 
     try {
-      tab.result = await queryApi.runQuery(tab.connectionId, tab.database, text, 0, tab.pageSize);
-    } catch (e) {
-      tab.error = friendlyError(e);
-    } finally {
-      tab.loading = false;
-    }
-  }
-
-  /** 翻页：用同一条查询语句请求新的一页 */
-  async function fetchPage(id: string, page: number, pageSize?: number) {
-    const tab = tabs.value.find((t) => t.id === id);
-    if (!tab || !tab.lastQueryText) return;
-
-    if (pageSize !== undefined) tab.pageSize = pageSize;
-    tab.currentPage = page;
-    tab.loading = true;
-
-    const skip = (page - 1) * tab.pageSize;
-    try {
-      tab.result = await queryApi.runQuery(
+      const res = await queryApi.runQuery(
         tab.connectionId,
         tab.database,
-        tab.lastQueryText,
-        skip,
-        tab.pageSize,
+        text,
+        0,
+        rt.pageSize,
+        rt.currentQueryId ?? undefined,
       );
-      tab.error = null;
+      if (rt.aborted) return;
+      rt.result = res;
     } catch (e) {
-      tab.error = friendlyError(e);
+      if (rt.aborted) return;
+      rt.error = friendlyError(e);
     } finally {
-      tab.loading = false;
+      if (!rt.aborted) rt.loading = false;
     }
   }
+
+  /** Explain —— 每次追加一个 Explain 结果 tab */
+  async function executeExplain(editorTabId: string, queryText?: string) {
+    const tab = tabs.value.find((t) => t.id === editorTabId);
+    if (!tab) return;
+    const text = (queryText ?? tab.content).trim();
+    if (!text) return;
+
+    const rt = spawnResultTab(tab, "explain", text);
+    if (!rt) return;
+
+    try {
+      const res = await invoke<Record<string, unknown>>("explain_shell_query", {
+        connectionId: tab.connectionId,
+        database: tab.database,
+        queryText: text,
+      });
+      if (rt.aborted) return;
+      rt.explainResult = res;
+    } catch (e) {
+      if (rt.aborted) return;
+      rt.error = friendlyError(e);
+    } finally {
+      if (!rt.aborted) rt.loading = false;
+    }
+  }
+
+  /** 翻页 —— 在指定结果 tab 上重跑查询 */
+  async function fetchPage(
+    editorTabId: string,
+    resultTabId: string,
+    page: number,
+    pageSize?: number,
+  ) {
+    const tab = tabs.value.find((t) => t.id === editorTabId);
+    // 这里 find 返回的是 Pinia 的 reactive 代理, 后续修改会触发更新
+    const rt = tab?.resultTabs.find((r) => r.id === resultTabId);
+    if (!tab || !rt || !rt.queryText) return;
+
+    if (pageSize !== undefined) rt.pageSize = pageSize;
+    rt.currentPage = page;
+    rt.loading = true;
+    rt.aborted = false;
+    rt.currentQueryId = crypto.randomUUID();
+
+    const skip = (page - 1) * rt.pageSize;
+    try {
+      const res = await queryApi.runQuery(
+        tab.connectionId,
+        tab.database,
+        rt.queryText,
+        skip,
+        rt.pageSize,
+        rt.currentQueryId,
+      );
+      if (rt.aborted) return;
+      rt.result = res;
+      rt.error = null;
+    } catch (e) {
+      if (rt.aborted) return;
+      rt.error = friendlyError(e);
+    } finally {
+      if (!rt.aborted) rt.loading = false;
+    }
+  }
+
+  /** 停止当前在途查询 (前端侧 abort —— 后端无法真正取消, 仅丢弃即将回来的结果) */
+  function stopResultTab(editorTabId: string, resultTabId: string) {
+    const tab = tabs.value.find((t) => t.id === editorTabId);
+    const rt = tab?.resultTabs.find((r) => r.id === resultTabId);
+    if (!rt || !rt.loading) return;
+    rt.aborted = true;
+    rt.loading = false;
+    rt.error = "已取消";
+  }
+
+  // 监听后端异步计数事件, 在所有 tab 的所有 result tab 中按 queryId 定位.
+  listen<{ queryId: string; totalCount: number }>("query:count-ready", (e) => {
+    const { queryId, totalCount } = e.payload;
+    if (totalCount === -2) return; // 计数失败, 保留 -1
+    for (const t of tabs.value) {
+      const rt = t.resultTabs.find((r) => r.currentQueryId === queryId);
+      if (rt && rt.result) {
+        rt.result = { ...rt.result, totalCount };
+        return;
+      }
+    }
+  }).catch(() => {
+    /* 非 Tauri 环境静默 */
+  });
 
   /** 将原始错误转为友好提示 */
   function friendlyError(e: unknown): string {
@@ -135,5 +315,23 @@ export const useEditorStore = defineStore("editor", () => {
     return s;
   }
 
-  return { tabs, activeTabId, activeTab, createTab, closeTab, setContent, executeQuery, fetchPage };
+  return {
+    tabs,
+    activeTabId,
+    activeTab,
+    activeResultTab,
+    createTab,
+    closeTab,
+    setContent,
+    executeQuery,
+    executeExplain,
+    fetchPage,
+    activateResultTab,
+    closeResultTab,
+    closeOtherResultTabs,
+    closeLeftOfResultTab,
+    closeRightOfResultTab,
+    closeAllResultTabs,
+    stopResultTab,
+  };
 });

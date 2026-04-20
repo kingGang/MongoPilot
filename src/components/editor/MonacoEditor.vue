@@ -6,6 +6,12 @@ import "monaco-editor/esm/vs/basic-languages/javascript/javascript.contribution"
 import "monaco-editor/esm/vs/language/typescript/monaco.contribution";
 import { registerMongoCompletions } from "@/utils/mongo-completions";
 import type { FieldCompletionInfo } from "@/utils/mongo-completions";
+import {
+  registerMongoLanguage,
+  registerMongoTheme,
+  MONGO_LANGUAGE_ID,
+  MONGO_THEME_LIGHT,
+} from "@/utils/mongo-language";
 import { useEditorStore } from "@/stores/editor";
 import { useDatabaseStore } from "@/stores/database";
 import * as aiApi from "@/api/ai";
@@ -63,7 +69,11 @@ monaco.languages.typescript.javascriptDefaults.setDiagnosticsOptions({
   noSyntaxValidation: true,
 });
 
-// 注册 MongoDB 自动补全（全局只注册一次）
+// 注册自定义 mongosh 语言 (Monarch tokenizer + brackets config) 和配套主题
+registerMongoLanguage();
+registerMongoTheme();
+
+// 注册 MongoDB 自动补全（全局只注册一次；对 JS 和 mongosh 两个 language id 都挂）
 registerMongoCompletions({
   collectionNames: () => {
     const tab = editorStore.activeTab;
@@ -281,7 +291,7 @@ function relaxJsonForValidation(text: string): string {
   //    ObjectId("..."), ISODate("..."), NumberLong("..."), NumberDecimal("..."),
   //    UUID("..."), BinData(...), Timestamp(...), new Date("..."), RegExp(...)
   let result = text.replace(
-    /(?:new\s+)?(?:ObjectId|ISODate|UUID|NumberLong|NumberInt|NumberDecimal|BinData|Timestamp|Date|RegExp)\s*\([^)]*\)/g,
+    /(?:new\s+)?(?:ObjectId|ISODate|UUID|NumberLong|NumberInt|NumberDecimal|Double|BinData|Timestamp|Date|RegExp)\s*\([^)]*\)/g,
     (m) => JSON.stringify(m),
   );
   // 正则字面量 /pattern/flags
@@ -515,9 +525,11 @@ function lintContent() {
         if (/^["'][^"']*["']$/.test(arg.argText)) continue;
 
         // 尝试解析 {} 或 [] 参数
+        // argText 可能是多个逗号分隔的参数 (如 updateOne(filter, update)),
+        // 所以用 [argText] 当 JSON 数组解析, 兼容单参和多参.
         if (arg.argText.startsWith("{") || arg.argText.startsWith("[")) {
           try {
-            JSON.parse(relaxJsonForValidation(arg.argText));
+            JSON.parse(`[${relaxJsonForValidation(arg.argText)}]`);
           } catch (e) {
             const errMsg = String(e).replace(/^SyntaxError:\s*/, "");
             // 定位到参数在编辑器中的实际位置
@@ -611,8 +623,8 @@ onMounted(() => {
   if (!editorRef.value) return;
   editor = monaco.editor.create(editorRef.value, {
     value: props.modelValue,
-    language: props.language || "javascript",
-    theme: "vs",
+    language: props.language || MONGO_LANGUAGE_ID,
+    theme: MONGO_THEME_LIGHT,
     minimap: { enabled: false },
     fontSize: 14,
     lineNumbers: "on",
@@ -624,6 +636,18 @@ onMounted(() => {
     quickSuggestions: true,
     snippetSuggestions: "inline",
   });
+
+  // 关闭浏览器的原生拼写检查: 整个容器 + inputarea <textarea> 都设 spellcheck=false,
+  // 避免 Chrome 对 Mongo shell 代码 / 中文字符串画红色波浪线.
+  editorRef.value.setAttribute("spellcheck", "false");
+  const inputArea = editorRef.value.querySelector<HTMLTextAreaElement>(
+    "textarea.inputarea",
+  );
+  if (inputArea) {
+    inputArea.spellcheck = false;
+    inputArea.setAttribute("autocorrect", "off");
+    inputArea.setAttribute("autocapitalize", "off");
+  }
 
   statementDecorations = editor.createDecorationsCollection([]);
 
@@ -658,7 +682,7 @@ onBeforeUnmount(() => { editor?.dispose(); });
 </script>
 
 <template>
-  <div ref="editorRef" class="monaco-editor-container" />
+  <div ref="editorRef" class="monaco-editor-container" spellcheck="false" />
 </template>
 
 <style>

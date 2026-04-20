@@ -128,15 +128,19 @@ const treeData = computed<TreeNode[]>(() => {
       } else {
         const dbNodes: TreeNode[] = dbs.map((db) => {
           const dbKey = `db:${conn.id}:${db.name}`;
-          const colls = buildCollectionNodes(conn.id, db.name);
+          // 用原始集合列表判断是否在首次加载（buildCollectionNodes 尾部会追加 users 节点，
+          // 所以不能用它的返回长度来判断）
+          const rawColls = dbStore.getCollections(conn.id, db.name);
+          const isDbLoading = loadingKeys.value.has(dbKey);
+          const children = isDbLoading && rawColls.length === 0
+            ? [loadingNode(dbKey)]
+            : buildCollectionNodes(conn.id, db.name);
           return {
             key: dbKey,
             label: `${db.name} (${db.collectionCount})`,
             isLeaf: false,
             prefix: () => h(NIcon, { size: 15, color: "#e8a838" }, { default: () => h(DbIcon) }),
-            children: colls.length === 0 && loadingKeys.value.has(dbKey)
-              ? [loadingNode(dbKey)]
-              : colls,
+            children,
           };
         });
 
@@ -259,17 +263,40 @@ async function handleExpandUpdate(keys: string[]) {
         loadingKeys.value = new Set(loadingKeys.value);
       }
     }
-    // 展开数据库节点 → 加载集合列表
+    // 展开数据库节点 → 并发加载集合列表 + 该库的用户列表
     if (key.startsWith("db:")) {
       const rest = key.slice(3);
       const colonIdx = rest.indexOf(":");
       const connId = rest.slice(0, colonIdx);
       const dbName = rest.slice(colonIdx + 1);
+      const dbUsersKey = `dbusers:${connId}:${dbName}`;
+      const usersCacheKey = `${connId}:${dbName}`;
+
       loadingKeys.value.add(key);
+      // 用户列表没缓存时，提前打 users 的 loading 标记，展开 users 节点时能立刻看到转圈
+      const needLoadUsers = !usersCache.value[usersCacheKey];
+      if (needLoadUsers) loadingKeys.value.add(dbUsersKey);
       loadingKeys.value = new Set(loadingKeys.value);
-      await dbStore.fetchCollections(connId, dbName);
-      loadingKeys.value.delete(key);
-      loadingKeys.value = new Set(loadingKeys.value);
+
+      // users 后台并发拉取，不阻塞集合显示
+      if (needLoadUsers) {
+        listUsers(connId, dbName)
+          .then((users) => {
+            usersCache.value = { ...usersCache.value, [usersCacheKey]: users };
+          })
+          .catch(() => { /* ignore, 权限不足时静默失败 */ })
+          .finally(() => {
+            loadingKeys.value.delete(dbUsersKey);
+            loadingKeys.value = new Set(loadingKeys.value);
+          });
+      }
+
+      try {
+        await dbStore.fetchCollections(connId, dbName);
+      } finally {
+        loadingKeys.value.delete(key);
+        loadingKeys.value = new Set(loadingKeys.value);
+      }
     }
     // 展开连接级 users 节点 → 加载全局用户列表
     if (key.startsWith("users:")) {

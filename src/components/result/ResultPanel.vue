@@ -1,56 +1,134 @@
 <script setup lang="ts">
-import { ref, computed, onErrorCaptured, watch } from "vue";
-import { NEmpty, NAlert, NButton, NModal, NInput, useMessage, useDialog } from "naive-ui";
+import { ref, computed, onErrorCaptured, onMounted, onBeforeUnmount, watch, h } from "vue";
+import { NEmpty, NAlert, NButton, NButtonGroup, NModal, NInput, useMessage, useDialog } from "naive-ui";
 import ResultToolbar from "./ResultToolbar.vue";
 import TreeDocView from "./TreeDocView.vue";
 import TableView from "./TableView.vue";
 import JsonTreeView from "./JsonTreeView.vue";
+import ExplainView from "./ExplainView.vue";
 import ExportDialog from "./ExportDialog.vue";
-import type { QueryResult } from "@/types/database";
+import type { ResultTab } from "@/types/database";
 import * as docApi from "@/api/document";
 
 const props = defineProps<{
-  result: QueryResult | null;
-  error: string | null;
-  loading: boolean;
+  resultTab: ResultTab | null;
   connectionId: string;
   database: string;
   collection: string;
-  queryText?: string;
-  currentPage: number;
-  pageSize: number;
 }>();
 
 const emit = defineEmits<{
   refresh: [];
   pageChange: [page: number, pageSize: number];
+  editInTab: [payload: { doc: Record<string, unknown>; queryText: string }];
 }>();
 
 const viewMode = ref<"tree" | "table" | "json">("tree");
 const renderError = ref<string | null>(null);
 
-const totalCount = computed(() => props.result?.totalCount ?? props.result?.count ?? 0);
-const returnedCount = computed(() => props.result?.documents.length ?? 0);
-const rowOffset = computed(() => (props.currentPage - 1) * props.pageSize);
+// 从 resultTab 派生所有字段
+const result = computed(() => props.resultTab?.result ?? null);
+const explainResult = computed(() => props.resultTab?.explainResult ?? null);
+const error = computed(() => props.resultTab?.error ?? null);
+const loading = computed(() => props.resultTab?.loading ?? false);
+const queryText = computed(() => props.resultTab?.queryText ?? "");
+const currentPage = computed(() => props.resultTab?.currentPage ?? 1);
+const pageSize = computed(() => props.resultTab?.pageSize ?? 50);
 
-// ---- 结果搜索 ----
+const totalCount = computed(() => result.value?.totalCount ?? result.value?.count ?? 0);
+const returnedCount = computed(() => result.value?.documents.length ?? 0);
+const rowOffset = computed(() => (currentPage.value - 1) * pageSize.value);
+
+// ---- 结果搜索 (Excel 风格: 高亮 + 上下导航, 不过滤行) ----
 const showSearchBar = ref(false);
 const searchKeyword = ref("");
+const matchCase = ref(false);
+const currentMatchIdx = ref(0);
 
-const filteredDocuments = computed(() => {
-  const docs = props.result?.documents ?? [];
-  const kw = searchKeyword.value.trim().toLowerCase();
-  if (!kw) return docs;
-  return docs.filter((doc) => JSON.stringify(doc).toLowerCase().includes(kw));
+/** 匹配到关键字的文档下标列表 —— 顺序即 prev/next 的遍历顺序 */
+const matchDocIndexes = computed<number[]>(() => {
+  const kw = searchKeyword.value;
+  if (!kw) return [];
+  const docs = result.value?.documents ?? [];
+  const needle = matchCase.value ? kw : kw.toLowerCase();
+  const hits: number[] = [];
+  for (let i = 0; i < docs.length; i++) {
+    const hay = matchCase.value
+      ? JSON.stringify(docs[i])
+      : JSON.stringify(docs[i]).toLowerCase();
+    if (hay.includes(needle)) hits.push(i);
+  }
+  return hits;
 });
 
-const pagedDocuments = computed(() => filteredDocuments.value);
+/** 当前高亮的"当前匹配"文档下标 */
+const activeMatchDocIndex = computed<number>(() => {
+  const list = matchDocIndexes.value;
+  if (list.length === 0) return -1;
+  const idx = Math.min(Math.max(0, currentMatchIdx.value), list.length - 1);
+  return list[idx];
+});
 
-// 搜索关键词变化时重置
-watch(() => props.result, () => { searchKeyword.value = ""; });
+function gotoNextMatch() {
+  const n = matchDocIndexes.value.length;
+  if (n === 0) return;
+  currentMatchIdx.value = (currentMatchIdx.value + 1) % n;
+}
+function gotoPrevMatch() {
+  const n = matchDocIndexes.value.length;
+  if (n === 0) return;
+  currentMatchIdx.value = (currentMatchIdx.value - 1 + n) % n;
+}
+
+// 关键字变化时重置当前匹配游标
+watch(searchKeyword, () => { currentMatchIdx.value = 0; });
+watch(matchCase, () => { currentMatchIdx.value = 0; });
+
+// 展示文档仍然是整页 (Excel 不隐藏不匹配的行, 只做高亮 + 跳转)
+const pagedDocuments = computed(() => result.value?.documents ?? []);
+
+// ---- 多选状态 ----
+/** 从文档里取出稳定的选择 key (ObjectId / 字面量 / 其他对象的 JSON) */
+function docSelectionKey(doc: Record<string, unknown>): string | null {
+  const id = doc._id;
+  if (id === undefined || id === null) return null;
+  if (typeof id === "object") {
+    const obj = id as Record<string, unknown>;
+    if (typeof obj.$oid === "string") return `oid:${obj.$oid}`;
+    try { return `json:${JSON.stringify(id)}`; } catch { return null; }
+  }
+  return `lit:${String(id)}`;
+}
+
+const selectedKeys = ref<Set<string>>(new Set());
+
+function toggleSelect(key: string) {
+  const next = new Set(selectedKeys.value);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  selectedKeys.value = next;
+}
+
+function setSelectedKeys(keys: string[]) {
+  selectedKeys.value = new Set(keys);
+}
+
+// 搜索栏与搜索状态绑定到当前结果 tab:
+//   · 翻页 / 换结果 / 关闭当前 result tab 都会让 resultTab 变化 -> 关掉搜索栏 + 清勾选
+watch(() => props.resultTab?.id, () => {
+  showSearchBar.value = false;
+  searchKeyword.value = "";
+  currentMatchIdx.value = 0;
+  selectedKeys.value = new Set();
+});
+// 同一 result tab 内 result 换了(翻页 / refresh) —— 保留搜索栏开关,但清关键字
+watch(() => result.value, () => {
+  searchKeyword.value = "";
+  selectedKeys.value = new Set();
+});
 
 function handlePageSizeChange(size: number) { emit("pageChange", 1, size); }
-function handlePageChange(page: number) { emit("pageChange", page, props.pageSize); }
+function handlePageChange(page: number) { emit("pageChange", page, pageSize.value); }
 
 const message = useMessage();
 const dialog = useDialog();
@@ -58,7 +136,7 @@ const dialog = useDialog();
 // ---- 导出 ----
 const showExportDialog = ref(false);
 function openExportDialog() {
-  if (!props.result || props.result.documents.length === 0) {
+  if (!result.value || result.value.documents.length === 0) {
     message.warning("没有可导出的数据");
     return;
   }
@@ -70,14 +148,14 @@ function handleExported(count: number) {
 
 // ---- 复制 ----
 async function handleCopyDocs() {
-  if (!props.result || props.result.documents.length === 0) {
+  if (!result.value || result.value.documents.length === 0) {
     message.warning("没有可复制的数据");
     return;
   }
   try {
-    const text = JSON.stringify(props.result.documents, null, 2);
+    const text = JSON.stringify(result.value.documents, null, 2);
     await navigator.clipboard.writeText(text);
-    message.success(`已复制 ${props.result.documents.length} 条文档到剪贴板`);
+    message.success(`已复制 ${result.value.documents.length} 条文档到剪贴板`);
   } catch { message.error("复制失败"); }
 }
 
@@ -108,30 +186,76 @@ async function handleInsertDoc() {
   }
 }
 
-// ---- 删除文档 ----
-function handleDeleteSelected() {
-  if (!props.result || props.result.documents.length === 0 || !props.collection) return;
+// ---- 删除文档 (仅勾选项) ----
+/** 把 _id 格式化成 shell 风格展示, 用于确认弹窗里列出 */
+function formatIdForDisplay(id: unknown): string {
+  if (id === null || id === undefined) return "—";
+  if (typeof id === "object") {
+    const obj = id as Record<string, unknown>;
+    if (typeof obj.$oid === "string") return `ObjectId("${obj.$oid}")`;
+    if (typeof obj.$numberLong === "string") return `NumberLong("${obj.$numberLong}")`;
+    if (typeof obj.$date !== "undefined") return `ISODate(${JSON.stringify(obj.$date)})`;
+    try { return JSON.stringify(id); } catch { return String(id); }
+  }
+  if (typeof id === "string") return `"${id}"`;
+  return String(id);
+}
 
-  const ids = props.result.documents
+function handleDeleteSelected() {
+  if (!result.value || !props.collection) return;
+
+  const selectedDocs = result.value.documents.filter((d) => {
+    const key = docSelectionKey(d);
+    return key !== null && selectedKeys.value.has(key);
+  });
+
+  if (selectedDocs.length === 0) {
+    message.warning("请先勾选要删除的文档");
+    return;
+  }
+
+  const ids = selectedDocs
     .map((d) => d._id)
     .filter((id): id is Record<string, unknown> => id !== undefined && id !== null);
 
   if (ids.length === 0) {
-    message.warning("没有可删除的文档（缺少 _id 字段）");
+    message.warning("勾选的文档缺少 _id, 无法删除");
     return;
   }
 
+  // 弹窗里最多列出前 20 条, 超过就折叠
+  const MAX_PREVIEW = 20;
+  const previewIds = ids.slice(0, MAX_PREVIEW).map(formatIdForDisplay);
+  const overflow = ids.length - previewIds.length;
+
   dialog.warning({
     title: "确认删除",
-    content: `确定要删除当前页 ${ids.length} 条文档吗？此操作不可撤销。`,
+    content: () => h("div", [
+      h("p", { style: "margin:0 0 8px" }, `确定要删除以下 ${ids.length} 条文档吗？此操作不可撤销。`),
+      h(
+        "div",
+        {
+          style: "max-height:200px;overflow:auto;padding:8px 10px;background:#f7f7f7;"
+            + "border:1px solid #eee;border-radius:3px;font-family:'Fira Code','Consolas',monospace;"
+            + "font-size:12px;line-height:1.6",
+        },
+        [
+          ...previewIds.map((s) => h("div", { style: "word-break:break-all" }, s)),
+          overflow > 0
+            ? h("div", { style: "margin-top:4px;color:#888;font-style:italic" },
+              `… 还有 ${overflow} 条未展示`)
+            : null,
+        ],
+      ),
+    ]),
     positiveText: "删除",
     negativeText: "取消",
     onPositiveClick: async () => {
       try {
-        // 用 $in 批量删除
         const filter = { _id: { $in: ids } };
         await docApi.deleteDocuments(props.connectionId, props.database, props.collection, filter);
         message.success(`已删除 ${ids.length} 条文档`);
+        selectedKeys.value = new Set();
         emit("refresh");
       } catch (e) {
         message.error(`删除失败: ${e}`);
@@ -145,14 +269,27 @@ onErrorCaptured((err) => {
   console.error("ResultPanel child error:", err);
   return false;
 });
+
+// Ctrl+F -> 打开搜索栏
+function onKeyDown(e: KeyboardEvent) {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f" && !e.shiftKey && !e.altKey) {
+    // 只拦截 ResultPanel 作为前景视图时的全局 Ctrl+F
+    if (!result.value) return;
+    e.preventDefault();
+    showSearchBar.value = true;
+  }
+}
+onMounted(() => window.addEventListener("keydown", onKeyDown));
+onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
 </script>
 
 <template>
   <div class="result-panel">
     <ResultToolbar
-      v-if="result"
+      v-if="result && !explainResult"
       :total-count="totalCount"
       :returned-count="returnedCount"
+      :selected-count="selectedKeys.size"
       :page-size="pageSize"
       :current-page="currentPage"
       :view-mode="viewMode"
@@ -170,16 +307,52 @@ onErrorCaptured((err) => {
       @toggle-search="showSearchBar = !showSearchBar; if (!showSearchBar) searchKeyword = ''"
     />
 
-    <!-- 搜索栏 -->
+    <!-- 搜索栏 (Excel 风格) -->
     <div v-if="showSearchBar" class="search-bar">
       <n-input
         v-model:value="searchKeyword"
         size="small"
-        placeholder="搜索当前页文档..."
+        placeholder="在当前结果里搜索..."
         clearable
-        style="max-width: 400px"
+        autofocus
+        style="max-width: 320px"
+        @keydown.enter.exact.prevent="gotoNextMatch"
+        @keydown.shift.enter.prevent="gotoPrevMatch"
+        @keydown.escape="showSearchBar = false; searchKeyword = ''"
       />
-      <span class="search-count">{{ filteredDocuments.length }} / {{ result?.documents.length ?? 0 }}</span>
+      <span v-if="searchKeyword" class="search-count">
+        <template v-if="matchDocIndexes.length === 0">0 结果</template>
+        <template v-else>
+          {{ currentMatchIdx + 1 }} / {{ matchDocIndexes.length }} 行
+        </template>
+      </span>
+      <n-button-group size="tiny">
+        <n-button
+          :disabled="matchDocIndexes.length === 0"
+          quaternary
+          title="上一个 (Shift+Enter)"
+          @click="gotoPrevMatch"
+        >↑</n-button>
+        <n-button
+          :disabled="matchDocIndexes.length === 0"
+          quaternary
+          title="下一个 (Enter)"
+          @click="gotoNextMatch"
+        >↓</n-button>
+      </n-button-group>
+      <n-button
+        size="tiny"
+        quaternary
+        :type="matchCase ? 'primary' : 'default'"
+        title="区分大小写"
+        @click="matchCase = !matchCase"
+      >Aa</n-button>
+      <n-button
+        size="tiny"
+        quaternary
+        title="关闭 (Esc)"
+        @click="showSearchBar = false; searchKeyword = ''"
+      >×</n-button>
     </div>
 
     <div class="result-body">
@@ -189,6 +362,7 @@ onErrorCaptured((err) => {
       <div v-else-if="error" class="result-error">
         <n-alert type="error" title="查询错误">{{ error }}</n-alert>
       </div>
+      <ExplainView v-else-if="explainResult" :explain-result="explainResult" />
       <div v-else-if="result" class="result-content">
         <div v-if="renderError" class="result-error">
           <n-alert type="warning" title="渲染错误">
@@ -196,7 +370,21 @@ onErrorCaptured((err) => {
             <n-button size="small" style="margin-top:8px" @click="renderError = null">重试</n-button>
           </n-alert>
         </div>
-        <TreeDocView v-else-if="viewMode === 'tree'" :documents="pagedDocuments" :row-offset="rowOffset" />
+        <TreeDocView
+          v-else-if="viewMode === 'tree'"
+          :documents="pagedDocuments"
+          :row-offset="rowOffset"
+          :collection="collection"
+          :doc-key-fn="docSelectionKey"
+          :selected-keys="selectedKeys"
+          :search-keyword="searchKeyword"
+          :match-case="matchCase"
+          :active-match-doc-index="activeMatchDocIndex"
+          :match-doc-indexes="matchDocIndexes"
+          @toggle-select="toggleSelect"
+          @set-selection="setSelectedKeys"
+          @edit-in-tab="(p: { doc: Record<string, unknown>; queryText: string }) => emit('editInTab', p)"
+        />
         <TableView
           v-else-if="viewMode === 'table'"
           :documents="pagedDocuments"
@@ -204,6 +392,14 @@ onErrorCaptured((err) => {
           :connection-id="connectionId"
           :database="database"
           :collection="collection"
+          :doc-key-fn="docSelectionKey"
+          :selected-keys="selectedKeys"
+          :search-keyword="searchKeyword"
+          :match-case="matchCase"
+          :active-match-doc-index="activeMatchDocIndex"
+          :match-doc-indexes="matchDocIndexes"
+          @set-selection="setSelectedKeys"
+          @edit-in-tab="(p: { doc: Record<string, unknown>; queryText: string }) => emit('editInTab', p)"
         />
         <JsonTreeView v-else :documents="pagedDocuments" :row-offset="rowOffset" />
       </div>
@@ -244,7 +440,7 @@ onErrorCaptured((err) => {
 </template>
 
 <style scoped>
-.result-panel { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.result-panel { flex: 1 1 auto; min-height: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden; }
 .result-body { flex: 1; min-height: 0; overflow: hidden; position: relative; }
 .result-content { height: 100%; overflow: hidden; display: flex; flex-direction: column; }
 .result-content > * { flex: 1; min-height: 0; }
@@ -253,6 +449,12 @@ onErrorCaptured((err) => {
 @keyframes spin { to { transform: rotate(360deg); } }
 .result-error { padding: 16px; overflow: auto; }
 .result-empty { display: flex; align-items: center; justify-content: center; height: 100%; }
-.search-bar { display: flex; align-items: center; gap: 8px; padding: 4px 8px; background: #fffbe6; border-bottom: 1px solid #e0e0e0; flex-shrink: 0; }
-.search-count { font-size: 12px; color: #999; white-space: nowrap; }
+.search-bar { display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: #fffbe6; border-bottom: 1px solid #e0e0e0; flex-shrink: 0; }
+.search-count {
+  font-size: 12px;
+  color: #666;
+  white-space: nowrap;
+  min-width: 70px;
+  font-variant-numeric: tabular-nums;
+}
 </style>
