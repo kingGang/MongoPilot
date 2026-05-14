@@ -1,12 +1,54 @@
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
-import type { EditorTab, ResultTab, ResultTabKind } from "@/types/database";
+import type { EditorTab, ResultTab, ResultTabKind, TabExecutor } from "@/types/database";
 import * as queryApi from "@/api/query";
+import * as collApi from "@/api/collectionMgmt";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useConnectionStore } from "@/stores/connection";
 
 const MAX_RESULT_TABS = 10;
+
+/** 剥掉 //... 行注释 与 /* ... *\/ 块注释 (字符串内同样写法保留) */
+function stripJsCommentsInline(text: string): string {
+  let out = "";
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"' || c === "'") {
+      const quote = c;
+      out += c;
+      i++;
+      while (i < n) {
+        const sc = text[i];
+        out += sc;
+        i++;
+        if (sc === "\\" && i < n) {
+          out += text[i];
+          i++;
+        } else if (sc === quote) {
+          break;
+        }
+      }
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "/") {
+      i += 2;
+      while (i < n && text[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "*") {
+      i += 2;
+      while (i + 1 < n && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      i = Math.min(i + 2, n);
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
 
 export const useEditorStore = defineStore("editor", () => {
   const tabs = ref<EditorTab[]>([]);
@@ -59,6 +101,16 @@ export const useEditorStore = defineStore("editor", () => {
     tabs.value.push(tab);
     activeTabId.value = id;
     return id;
+  }
+
+  function setTabExecutor(id: string, executor: TabExecutor | undefined) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (tab) tab.executor = executor;
+  }
+
+  function setTabSkipLint(id: string, skip: boolean) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (tab) tab.skipLint = skip;
   }
 
   function closeTab(id: string) {
@@ -184,6 +236,64 @@ export const useEditorStore = defineStore("editor", () => {
     const text = (queryText ?? tab.content).trim();
     if (!text) return;
 
+    // 特殊执行通道: tab.executor 指定的命令
+    if (tab.executor?.kind === "indexInfo") {
+      const rt = spawnResultTab(tab, "find", text);
+      if (!rt) return;
+      const start = Date.now();
+      try {
+        const doc = await collApi.getIndexInfo(
+          tab.connectionId,
+          tab.database,
+          tab.executor.collection,
+          tab.executor.indexName,
+        );
+        if (rt.aborted) return;
+        rt.result = {
+          documents: [doc],
+          count: 1,
+          totalCount: 1,
+          executionTimeMs: Date.now() - start,
+        };
+      } catch (e) {
+        if (rt.aborted) return;
+        rt.error = friendlyError(e);
+      } finally {
+        if (!rt.aborted) rt.loading = false;
+      }
+      return;
+    }
+
+    if (tab.executor?.kind === "collectionIndexes") {
+      const rt = spawnResultTab(tab, "find", text);
+      if (!rt) return;
+      const start = Date.now();
+      try {
+        const docs = await collApi.getCollectionIndexes(
+          tab.connectionId,
+          tab.database,
+          tab.executor.collection,
+        );
+        if (rt.aborted) return;
+        rt.result = {
+          documents: docs,
+          count: docs.length,
+          totalCount: docs.length,
+          executionTimeMs: Date.now() - start,
+        };
+      } catch (e) {
+        if (rt.aborted) return;
+        rt.error = friendlyError(e);
+      } finally {
+        if (!rt.aborted) rt.loading = false;
+      }
+      return;
+    }
+
+    // 剥掉注释后仍没有可执行内容 (例如纯注释 tab) 直接跳过, 不触发执行器
+    const stripped = stripJsCommentsInline(text).trim();
+    if (!stripped) return;
+
     const rt = spawnResultTab(tab, "find", text);
     if (!rt) return;
 
@@ -206,12 +316,36 @@ export const useEditorStore = defineStore("editor", () => {
     }
   }
 
+  /**
+   * 用一个**外部**已经拿到的单文档结果填充一个新 result tab.
+   * 不走 run_query 执行器, 用于 "查看索引" 等场景: 后端复合命令直接返回一个 doc.
+   */
+  function pushExternalResult(
+    editorTabId: string,
+    queryText: string,
+    doc: Record<string, unknown>,
+  ) {
+    const tab = tabs.value.find((t) => t.id === editorTabId);
+    if (!tab) return;
+    const rt = spawnResultTab(tab, "find", queryText);
+    if (!rt) return;
+    rt.result = {
+      documents: [doc],
+      count: 1,
+      totalCount: 1,
+      executionTimeMs: 0,
+    };
+    rt.loading = false;
+  }
+
   /** Explain —— 每次追加一个 Explain 结果 tab */
   async function executeExplain(editorTabId: string, queryText?: string) {
     const tab = tabs.value.find((t) => t.id === editorTabId);
     if (!tab) return;
     const text = (queryText ?? tab.content).trim();
     if (!text) return;
+    const stripped = stripJsCommentsInline(text).trim();
+    if (!stripped) return;
 
     const rt = spawnResultTab(tab, "explain", text);
     if (!rt) return;
@@ -325,6 +459,9 @@ export const useEditorStore = defineStore("editor", () => {
     setContent,
     executeQuery,
     executeExplain,
+    pushExternalResult,
+    setTabExecutor,
+    setTabSkipLint,
     fetchPage,
     activateResultTab,
     closeResultTab,

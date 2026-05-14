@@ -215,6 +215,7 @@ mod tests {
             default_db: None,
             uri_options: None,
             sort_order: 0,
+            read_only: Some(0),
             created_at: "".to_string(),
             updated_at: "".to_string(),
         }

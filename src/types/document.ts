@@ -18,4 +18,5 @@ export interface CreateIndexOptions {
   sparse?: boolean;
   name?: string;
   expireAfterSeconds?: number;
+  background?: boolean;
 }

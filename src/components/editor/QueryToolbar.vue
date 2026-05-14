@@ -28,6 +28,7 @@ const emit = defineEmits<{
   stop: [];
   history: [];
   explain: [];
+  queryBuilder: [];
   import: [];
   export: [];
 }>();
@@ -129,7 +130,7 @@ const connectionLabel = computed(() => {
         <n-divider vertical style="margin: 0 2px" />
 
         <!-- Query / Explain -->
-        <n-button size="tiny" quaternary @click="emit('run')">
+        <n-button size="tiny" quaternary @click="emit('queryBuilder')">
           Query
         </n-button>
         <n-button size="tiny" quaternary @click="emit('explain')">

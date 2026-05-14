@@ -61,6 +61,11 @@ export interface ResultTab {
   aborted: boolean;
 }
 
+/** 特殊执行路径: 设置后, Run 不走通用 run_query 执行器, 改走对应后端命令. */
+export type TabExecutor =
+  | { kind: "indexInfo"; collection: string; indexName: string }
+  | { kind: "collectionIndexes"; collection: string };
+
 export interface EditorTab {
   id: string;
   title: string;
@@ -71,4 +76,8 @@ export interface EditorTab {
   /** 结果 tab 列表 (Find/Explain). 上限 10, 超限淘汰最早一个. */
   resultTabs: ResultTab[];
   activeResultTabId: string | null;
+  /** 自定义执行通道 (例如 "查看索引" tab) */
+  executor?: TabExecutor;
+  /** 跳过编辑器 lint (展示型脚本, 例如 mongosh 等效脚本) */
+  skipLint?: boolean;
 }

@@ -1,3 +1,4 @@
+use futures::future::join_all;
 use mongodb::bson::{doc, Bson, Document};
 use serde::Serialize;
 use tauri::State;
@@ -44,22 +45,31 @@ pub async fn list_databases(
         .await
         .map_err(AppError::Mongo)?;
 
-    let mut result = Vec::new();
-    for db in dbs {
-        let coll_count = client
-            .database(&db.name)
-            .list_collection_names()
-            .await
-            .map(|c| c.len() as i64)
-            .unwrap_or(0);
+    // 每个 DB 取 collection_count 是独立的 RTT, 并行发起避免 N 次串行等待.
+    let count_futs = dbs.iter().map(|db| {
+        let client = client.clone();
+        let name = db.name.clone();
+        async move {
+            client
+                .database(&name)
+                .list_collection_names()
+                .await
+                .map(|c| c.len() as i64)
+                .unwrap_or(0)
+        }
+    });
+    let counts = join_all(count_futs).await;
 
-        result.push(DatabaseInfo {
+    let result = dbs
+        .into_iter()
+        .zip(counts)
+        .map(|(db, coll_count)| DatabaseInfo {
             name: db.name,
             size_on_disk: db.size_on_disk as i64,
             empty: db.size_on_disk == 0,
             collection_count: coll_count,
-        });
-    }
+        })
+        .collect();
 
     Ok(result)
 }
@@ -77,28 +87,28 @@ pub async fn list_collections(
         .await
         .map_err(AppError::Mongo)?;
 
-    let mut result = Vec::new();
-    for name in collection_names {
-        let coll = db.collection::<Document>(&name);
-        let count = coll
-            .estimated_document_count()
-            .await
-            .unwrap_or(0) as i64;
-
-        let size = db
-            .run_command(doc! { "collStats": &name })
-            .await
-            .ok()
-            .map(|d| get_num(&d, "size"))
-            .unwrap_or(0);
-
-        result.push(CollectionInfo {
-            name,
-            collection_type: "collection".to_string(),
-            count,
-            size,
-        });
-    }
+    // 每个集合一个 collStats 命令 (count + size 都在返回里, 无需再单独 count).
+    // 并行 fan-out 避免大库 50+ 集合时几秒钟的串行等待.
+    let info_futs = collection_names.into_iter().map(|name| {
+        let db = db.clone();
+        async move {
+            let stats = db
+                .run_command(doc! { "collStats": &name })
+                .await
+                .ok();
+            let (count, size) = match stats {
+                Some(d) => (get_num(&d, "count"), get_num(&d, "size")),
+                None => (0, 0),
+            };
+            CollectionInfo {
+                name,
+                collection_type: "collection".to_string(),
+                count,
+                size,
+            }
+        }
+    });
+    let result = join_all(info_futs).await;
 
     Ok(result)
 }

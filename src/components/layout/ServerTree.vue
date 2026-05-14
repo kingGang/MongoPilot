@@ -22,8 +22,9 @@ import { listUsers } from "@/api/server";
 import type { UserInfo } from "@/types/server";
 import * as collApi from "@/api/collectionMgmt";
 import * as dbApi from "@/api/database";
+import AddIndexDialog from "@/components/data/AddIndexDialog.vue";
 import type { ConnectionConfig } from "@/types/connection";
-import type { CollectionStats } from "@/types/document";
+import type { CollectionStats, IndexInfo } from "@/types/document";
 import type { TreeOption } from "naive-ui";
 
 const emit = defineEmits<{
@@ -53,6 +54,21 @@ const ctxMenuX = ref(0);
 const ctxMenuY = ref(0);
 const ctxNodeKey = ref("");
 const ctxConnConfig = ref<ConnectionConfig | null>(null);
+
+// Add Index 弹窗
+const addIndexShow = ref(false);
+const addIndexCtx = ref<{ connId: string; database: string; collection: string }>({
+  connId: "",
+  database: "",
+  collection: "",
+});
+const addIndexEditing = ref<IndexInfo | null>(null);
+
+function openAddIndex(connId: string, database: string, collection: string, editing: IndexInfo | null = null) {
+  addIndexCtx.value = { connId, database, collection };
+  addIndexEditing.value = editing;
+  addIndexShow.value = true;
+}
 
 onMounted(() => {
   connStore.fetchConnections();
@@ -220,7 +236,8 @@ function buildCollectionNodes(connectionId: string, database: string): TreeNode[
           isLeaf: false,
           prefix: () => h(NIcon, { size: 13, color: "#e8a838" }, { default: () => h(IndexIcon) }),
           children: cachedIndexes.map((idx) => ({
-            key: `idx:${collKey}.${idx.name}`,
+            // 用 | 分隔索引名, 防止 "."" 与 db/coll 名混淆
+            key: `idx:${collKey}|${idx.name}`,
             label: `${idx.name} (${formatSize(idx.size)})`,
             isLeaf: true,
             prefix: () => h(NIcon, { size: 12, color: "#d19a66" }, { default: () => h(IndexKeyIcon) }),
@@ -364,6 +381,171 @@ async function loadIndexes(connId: string, dbName: string, collName: string) {
   }
 }
 
+/** 给 NDropdown 的菜单项做"右侧灰色快捷键"渲染 */
+function menuRow(label: string, shortcut?: string): () => VNodeChild {
+  return () => h(
+    "div",
+    {
+      style:
+        "display:flex;justify-content:space-between;align-items:center;gap:24px;min-width:220px",
+    },
+    [
+      h("span", null, label),
+      shortcut ? h("span", { style: "color:#999;font-size:12px" }, shortcut) : null,
+    ],
+  );
+}
+
+function parseIndexesKey(key: string): { connId: string; dbName: string; collName: string } {
+  // key 格式: indexes:connId:db.coll
+  const rest = key.slice("indexes:".length);
+  const colonIdx = rest.indexOf(":");
+  const connId = rest.slice(0, colonIdx);
+  const afterConn = rest.slice(colonIdx + 1);
+  const dotIdx = afterConn.indexOf(".");
+  return { connId, dbName: afterConn.slice(0, dotIdx), collName: afterConn.slice(dotIdx + 1) };
+}
+
+/**
+ * 渲染 "查看索引" 时贴进编辑器的 mongosh 等效脚本.
+ * Tab 上挂了 executor = { kind: "indexInfo", ... }, Run 时走后端 get_index_info 命令 (等效结果);
+ * 同时 tab.skipLint = true 让编辑器不对这段非 db.xxx 语法报红.
+ */
+function buildIndexInfoScript(collection: string, indexName: string): string {
+  return `function getCollectionIndexInfo(collection, indexName) {
+    const dbVersion = parseFloat(db.version());
+    const indexInfo = db.getCollection(collection).getIndexes().find(it => it.name === indexName);
+    const stats = (() => {
+        if (dbVersion >= 3.0) {
+            try{
+                return db.getCollection(collection).stats({ indexDetails: true, indexDetailsName: indexName });
+            } catch (error){
+                console.error(error);
+            }
+        }
+    })();
+
+    const indexDetails=(()=>{
+        if (_.isEmpty((stats))) return;
+
+        if (stats.indexDetails) {
+            return stats.indexDetails[indexName];
+        }
+
+        if (stats.shards) {
+            return _.transform(stats.shards, function(result, value, key) {
+                result[key] = {
+                    name: indexName,
+                    indexSize: _.get(value, "indexSizes." + indexName),
+                    ..._.get(value, "indexDetails." + indexName)
+                }
+            }, {});
+        }
+    })();
+
+    const indexStats = (() => {
+        if (dbVersion >= 3.2) {
+            try{
+                return db.getCollection(collection).aggregate([{ $indexStats: {} }]).toArray().filter(it => it.name === indexName)
+            } catch (error){
+                console.error(error)
+            }
+        }
+    })();
+
+    return ({ ...indexInfo, indexSize: stats && stats.indexSizes[indexName],  "usage stats": indexStats, "index details": indexDetails })
+}
+
+getCollectionIndexInfo(${JSON.stringify(collection)}, ${JSON.stringify(indexName)});`;
+}
+
+/** "查看索引" 贴进编辑器的 mongosh 等效脚本 (Run 走后端 get_collection_indexes) */
+function buildCollectionIndexesScript(collection: string): string {
+  return `function getCollectionIndexes(col){
+    const indexStats = (() => {
+        const dbVersion = parseFloat(db.version());
+        if (dbVersion >= 3.2) {
+            try{
+                return db.getCollection(col).aggregate([{ $indexStats: {} }]).toArray()
+            }catch(err){
+                console.error(err)
+                return [];
+            }
+        }
+    })();
+
+    const indexSizes=db.getCollection(col).stats().indexSizes;
+
+    const indexes=db.getCollection(col).getIndexes();
+
+    return indexes.map(it=>{
+        const usageStats=(()=>{
+            const stats=(indexStats || []).filter(stat=>stat.name===it.name);
+            if (_.isEmpty(stats)) return {"usage stats": "not available"};
+
+            const formatAccesses=(it)=>\`\${it.ops} since \${it.since.toLocaleString()}\`
+            if (stats.length>1){
+                return {
+                    "usage stats":stats.reduce((acc, cur, i)=> {
+                        acc[i]={
+                            host:cur.host,
+                            accesses:formatAccesses(cur.accesses)
+                        }
+
+                        return acc;
+                    }, {})
+                }
+            }else{
+                return {
+                    ...stats[0],
+                    accesses: formatAccesses(stats[0].accesses),
+                }
+            }
+        })();
+
+        const size=indexSizes[it.name];
+        const type=(_.find(_.values(it.key), v=>_.isString(v)) || "regular").toUpperCase();
+        const info={
+            ...it,
+            size,
+            type,
+            ...usageStats,
+        }
+
+        const commonFields=["name","key","type","size", "ns","accesses","usage stats"];
+        if (!info.ns){
+            info.ns=db.getName()+"."+col;
+        }
+
+        return _.omitBy({
+            ..._.pick(info,commonFields),
+            ...{properties: _.omit(info, [...commonFields,"v","host"])},
+            ..._.pick(info,"v","host")
+        },_.isEmpty)
+    })
+}
+
+getCollectionIndexes(${JSON.stringify(collection)});`;
+}
+
+function parseIdxKey(key: string): { connId: string; dbName: string; collName: string; idxName: string } {
+  // key 格式: idx:connId:db.coll|idxName
+  const rest = key.slice("idx:".length);
+  const pipeIdx = rest.lastIndexOf("|");
+  const idxName = rest.slice(pipeIdx + 1);
+  const collKeyPart = rest.slice(0, pipeIdx); // connId:db.coll
+  const colonIdx = collKeyPart.indexOf(":");
+  const connId = collKeyPart.slice(0, colonIdx);
+  const afterConn = collKeyPart.slice(colonIdx + 1);
+  const dotIdx = afterConn.indexOf(".");
+  return {
+    connId,
+    dbName: afterConn.slice(0, dotIdx),
+    collName: afterConn.slice(dotIdx + 1),
+    idxName,
+  };
+}
+
 // 右键菜单
 const ctxMenuOptions = computed(() => {
   const key = ctxNodeKey.value;
@@ -399,6 +581,36 @@ const ctxMenuOptions = computed(() => {
       { label: "刷新", key: "refresh-coll-parent" },
       { type: "divider" as const, key: "d4" },
       { label: "删除集合", key: "drop-coll" },
+    ];
+  }
+  if (key.startsWith("idx:")) {
+    return [
+      { label: menuRow("查看索引..."), key: "show-index" },
+      { label: menuRow("修改索引..."), key: "update-index" },
+      { label: menuRow("删除索引...", "Del"), key: "drop-this-index" },
+      { type: "divider" as const, key: "dx1" },
+      { label: menuRow("新建索引...", "Alt+N"), key: "add-index-from-idx" },
+      { type: "divider" as const, key: "dx2" },
+      { label: menuRow("复制名称", "Alt+Ctrl+C"), key: "copy-idx-name" },
+    ];
+  }
+  if (key.startsWith("indexes:")) {
+    return [
+      { label: menuRow("查看索引", "Enter"), key: "view-indexes" },
+      { label: menuRow("查看索引统计 ($indexStats)"), key: "view-index-stats" },
+      { type: "divider" as const, key: "di1" },
+      { label: menuRow("新建索引...", "Alt+N"), key: "add-index" },
+      { type: "divider" as const, key: "di2" },
+      { label: menuRow("重建索引..."), key: "rebuild-indexes" },
+      { label: menuRow("删除索引..."), key: "drop-indexes" },
+      { type: "divider" as const, key: "di3" },
+      { label: menuRow("复制名称", "Alt+Ctrl+C"), key: "copy-coll-name" },
+      { type: "divider" as const, key: "di4" },
+      { label: menuRow("设置注释..."), key: "set-comment" },
+      { label: menuRow("添加到收藏"), key: "add-to-favorites" },
+      { type: "divider" as const, key: "di5" },
+      { label: menuRow("显示节点定位器", "Ctrl+F"), key: "show-locator" },
+      { label: menuRow("刷新", "Ctrl+R"), key: "refresh-indexes" },
     ];
   }
   if (key.startsWith("users:")) {
@@ -521,6 +733,13 @@ function parseCollKey(key: string): { connId: string; dbName: string; collName: 
   return { connId, dbName: afterConn.slice(0, dotIdx), collName: afterConn.slice(dotIdx + 1) };
 }
 
+async function handleIndexCreated() {
+  const { connId, database, collection } = addIndexCtx.value;
+  if (!connId) return;
+  delete indexCache.value[`${connId}:${database}.${collection}`];
+  await loadIndexes(connId, database, collection);
+}
+
 async function handleCtxSelect(action: string) {
   showCtxMenu.value = false;
   const nodeKey = ctxNodeKey.value;
@@ -567,6 +786,198 @@ async function handleCtxSelect(action: string) {
   if (action === "export-coll" && nodeKey.startsWith("coll:")) {
     const { connId, dbName, collName } = parseCollKey(nodeKey);
     emit("exportColl", connId, dbName, collName);
+  }
+
+  // ---- indexes 节点 ----
+  if (nodeKey.startsWith("indexes:")) {
+    const { connId, dbName, collName } = parseIndexesKey(nodeKey);
+    const ref = collRef(collName);
+
+    if (action === "view-indexes") {
+      // mongosh 等效脚本 getCollectionIndexes(col), 后端 get_collection_indexes 命令做等效计算
+      const script = buildCollectionIndexesScript(collName);
+      const tabId = editorStore.createTab(connId, dbName, collName);
+      editorStore.setTabExecutor(tabId, { kind: "collectionIndexes", collection: collName });
+      editorStore.setTabSkipLint(tabId, true);
+      editorStore.setContent(tabId, script);
+      editorStore.executeQuery(tabId);
+    }
+    if (action === "view-index-stats") {
+      const tabId = editorStore.createTab(connId, dbName, collName);
+      editorStore.setContent(tabId, `${ref}.aggregate([{ $indexStats: {} }])`);
+      editorStore.executeQuery(tabId);
+    }
+    if (action === "add-index") {
+      openAddIndex(connId, dbName, collName);
+    }
+    if (action === "rebuild-indexes") {
+      dlg.warning({
+        title: "重建索引",
+        content: `确定重建 "${collName}" 的所有索引吗? 期间集合会持有写锁.`,
+        positiveText: "重建",
+        negativeText: "取消",
+        onPositiveClick: async () => {
+          try {
+            await collApi.reIndex(connId, dbName, collName);
+            message.success("索引已重建");
+            delete indexCache.value[`${connId}:${dbName}.${collName}`];
+            await loadIndexes(connId, dbName, collName);
+          } catch (e) {
+            message.error(`重建失败: ${e}`);
+          }
+        },
+      });
+    }
+    if (action === "drop-indexes") {
+      const cacheKey = `${connId}:${dbName}.${collName}`;
+      const cached = indexCache.value[cacheKey] || [];
+      const droppable = cached.filter((i) => i.name !== "_id_");
+      if (droppable.length === 0) {
+        message.info("没有可删除的索引 (_id_ 索引不可删)");
+        return;
+      }
+      // 简单交互: 列出名字让用户输入要删的索引名 (含逗号分隔批量)
+      dlg.create({
+        title: `删除索引 (${collName})`,
+        content: () =>
+          h("div", { style: "display:flex;flex-direction:column;gap:8px" }, [
+            h("p", { style: "margin:0;font-size:12px" }, "现有索引:"),
+            h(
+              "div",
+              { style: "font-family:monospace;font-size:12px;color:#555;padding:4px 8px;background:#f5f5f5;border-radius:4px" },
+              droppable.map((i) => i.name).join(", "),
+            ),
+            h("p", { style: "margin:8px 0 0;font-size:12px" }, "输入要删除的索引名 (逗号分隔):"),
+            h("input", {
+              id: "__idx_drop_names",
+              style: "width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px",
+            }),
+          ]),
+        positiveText: "删除",
+        negativeText: "取消",
+        onPositiveClick: async () => {
+          const raw = (document.getElementById("__idx_drop_names") as HTMLInputElement)?.value?.trim();
+          if (!raw) { message.warning("请输入索引名"); return false; }
+          const names = raw.split(",").map((s) => s.trim()).filter(Boolean);
+          let ok = 0;
+          for (const n of names) {
+            try {
+              await collApi.dropIndex(connId, dbName, collName, n);
+              ok++;
+            } catch (e) {
+              message.error(`删除 ${n} 失败: ${e}`);
+            }
+          }
+          if (ok > 0) message.success(`已删除 ${ok} 个索引`);
+          delete indexCache.value[cacheKey];
+          await loadIndexes(connId, dbName, collName);
+        },
+      });
+    }
+    if (action === "copy-coll-name") {
+      navigator.clipboard.writeText(collName).then(
+        () => message.success("已复制集合名"),
+        () => message.error("复制失败"),
+      );
+    }
+    if (action === "set-comment" || action === "add-to-favorites" || action === "show-locator") {
+      message.info("此功能暂未实现");
+    }
+    if (action === "refresh-indexes") {
+      delete indexCache.value[`${connId}:${dbName}.${collName}`];
+      await loadIndexes(connId, dbName, collName);
+      message.success("索引列表已刷新");
+    }
+  }
+
+  // ---- 单个 idx 节点 ----
+  if (nodeKey.startsWith("idx:")) {
+    const { connId, dbName, collName, idxName } = parseIdxKey(nodeKey);
+
+    if (action === "show-index") {
+      // 等效那段 getCollectionIndexInfo 脚本: 贴脚本 + 把执行通道指向后端 get_index_info
+      const script = buildIndexInfoScript(collName, idxName);
+      const tabId = editorStore.createTab(connId, dbName, collName);
+      editorStore.setTabExecutor(tabId, { kind: "indexInfo", collection: collName, indexName: idxName });
+      editorStore.setTabSkipLint(tabId, true);
+      editorStore.setContent(tabId, script);
+      // 立即触发一次执行, 走 tab.executor 通道 -> get_index_info
+      editorStore.executeQuery(tabId);
+    }
+
+    if (action === "update-index") {
+      if (idxName === "_id_") {
+        message.warning("_id_ 索引不可修改");
+        return;
+      }
+      // 通过 listIndexes 拿到完整定义后, 打开 AddIndexDialog 编辑模式
+      try {
+        const all = await collApi.listIndexes(connId, dbName, collName);
+        const target = all.find((i) => i.name === idxName);
+        if (!target) {
+          message.error("找不到该索引, 可能已被删除");
+          return;
+        }
+        openAddIndex(connId, dbName, collName, target);
+      } catch (e) {
+        message.error(`加载索引信息失败: ${e}`);
+      }
+    }
+
+    if (action === "drop-this-index") {
+      if (idxName === "_id_") {
+        message.warning("_id_ 索引不可删除");
+        return;
+      }
+      const cfg = connStore.connections.find((c) => c.id === connId);
+      const hostLabel = cfg ? cfg.name || `${cfg.host}:${cfg.port}` : connId;
+      const script = `db.getSiblingDB(${JSON.stringify(dbName)})\n  .getCollection(${JSON.stringify(collName)}).dropIndex(${JSON.stringify(idxName)})`;
+      dlg.warning({
+        title: "Drop Index",
+        content: () =>
+          h("div", { style: "display:flex;flex-direction:column;gap:12px;line-height:1.6" }, [
+            h("div", null, [
+              "Do you want to drop this index ",
+              h("strong", null, `"${idxName}"`),
+              ' on "',
+              h("strong", null, hostLabel),
+              '"? This operation can not be undone.',
+            ]),
+            h("div", null, "The following script will be executed."),
+            h(
+              "pre",
+              {
+                style:
+                  "margin:0;padding:8px 10px;background:#f7f9fb;border:1px solid #e0e0e0;border-radius:4px;font-family:Consolas,Monaco,monospace;font-size:12px;color:#333;white-space:pre-wrap;word-break:break-all",
+              },
+              script,
+            ),
+          ]),
+        positiveText: "Ok",
+        negativeText: "Cancel",
+        onPositiveClick: async () => {
+          try {
+            await collApi.dropIndex(connId, dbName, collName, idxName);
+            message.success(`索引 ${idxName} 已删除`);
+            delete indexCache.value[`${connId}:${dbName}.${collName}`];
+            await loadIndexes(connId, dbName, collName);
+          } catch (e) {
+            message.error(`删除失败: ${e}`);
+          }
+        },
+      });
+    }
+
+    if (action === "add-index-from-idx") {
+      openAddIndex(connId, dbName, collName);
+    }
+
+    if (action === "copy-idx-name") {
+      navigator.clipboard.writeText(idxName).then(
+        () => message.success("已复制索引名"),
+        () => message.error("复制失败"),
+      );
+    }
   }
 
   // ---- DDL 操作 ----
@@ -1116,6 +1527,15 @@ function handleNodeDblClick(node: TreeNode) {
       :y="ctxMenuY"
       @select="handleCtxSelect"
       @clickoutside="showCtxMenu = false"
+    />
+
+    <AddIndexDialog
+      v-model:show="addIndexShow"
+      :connection-id="addIndexCtx.connId"
+      :database="addIndexCtx.database"
+      :collection="addIndexCtx.collection"
+      :editing-index="addIndexEditing"
+      @created="handleIndexCreated"
     />
   </div>
 </template>

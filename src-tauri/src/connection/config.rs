@@ -445,6 +445,7 @@ mod tests {
             default_db: Some("testdb".to_string()),
             uri_options: None,
             sort_order: 0,
+            read_only: false,
         };
 
         let uri = config.to_uri();
@@ -493,6 +494,7 @@ mod tests {
             default_db: Some("testdb".to_string()),
             uri_options: None,
             sort_order: 0,
+            read_only: false,
         };
 
         let uri = original.to_uri();

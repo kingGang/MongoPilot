@@ -2,7 +2,7 @@
 import { ref, computed, watch, onUnmounted } from "vue";
 import {
   NModal, NCard, NButton, NSelect, NInput, NCheckbox,
-  NCheckboxGroup, NSpace, NIcon, NScrollbar, NProgress,
+  NSpace, NIcon, NScrollbar, NProgress,
 } from "naive-ui";
 import {
   Download as ExportIcon,
@@ -14,6 +14,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useConnectionStore } from "@/stores/connection";
 import { useDatabaseStore } from "@/stores/database";
 import { FORMAT_LIST, type ExportFormat } from "@/api/export";
+import { getBsonType } from "@/utils/bson-format";
 
 const props = defineProps<{
   show: boolean;
@@ -69,6 +70,13 @@ function handleConnChange(connId: string) {
 const format = ref<ExportFormat>("simple-json");
 const targetPath = ref("");
 const delimiter = ref(",");
+/** 每个 Date 字段的 Excel num_format pattern; 仅 xlsx 输出时生效, 空表示用默认 */
+const fieldDateFormats = ref<Record<string, string>>({});
+const DEFAULT_DATE_FORMAT = "yyyy-mm-dd hh:mm:ss";
+
+function setFieldDateFormat(field: string, value: string) {
+  fieldDateFormats.value = { ...fieldDateFormats.value, [field]: value };
+}
 const exporting = ref(false);
 const exportedCount = ref(0);
 const exportTotal = ref(0);
@@ -97,13 +105,132 @@ const allFields = computed(() => {
   return Array.from(fieldSet);
 });
 
+/** 每个字段的 BSON 类型: 取首个非空值推断, 若全空则 Null */
+const fieldTypes = computed<Record<string, string>>(() => {
+  const m: Record<string, string> = {};
+  for (const f of allFields.value) {
+    let t = "Null";
+    for (const doc of props.documents) {
+      const v = (doc as Record<string, unknown>)[f];
+      if (v === undefined || v === null) continue;
+      t = getBsonType(v);
+      break;
+    }
+    m[f] = t;
+  }
+  return m;
+});
+
+/**
+ * 把 BSON 类型映射成在当前导出格式下的"导出类型"标签.
+ * - mongoshell  : ObjectId() / ISODate() 等 Shell 表示, 其他保持
+ * - ejson       : $oid / $date 等 Extended JSON wrapper
+ * - simple-json /
+ *   jsonl       : 复杂类型 → 字符串, Document/Array 保留结构
+ * - csv/sql/
+ *   txt/html    : 一律文本
+ * - xlsx        : 数字/布尔保留, 日期 ISO 字符串, 复杂类型 JSON 字符串
+ */
+function exportTypeLabel(bsonType: string, fmt: ExportFormat): string {
+  if (fmt === "csv" || fmt === "sql" || fmt === "txt" || fmt === "html") {
+    return "Text";
+  }
+  if (fmt === "xlsx") {
+    if (bsonType === "Int32" || bsonType === "Int64" || bsonType === "Double") return "Number";
+    if (bsonType === "Boolean") return "Boolean";
+    if (bsonType === "Date") return "String (ISO)";
+    if (bsonType === "Document" || bsonType === "Array") return "JSON Text";
+    return "Text";
+  }
+  if (fmt === "mongoshell") {
+    if (bsonType === "ObjectId") return "ObjectId()";
+    if (bsonType === "Date") return "ISODate()";
+    if (bsonType === "Int64") return "NumberLong()";
+    if (bsonType === "Decimal128") return "NumberDecimal()";
+    return bsonType;
+  }
+  if (fmt === "ejson") {
+    if (bsonType === "ObjectId") return "$oid";
+    if (bsonType === "Date") return "$date";
+    if (bsonType === "Int64") return "$numberLong";
+    if (bsonType === "Decimal128") return "$numberDecimal";
+    if (bsonType === "Binary") return "$binary";
+    if (bsonType === "Timestamp") return "$timestamp";
+    return bsonType;
+  }
+  // simple-json / jsonl
+  if (bsonType === "ObjectId" || bsonType === "Date" || bsonType === "Int64" || bsonType === "Decimal128") {
+    return "String";
+  }
+  if (bsonType === "Int32" || bsonType === "Double") return "Number";
+  if (bsonType === "Boolean") return "Boolean";
+  if (bsonType === "Document") return "Object";
+  if (bsonType === "Array") return "Array";
+  return bsonType;
+}
+
+/** BSON 类型 → 显示用的颜色 (与 TreeDocView 大致对齐) */
+function typeBadgeColor(t: string): string {
+  switch (t) {
+    case "String": return "#18a058";
+    case "Int32":
+    case "Int64":
+    case "Double":
+    case "Decimal128": return "#2080f0";
+    case "Boolean": return "#d97706";
+    case "ObjectId": return "#7c3aed";
+    case "Date":
+    case "Timestamp": return "#0891b2";
+    case "Document": return "#666";
+    case "Array": return "#666";
+    case "Null": return "#999";
+    default: return "#999";
+  }
+}
+
 const selectedFields = ref<string[]>([]);
+
+/** 用户对每个字段选择的导出类型 override; "auto" 表示跟随 Format 默认 (不下发). */
+const fieldOverrides = ref<Record<string, string>>({});
+
+/** 通用 override 选项 (全字段共用) */
+const overrideOptionList = [
+  { label: "Auto (跟随格式)", value: "auto" },
+  { label: "String (字符串)", value: "string" },
+  { label: "Number (数字)", value: "number" },
+  { label: "Boolean (布尔)", value: "boolean" },
+  { label: "JSON Text", value: "json" },
+];
+
+/** 当前字段在 Auto 下的"默认标签" —— 用作 Auto 项的副文本提示 */
+function autoLabelFor(field: string): string {
+  return exportTypeLabel(fieldTypes.value[field] ?? "Null", format.value);
+}
+
+function setFieldChecked(field: string, checked: boolean) {
+  if (checked) {
+    if (!selectedFields.value.includes(field)) selectedFields.value.push(field);
+  } else {
+    selectedFields.value = selectedFields.value.filter((f) => f !== field);
+  }
+}
+
+function setFieldOverride(field: string, value: string) {
+  fieldOverrides.value = { ...fieldOverrides.value, [field]: value };
+}
 
 watch(() => props.show, (show) => {
   if (show) {
     selectedConnId.value = props.connectionId;
     selectedDb.value = props.database;
     selectedFields.value = [...allFields.value];
+    fieldOverrides.value = {};
+    // Date 字段填默认 pattern, 其他不动
+    const dateInit: Record<string, string> = {};
+    for (const f of allFields.value) {
+      if (fieldTypes.value[f] === "Date") dateInit[f] = DEFAULT_DATE_FORMAT;
+    }
+    fieldDateFormats.value = dateInit;
     targetPath.value = "";
     exportError.value = "";
     exporting.value = false;
@@ -163,6 +290,13 @@ async function handleExport() {
 
   await startProgressListener();
 
+  // 只下发非 auto 的 overrides
+  const overrides: Record<string, string> = {};
+  for (const f of selectedFields.value) {
+    const v = fieldOverrides.value[f];
+    if (v && v !== "auto") overrides[f] = v;
+  }
+
   try {
     const count = await invoke<number>("export_query", {
       request: {
@@ -174,6 +308,15 @@ async function handleExport() {
         targetPath: targetPath.value,
         delimiter: delimiter.value,
         collectionName: props.collection || null,
+        fieldTypes: Object.keys(overrides).length ? overrides : null,
+        dateFormats: format.value === "xlsx" ? (() => {
+          const map: Record<string, string> = {};
+          for (const f of selectedFields.value) {
+            const p = fieldDateFormats.value[f]?.trim();
+            if (p && fieldTypes.value[f] === "Date") map[f] = p;
+          }
+          return Object.keys(map).length ? map : null;
+        })() : null,
       },
     });
     exportedCount.value = count;
@@ -207,7 +350,7 @@ const canExport = computed(() =>
       :bordered="false"
       :closable="!exporting"
       role="dialog"
-      style="width: 600px"
+      style="width: 720px"
       @close="handleClose"
     >
       <div class="export-form">
@@ -262,6 +405,7 @@ const canExport = computed(() =>
           <n-select v-model:value="delimiter" :options="delimiterOptions" size="small" style="flex:1" :disabled="exporting" />
         </div>
 
+
         <!-- Target -->
         <div class="export-row">
           <label class="export-label">Target</label>
@@ -279,8 +423,8 @@ const canExport = computed(() =>
         </div>
       </div>
 
-      <!-- 进度条 -->
-      <div v-if="exporting || exportedCount > 0" class="progress-section">
+      <!-- 进度条 / 错误反馈 -->
+      <div v-if="exporting || exportedCount > 0 || exportError" class="progress-section">
         <n-progress
           type="line"
           :percentage="progressPercent"
@@ -303,23 +447,72 @@ const canExport = computed(() =>
         </div>
 
         <div class="field-toolbar">
-          <n-checkbox
-            :checked="allChecked"
-            :indeterminate="someChecked"
-            :disabled="exporting"
-            @update:checked="toggleAll"
-          >
-            Field
-          </n-checkbox>
-          <span class="field-count">{{ selectedFields.length }} / {{ allFields.length }}</span>
+          <div class="col-check">
+            <n-checkbox
+              :checked="allChecked"
+              :indeterminate="someChecked"
+              :disabled="exporting"
+              @update:checked="toggleAll"
+            />
+          </div>
+          <div class="col-name col-header">Field</div>
+          <div class="col-type col-header">字段类型</div>
+          <div class="col-export col-header">导出类型</div>
+          <div class="col-count">{{ selectedFields.length }} / {{ allFields.length }}</div>
         </div>
 
         <n-scrollbar style="max-height: 280px">
-          <n-checkbox-group v-model:value="selectedFields" :disabled="exporting">
-            <div v-for="field in allFields" :key="field" class="field-item">
-              <n-checkbox :value="field" :label="field" />
+          <div
+            v-for="field in allFields"
+            :key="field"
+            class="field-item"
+            :class="{ disabled: exporting }"
+          >
+            <div class="col-check">
+              <n-checkbox
+                :checked="selectedFields.includes(field)"
+                :disabled="exporting"
+                @update:checked="setFieldChecked(field, $event)"
+              />
             </div>
-          </n-checkbox-group>
+            <div class="col-name" :title="field">{{ field }}</div>
+            <div
+              class="col-type type-badge"
+              :style="{ color: typeBadgeColor(fieldTypes[field]) }"
+            >{{ fieldTypes[field] }}</div>
+            <div class="col-export">
+              <!-- Date 字段且当前导出格式是 xlsx: 显示日期 pattern 输入 -->
+              <n-input
+                v-if="fieldTypes[field] === 'Date' && format === 'xlsx'"
+                :value="fieldDateFormats[field] ?? DEFAULT_DATE_FORMAT"
+                size="tiny"
+                :placeholder="DEFAULT_DATE_FORMAT"
+                :disabled="exporting || !selectedFields.includes(field)"
+                @update:value="setFieldDateFormat(field, $event)"
+              />
+              <n-select
+                v-else
+                :value="fieldOverrides[field] ?? 'auto'"
+                :options="overrideOptionList"
+                size="tiny"
+                :disabled="exporting || !selectedFields.includes(field)"
+                :placeholder="autoLabelFor(field)"
+                @update:value="setFieldOverride(field, $event)"
+              />
+            </div>
+            <div class="col-count">
+              <span
+                v-if="fieldTypes[field] === 'Date' && format === 'xlsx'"
+                class="auto-hint"
+                title="Excel num_format pattern"
+              >(Excel)</span>
+              <span
+                v-else-if="(fieldOverrides[field] ?? 'auto') === 'auto'"
+                class="auto-hint"
+                :title="`Auto: ${autoLabelFor(field)}`"
+              >({{ autoLabelFor(field) }})</span>
+            </div>
+          </div>
         </n-scrollbar>
       </div>
 
@@ -439,23 +632,63 @@ const canExport = computed(() =>
   font-size: 12px;
   color: #d03050;
 }
-.field-toolbar {
-  display: flex;
+/* Grid 5 列: checkbox | 字段名 | 字段类型 | 导出类型 (select) | 计数/auto提示 */
+.field-toolbar,
+.field-item {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) 100px 160px 110px;
   align-items: center;
-  justify-content: space-between;
-  padding: 6px 10px;
+  column-gap: 8px;
+  padding: 4px 10px;
+}
+.field-toolbar {
   border-bottom: 1px solid #eee;
   background: #fafafa;
-}
-.field-count {
+  font-weight: 600;
   font-size: 12px;
-  color: #999;
+  color: #555;
 }
 .field-item {
-  padding: 4px 10px;
   border-bottom: 1px solid #f5f5f5;
 }
 .field-item:hover {
   background: #f0f7ff;
+}
+.field-item.disabled {
+  opacity: 0.55;
+}
+.col-check {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.col-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.col-type {
+  font-size: 12px;
+  font-family: "Consolas", "Monaco", monospace;
+}
+.col-export {
+  min-width: 0;
+}
+.col-count {
+  font-size: 12px;
+  color: #999;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.col-header {
+  font-weight: 600;
+  color: #555;
+}
+.auto-hint {
+  color: #aaa;
+  font-family: "Consolas", "Monaco", monospace;
 }
 </style>

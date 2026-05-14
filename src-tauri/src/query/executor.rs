@@ -156,9 +156,11 @@ pub async fn execute_shell_query(
 
     if query.starts_with("createUser(") {
         let arg_str = extract_parens(query, "createUser")?;
-        let converted = convert_shell_types(&arg_str);
+        let no_comments = strip_comments(&arg_str);
+        let converted = convert_shell_types(&no_comments);
         let relaxed = relax_json(&converted);
-        let user_doc: Document = serde_json::from_str(&relaxed)
+        let cleaned = strip_trailing_commas(&relaxed);
+        let user_doc: Document = serde_json::from_str(&cleaned)
             .map_err(|e| AppError::InvalidInput(format!("无法解析用户文档: {e}")))?;
         let mut cmd = doc! { "createUser": user_doc.get_str("user").unwrap_or("") };
         if let Some(pwd) = user_doc.get_str("pwd").ok() { cmd.insert("pwd", pwd); }
@@ -355,10 +357,7 @@ async fn execute_aggregate(
     pagination: Option<Pagination>,
 ) -> Result<QueryResult, AppError> {
     let arg_str = extract_parens(rest, "aggregate")?;
-    let converted = convert_shell_types(&arg_str);
-    let relaxed = relax_json(&converted);
-    let mut pipeline: Vec<Document> = serde_json::from_str(&relaxed)
-        .map_err(|e| AppError::InvalidInput(format!("无法解析聚合管道: {e}")))?;
+    let mut pipeline = aggregate_pipeline_from_arg(&arg_str)?;
 
     // 先用不带 skip/limit 的 pipeline 计算总数
     let mut count_pipeline = pipeline.clone();
@@ -434,9 +433,11 @@ async fn execute_insert_many(
     rest: &str,
 ) -> Result<QueryResult, AppError> {
     let arg_str = extract_parens(rest, "insertMany")?;
-    let converted = convert_shell_types(&arg_str);
+    let no_comments = strip_comments(&arg_str);
+    let converted = convert_shell_types(&no_comments);
     let relaxed = relax_json(&converted);
-    let docs: Vec<Document> = serde_json::from_str(&relaxed)
+    let cleaned = strip_trailing_commas(&relaxed);
+    let docs: Vec<Document> = serde_json::from_str(&cleaned)
         .map_err(|e| AppError::InvalidInput(format!("无法解析文档数组: {e}")))?;
     let count = docs.len() as i64;
     let result = collection.insert_many(docs).await.map_err(AppError::Mongo)?;
@@ -579,17 +580,80 @@ pub fn extract_parens(rest: &str, method: &str) -> Result<String, AppError> {
     Ok(inner[..end].trim().to_string())
 }
 
+/// 把 `aggregate(...)` 括号内的原始字符串解析成 pipeline 文档数组.
+/// 与 `execute_aggregate` 共用一致的宽松处理: 注释 + shell 类型 + 无引号 key + 尾随逗号.
+pub fn aggregate_pipeline_from_arg(arg_str: &str) -> Result<Vec<Document>, AppError> {
+    let no_comments = strip_comments(arg_str);
+    let converted = convert_shell_types(&no_comments);
+    let relaxed = relax_json(&converted);
+    let cleaned = strip_trailing_commas(&relaxed);
+    serde_json::from_str(&cleaned)
+        .map_err(|e| AppError::InvalidInput(format!("无法解析聚合管道: {e}")))
+}
+
 pub fn parse_json_arg(s: &str) -> Result<Document, AppError> {
     if s.is_empty() { return Ok(doc! {}); }
     // 先尝试标准 JSON
     if let Ok(doc) = serde_json::from_str(s) {
         return Ok(doc);
     }
-    // 宽松模式：处理 Shell 类型 + 给无引号的 key 加引号
-    let shell_converted = convert_shell_types(s);
+    // 宽松模式: 注释 + shell 类型 + 无引号 key + 尾随逗号
+    let no_comments = strip_comments(s);
+    let shell_converted = convert_shell_types(&no_comments);
     let relaxed = relax_json(&shell_converted);
-    serde_json::from_str(&relaxed)
+    let cleaned = strip_trailing_commas(&relaxed);
+    serde_json::from_str(&cleaned)
         .map_err(|e| AppError::InvalidInput(format!("JSON 解析失败: {e}")))
+}
+
+/// 剥掉 JS 风格注释 (`//...` 行注释 与 `/* ... */` 块注释).
+/// 字符串内的同样写法会被保留.
+fn strip_comments(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        let c = chars[i];
+        // 字符串: 复制到结束引号
+        if c == '"' || c == '\'' {
+            let quote = c;
+            out.push(c);
+            i += 1;
+            while i < len {
+                let sc = chars[i];
+                out.push(sc);
+                i += 1;
+                if sc == '\\' && i < len {
+                    out.push(chars[i]);
+                    i += 1;
+                } else if sc == quote {
+                    break;
+                }
+            }
+            continue;
+        }
+        // 行注释 //... 到行尾
+        if c == '/' && i + 1 < len && chars[i + 1] == '/' {
+            i += 2;
+            while i < len && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // 块注释 /* ... */
+        if c == '/' && i + 1 < len && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(len);
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 /// 将 MongoDB Shell 类型构造器转为 Extended JSON 格式
@@ -786,6 +850,48 @@ fn is_key_position(preceding: &str) -> bool {
     last == '{' || last == ','
 }
 
+/// 去除尾随逗号: `{a:1, b:2,}` → `{a:1, b:2}`, `[1, 2,]` → `[1, 2]`
+/// 字符串内的逗号不动.
+fn strip_trailing_commas(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut result = String::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        let c = chars[i];
+        // 跳过字符串内容
+        if c == '"' {
+            result.push(c);
+            i += 1;
+            while i < len {
+                let sc = chars[i];
+                result.push(sc);
+                i += 1;
+                if sc == '\\' && i < len {
+                    result.push(chars[i]);
+                    i += 1;
+                } else if sc == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == ',' {
+            // 看后面是否只跟空白后跟 } 或 ]
+            let mut j = i + 1;
+            while j < len && chars[j].is_whitespace() { j += 1; }
+            if j < len && (chars[j] == '}' || chars[j] == ']') {
+                // 丢弃这个逗号
+                i += 1;
+                continue;
+            }
+        }
+        result.push(c);
+        i += 1;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,5 +1014,67 @@ mod tests {
         let v = doc.get("count").unwrap();
         // 解析后应是 f64
         assert!(v.as_f64().is_some());
+    }
+
+    #[test]
+    fn strip_trailing_comma_object() {
+        let result = strip_trailing_commas(r#"{"a": 1, "b": 2,}"#);
+        assert_eq!(result, r#"{"a": 1, "b": 2}"#);
+    }
+
+    #[test]
+    fn strip_trailing_comma_array() {
+        let result = strip_trailing_commas(r#"[1, 2, 3,]"#);
+        assert_eq!(result, r#"[1, 2, 3]"#);
+    }
+
+    #[test]
+    fn strip_trailing_comma_nested() {
+        let result = strip_trailing_commas(r#"[{"a": 1,}, {"b": 2,},]"#);
+        assert_eq!(result, r#"[{"a": 1}, {"b": 2}]"#);
+    }
+
+    #[test]
+    fn strip_trailing_comma_preserves_string_comma() {
+        // 字符串里的 ", ]" 不应被剥掉
+        let result = strip_trailing_commas(r#"{"k": "v,]"}"#);
+        assert_eq!(result, r#"{"k": "v,]"}"#);
+    }
+
+    #[test]
+    fn parse_json_arg_trailing_comma() {
+        // 用户报错的 case 简化版
+        let doc = parse_json_arg(r#"{"$unwind": "$attachment",}"#).unwrap();
+        assert_eq!(doc.get_str("$unwind").unwrap(), "$attachment");
+    }
+
+    #[test]
+    fn strip_line_comment() {
+        let result = strip_comments("{a:1, // hello\nb:2}");
+        assert!(!result.contains("hello"));
+        assert!(result.contains("a:1"));
+        assert!(result.contains("b:2"));
+    }
+
+    #[test]
+    fn strip_block_comment() {
+        let result = strip_comments("{a:1, /* hello */ b:2}");
+        assert!(!result.contains("hello"));
+        assert!(result.contains("a:1"));
+        assert!(result.contains("b:2"));
+    }
+
+    #[test]
+    fn strip_comment_inside_string_preserved() {
+        // 字符串里的 // 不应被剥
+        let result = strip_comments(r#"{url: "http://example.com"}"#);
+        assert!(result.contains("http://example.com"));
+    }
+
+    #[test]
+    fn parse_json_arg_with_line_comment() {
+        let doc = parse_json_arg("{ a: 1, // tail\n b: 2 }").unwrap();
+        assert_eq!(doc.get_i32("a").unwrap_or(0), 1);
+        assert_eq!(doc.get_i32("b").unwrap_or(0), 2);
     }
 }

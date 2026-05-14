@@ -115,8 +115,11 @@ impl ConnectionManager {
         opts.retry_writes = Some(true);
         opts.retry_reads = Some(true);
 
-        // SSH 隧道模式下需要 directConnection
-        if local_port.is_some() {
+        // 强制单节点模式: 除非用户在 URI 里显式配置了 replicaSet,
+        // 否则一律走 directConnection=true, 避免 driver 拓扑探测/SDAM 把
+        // 流量 fan-out 到多个 host, 也能规避某些服务端回包错位导致
+        // CommandNotFound 之类 wire protocol 错位问题.
+        if opts.repl_set_name.is_none() {
             opts.direct_connection = Some(true);
         }
 
@@ -156,7 +159,7 @@ impl ConnectionManager {
         opts.retry_writes = Some(true);
         opts.retry_reads = Some(true);
 
-        if local_port.is_some() {
+        if opts.repl_set_name.is_none() {
             opts.direct_connection = Some(true);
         }
 

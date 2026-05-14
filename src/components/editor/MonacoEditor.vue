@@ -111,22 +111,65 @@ function buildCommentSet(lines: string[]): Set<number> {
   return set;
 }
 
+/** 单行的 ( { [ - ) } ] 净变化, 跳过字符串和行内 // 块/行注释. */
+function bracketDelta(line: string): number {
+  let d = 0;
+  let inStr = false;
+  let strCh = "";
+  let i = 0;
+  const n = line.length;
+  while (i < n) {
+    const ch = line[i];
+    if (inStr) {
+      if (ch === "\\" && i + 1 < n) { i += 2; continue; }
+      if (ch === strCh) inStr = false;
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { inStr = true; strCh = ch; i++; continue; }
+    // 行注释截断: 后面的全部忽略
+    if (ch === "/" && line[i + 1] === "/") break;
+    // 行内块注释 /* ... */
+    if (ch === "/" && line[i + 1] === "*") {
+      i += 2;
+      while (i + 1 < n && !(line[i] === "*" && line[i + 1] === "/")) i++;
+      i = Math.min(i + 2, n);
+      continue;
+    }
+    if (ch === "(" || ch === "{" || ch === "[") d++;
+    else if (ch === ")" || ch === "}" || ch === "]") d--;
+    i++;
+  }
+  return d;
+}
+
 function parseStatements(content: string): StatementRange[] {
   const lines = content.split("\n");
   const commentLines = buildCommentSet(lines);
   const statements: StatementRange[] = [];
   let current: { startLine: number; lines: string[] } | null = null;
+  /** 当前累积语句的括号净深度. > 0 表示语句未闭合 */
+  let depth = 0;
+
+  const flush = () => {
+    if (!current) return;
+    statements.push({
+      startLine: current.startLine,
+      endLine: current.startLine + current.lines.length - 1,
+      text: current.lines.join("\n"),
+    });
+    current = null;
+    depth = 0;
+  };
 
   for (let i = 0; i < lines.length; i++) {
-    // 跳过注释行
+    // 注释行
     if (commentLines.has(i)) {
-      if (current) {
-        statements.push({
-          startLine: current.startLine,
-          endLine: current.startLine + current.lines.length - 1,
-          text: current.lines.join("\n"),
-        });
-        current = null;
+      if (current && depth > 0) {
+        // 语句未闭合, 注释当作语句体的一部分保持行号对齐, 不参与括号计算
+        current.lines.push(lines[i]);
+      } else if (current) {
+        flush();
       }
       continue;
     }
@@ -135,36 +178,22 @@ function parseStatements(content: string): StatementRange[] {
     const trimmed = line.trim();
 
     if (trimmed.startsWith("db.") || trimmed.startsWith("use ")) {
-      if (current) {
-        statements.push({
-          startLine: current.startLine,
-          endLine: current.startLine + current.lines.length - 1,
-          text: current.lines.join("\n"),
-        });
-      }
+      // 新语句开头之前先收尾旧的
+      flush();
       current = { startLine: i + 1, lines: [line] };
-    } else if (current && trimmed !== "") {
+      depth = bracketDelta(line);
+    } else if (current && (trimmed !== "" || depth > 0)) {
+      // 续行: 非空, 或语句未闭合 (允许语句中间出现空行)
       current.lines.push(line);
-    } else {
-      if (current) {
-        statements.push({
-          startLine: current.startLine,
-          endLine: current.startLine + current.lines.length - 1,
-          text: current.lines.join("\n"),
-        });
-        current = null;
-      }
+      depth += bracketDelta(line);
+    } else if (current && trimmed === "" && depth === 0) {
+      // 完整语句外的空行 → 收尾
+      flush();
     }
+    // !current && trimmed === "" → 直接忽略
   }
 
-  if (current) {
-    statements.push({
-      startLine: current.startLine,
-      endLine: current.startLine + current.lines.length - 1,
-      text: current.lines.join("\n"),
-    });
-  }
-
+  flush();
   return statements;
 }
 
@@ -287,10 +316,13 @@ let lintTimer: ReturnType<typeof setTimeout> | null = null;
  *     ObjectId("abc")      → "ObjectId(abc)"
  */
 function relaxJsonForValidation(text: string): string {
+  // 0. 剥掉 JS 风格注释 (//... 与 /* ... */); 字符串内的同样写法保留.
+  //    在 shell 类型替换之前做, 因为注释内可能包含 `ObjectId(...)` 等字面量.
+  let result = stripJsComments(text);
   // 1. 将 MongoDB Shell 类型构造器替换为普通字符串，避免 JSON.parse 报错
   //    ObjectId("..."), ISODate("..."), NumberLong("..."), NumberDecimal("..."),
   //    UUID("..."), BinData(...), Timestamp(...), new Date("..."), RegExp(...)
-  let result = text.replace(
+  result = result.replace(
     /(?:new\s+)?(?:ObjectId|ISODate|UUID|NumberLong|NumberInt|NumberDecimal|Double|BinData|Timestamp|Date|RegExp)\s*\([^)]*\)/g,
     (m) => JSON.stringify(m),
   );
@@ -302,7 +334,53 @@ function relaxJsonForValidation(text: string): string {
     /([{,]\s*)([a-zA-Z_$][a-zA-Z0-9_$]*)(\s*:)/g,
     '$1"$2"$3',
   );
+  // 3. 去除尾随逗号 (Shell 风格 mongo 容忍 {a:1,} / [1,2,] / 多 stage 管道 stage,)
+  //    JSON.parse 不容尾随逗号, 会让 $project 等后续 stage 被误标红.
+  //    这里是 lint 用的临时字符串, 不影响编辑器内容; 字符串里的 `,]`/`,}`
+  //    极少出现, 即便误剥也只是 false negative, 不会出现 false positive.
+  result = result.replace(/,(\s*[}\]])/g, "$1");
   return result;
+}
+
+/** 剥掉 JS 风格 //... 行注释 与 /* *\/ 块注释; 字符串内的不动. */
+function stripJsComments(text: string): string {
+  let out = "";
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"' || c === "'") {
+      const quote = c;
+      out += c;
+      i++;
+      while (i < n) {
+        const sc = text[i];
+        out += sc;
+        i++;
+        if (sc === "\\" && i < n) {
+          out += text[i];
+          i++;
+        } else if (sc === quote) {
+          break;
+        }
+      }
+      continue;
+    }
+    if (c === "/" && i + 1 < n && text[i + 1] === "/") {
+      i += 2;
+      while (i < n && text[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && i + 1 < n && text[i + 1] === "*") {
+      i += 2;
+      while (i + 1 < n && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      i = Math.min(i + 2, n);
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
 }
 
 /**
@@ -374,6 +452,12 @@ function lintContent() {
   if (!editor) return;
   const model = editor.getModel();
   if (!model) return;
+
+  // 当前 tab 标记了 skipLint (例如 "查看索引" 展示型 tab), 清掉所有 marker 直接返回
+  if (editorStore.activeTab?.skipLint) {
+    monaco.editor.setModelMarkers(model, "mongo-lint", []);
+    return;
+  }
 
   const content = editor.getValue();
   const lines = content.split("\n");

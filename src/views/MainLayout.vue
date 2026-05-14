@@ -13,6 +13,7 @@ import ConnectionDialog from "@/components/connection/ConnectionDialog.vue";
 import EditorTabs from "@/components/editor/EditorTabs.vue";
 import MonacoEditor from "@/components/editor/MonacoEditor.vue";
 import QueryToolbar from "@/components/editor/QueryToolbar.vue";
+import VisualQueryBuilder from "@/components/editor/VisualQueryBuilder.vue";
 import ResultPanel from "@/components/result/ResultPanel.vue";
 import ResultTabsBar from "@/components/result/ResultTabsBar.vue";
 import QueryHistory from "@/components/editor/QueryHistory.vue";
@@ -41,6 +42,8 @@ const showServerMonitor = ref(false);
 const showUserPanel = ref(false);
 const showProfiler = ref(false);
 const sidebarCollapsed = ref(false);
+const showQueryBuilder = ref(false);
+const queryBuilderInitialText = ref("");
 
 const activeTab = computed(() => editorStore.activeTab);
 const aiConnectionId = computed(() => activeTab.value?.connectionId ?? undefined);
@@ -59,6 +62,32 @@ function handleEditInNewTab(sourceTab: EditorTab, queryText: string) {
     sourceTab.collection,
   );
   editorStore.setContent(newTabId, queryText);
+}
+
+/** 工具栏 Query 按钮 → 打开 Visual Query Builder; 若编辑器有内容则作为初始值回填 */
+function handleOpenQueryBuilder() {
+  const tab = editorStore.activeTab;
+  if (!tab) {
+    msg.warning("请先打开一个查询页");
+    return;
+  }
+  queryBuilderInitialText.value = (tab.content || "").trim();
+  showQueryBuilder.value = true;
+}
+
+/** Visual Query Builder 提交 (Run) —— 写回编辑器并立即执行 */
+function handleQueryBuilderRun(queryText: string) {
+  const tab = editorStore.activeTab;
+  if (!tab) return;
+  editorStore.setContent(tab.id, queryText);
+  editorStore.executeQuery(tab.id, queryText);
+}
+
+/** Visual Query Builder 提交 (Insert 不执行) —— 仅写回编辑器 */
+function handleQueryBuilderInsert(queryText: string) {
+  const tab = editorStore.activeTab;
+  if (!tab) return;
+  editorStore.setContent(tab.id, queryText);
 }
 
 // 连接操作
@@ -300,6 +329,7 @@ const historyConnectionId = computed(() => activeTab.value?.connectionId ?? null
                           if (rt) editorStore.stopResultTab(tab.id, rt.id);
                         }"
                         @explain="handleExplain"
+                        @query-builder="handleOpenQueryBuilder"
                         @import="handleImport"
                         @export="handleExport"
                         @history="showHistory = true"
@@ -372,6 +402,16 @@ const historyConnectionId = computed(() => activeTab.value?.connectionId ?? null
     </div>
 
     <ConnectionDialog v-model:show="showDialog" :config="editingConfig" />
+    <VisualQueryBuilder
+      v-if="activeTab"
+      v-model:show="showQueryBuilder"
+      :connection-id="activeTab.connectionId"
+      :database="activeTab.database"
+      :collection="activeTab.collection"
+      :initial-query-text="queryBuilderInitialText"
+      @run="handleQueryBuilderRun"
+      @insert="handleQueryBuilderInsert"
+    />
     <QueryHistory
       v-if="historyConnectionId"
       v-model:show="showHistory"
