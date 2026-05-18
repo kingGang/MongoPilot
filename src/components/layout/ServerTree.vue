@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, h, onMounted, type VNodeChild } from "vue";
-import { NTree, NIcon, NButton, NDropdown, NPopover, NEmpty, useMessage, useDialog } from "naive-ui";
+import { NTree, NIcon, NButton, NDropdown, NPopover, NEmpty, NTooltip, useMessage, useDialog } from "naive-ui";
 import {
   Add as AddIcon,
   CloudDone as ConnectedIcon,
@@ -14,6 +14,9 @@ import {
   People as UsersIcon,
   Person as UserIcon,
   LockClosed as RoleIcon,
+  SwapVertical as SortIcon,
+  RefreshOutline as RefreshIcon,
+  ContractOutline as CollapseIcon,
 } from "@vicons/ionicons5";
 import { useConnectionStore } from "@/stores/connection";
 import { useDatabaseStore } from "@/stores/database";
@@ -47,6 +50,35 @@ const expandedKeys = ref<string[]>([]);
 const loadingKeys = ref<Set<string>>(new Set());
 const connectingIds = ref<Set<string>>(new Set());
 const statsCache = ref<Record<string, CollectionStats>>({});
+
+/** 集合列表按字母 A→Z 排序; 关闭时按后端返回顺序 (创建时间) */
+const SORT_LS_KEY = "mongopilot.collSortByName";
+const sortCollByName = ref<boolean>(localStorage.getItem(SORT_LS_KEY) === "true");
+function toggleCollSort() {
+  sortCollByName.value = !sortCollByName.value;
+  localStorage.setItem(SORT_LS_KEY, String(sortCollByName.value));
+}
+
+// 工具栏: 刷新所有已连接 / 全部折叠
+const refreshing = ref(false);
+async function refreshAll() {
+  if (refreshing.value) return;
+  const activeConns = connStore.connections.filter((c) => connStore.isActive(c.id));
+  if (activeConns.length === 0) {
+    message.info("没有已连接的服务器");
+    return;
+  }
+  refreshing.value = true;
+  try {
+    await Promise.all(activeConns.map((c) => refreshConnection(c.id).catch(() => {})));
+    message.success("已刷新");
+  } finally {
+    refreshing.value = false;
+  }
+}
+function collapseAll() {
+  expandedKeys.value = [];
+}
 
 // 右键菜单
 const showCtxMenu = ref(false);
@@ -206,7 +238,10 @@ function buildUserNodes(connectionId: string, _database: string, cacheKey: strin
 }
 
 function buildCollectionNodes(connectionId: string, database: string): TreeNode[] {
-  const colls = dbStore.getCollections(connectionId, database);
+  const raw = dbStore.getCollections(connectionId, database);
+  const colls = sortCollByName.value
+    ? [...raw].sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN", { numeric: true, sensitivity: "base" }))
+    : raw;
   const collNodes: TreeNode[] = colls.map((c) => {
     const collKey = `${connectionId}:${database}.${c.name}`;
     const cachedIndexes = indexCache.value[collKey] || [];
@@ -715,7 +750,8 @@ function collRef(name: string): string {
 }
 
 function buildDefaultQuery(collName: string): string {
-  return `${collRef(collName)}.find({})\n  .projection({})\n  .sort({_id:1})\n  .limit(100)`;
+  // 默认按 _id 倒序 (最新插入的优先), 翻看最近数据的场景多于历史回溯
+  return `${collRef(collName)}.find({})\n  .projection({})\n  .sort({_id:-1})\n  .limit(100)`;
 }
 
 function parseDbKey(key: string): { connId: string; dbName: string } {
@@ -1488,10 +1524,54 @@ function handleNodeDblClick(node: TreeNode) {
 <template>
   <div class="server-tree">
     <div class="tree-toolbar">
-      <n-button size="small" quaternary @click="$emit('createConnection')">
-        <template #icon><n-icon><AddIcon /></n-icon></template>
-        New Connection
-      </n-button>
+      <n-tooltip trigger="hover" :delay="400">
+        <template #trigger>
+          <n-button class="tb-btn" size="small" quaternary @click="$emit('createConnection')">
+            <template #icon><n-icon :size="17"><AddIcon /></n-icon></template>
+          </n-button>
+        </template>
+        新建连接
+      </n-tooltip>
+      <n-tooltip trigger="hover" :delay="400">
+        <template #trigger>
+          <n-button
+            class="tb-btn"
+            size="small"
+            quaternary
+            :loading="refreshing"
+            @click="refreshAll"
+          >
+            <template #icon><n-icon :size="16"><RefreshIcon /></n-icon></template>
+          </n-button>
+        </template>
+        刷新所有已连接
+      </n-tooltip>
+      <n-tooltip trigger="hover" :delay="400">
+        <template #trigger>
+          <n-button class="tb-btn" size="small" quaternary @click="collapseAll">
+            <template #icon><n-icon :size="16"><CollapseIcon /></n-icon></template>
+          </n-button>
+        </template>
+        全部折叠
+      </n-tooltip>
+
+      <div class="tb-sep" />
+
+      <n-tooltip trigger="hover" :delay="400">
+        <template #trigger>
+          <n-button
+            class="tb-btn"
+            size="small"
+            :type="sortCollByName ? 'primary' : 'default'"
+            :quaternary="!sortCollByName"
+            :secondary="sortCollByName"
+            @click="toggleCollSort"
+          >
+            <template #icon><n-icon :size="16"><SortIcon /></n-icon></template>
+          </n-button>
+        </template>
+        {{ sortCollByName ? "集合 A→Z 排序中 (点击关闭)" : "集合按 A→Z 排序" }}
+      </n-tooltip>
     </div>
 
     <n-empty
@@ -1547,9 +1627,23 @@ function handleNodeDblClick(node: TreeNode) {
   flex-direction: column;
 }
 .tree-toolbar {
-  padding: 4px 8px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 6px;
   border-bottom: 1px solid var(--n-border-color);
+  background: #fafafa;
   flex-shrink: 0;
+}
+.tb-btn {
+  width: 28px;
+  padding: 0;
+}
+.tb-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: #e0e0e0;
 }
 .loading-dot {
   display: inline-block;

@@ -4,8 +4,9 @@ import { NIcon, NDropdown } from "naive-ui";
 import {
   SearchOutline as FindIcon,
   BarChartOutline as ExplainIcon,
+  TerminalOutline as ConsoleIcon,
 } from "@vicons/ionicons5";
-import type { ResultTab } from "@/types/database";
+import type { ResultTab, ResultTabKind } from "@/types/database";
 
 defineProps<{
   resultTabs: ResultTab[];
@@ -65,12 +66,16 @@ function onCtxSelect(key: string) {
   }
 }
 
-function kindIcon(kind: "find" | "explain") {
-  return kind === "find" ? FindIcon : ExplainIcon;
+function kindIcon(kind: ResultTabKind) {
+  if (kind === "find") return FindIcon;
+  if (kind === "explain") return ExplainIcon;
+  return ConsoleIcon;
 }
 
-function kindColor(kind: "find" | "explain") {
-  return kind === "find" ? "#18a058" : "#3875d7";
+function kindColor(kind: ResultTabKind) {
+  if (kind === "find") return "#18a058";
+  if (kind === "explain") return "#3875d7";
+  return "#888";
 }
 
 // 用于 h() 内部

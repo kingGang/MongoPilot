@@ -114,6 +114,82 @@ pub async fn run_query(
     result
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunScriptOpsRequest {
+    pub connection_id: String,
+    pub database: String,
+    /// 前端脚本模式收集到的写操作, 每条已渲染成 `db.coll.method(JSON...)`
+    pub statements: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptRunSummary {
+    pub total: usize,
+    pub ok: usize,
+    pub failed: usize,
+    pub first_error: Option<String>,
+    pub elapsed_ms: u64,
+}
+
+/// 脚本模式: 前端把整段命令式脚本在 webview 里跑一遍, 收集到的所有写操作
+/// (每条已渲染成 `db.coll.method(JSON...)`) 通过这里顺序执行.
+#[tauri::command]
+pub async fn run_script_ops(
+    mgr: State<'_, ConnectionManager>,
+    pool: State<'_, DbPool>,
+    request: RunScriptOpsRequest,
+) -> Result<ScriptRunSummary, AppError> {
+    if mgr.is_read_only(&request.connection_id).await {
+        return Err(AppError::InvalidInput(
+            "只读连接：不允许执行写操作".into(),
+        ));
+    }
+
+    let client = mgr.get_client(&request.connection_id).await?;
+    let start = std::time::Instant::now();
+    let total = request.statements.len();
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    let mut first_error: Option<String> = None;
+
+    for stmt in &request.statements {
+        match executor::execute_shell_query(&client, &request.database, stmt, None).await {
+            Ok(_) => ok += 1,
+            Err(e) => {
+                failed += 1;
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    let _ = history_repo::insert_history(
+        &pool,
+        &request.connection_id,
+        &request.database,
+        None,
+        &format!("[脚本] {total} 条写操作 (成功 {ok} / 失败 {failed})"),
+        "script",
+        Some(elapsed_ms as i64),
+        Some(ok as i64),
+        first_error.as_deref(),
+    )
+    .await;
+
+    Ok(ScriptRunSummary {
+        total,
+        ok,
+        failed,
+        first_error,
+        elapsed_ms,
+    })
+}
+
 #[tauri::command]
 pub async fn get_query_history(
     pool: State<'_, DbPool>,

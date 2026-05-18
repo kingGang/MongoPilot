@@ -36,6 +36,7 @@ const menuOptions: MenuOption[] = [
     key: "view",
     children: [
       { label: "Toggle Sidebar", key: "view.sidebar" },
+      { label: "Toggle Script Panel", key: "view.script-panel" },
       { label: "Toggle AI Panel", key: "view.ai-panel" },
       { type: "divider", key: "d3" },
       { label: "Zoom In", key: "view.zoom-in" },

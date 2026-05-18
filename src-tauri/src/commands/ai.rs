@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::ai::client::{self, AiConfig, ChatMessage};
+use crate::ai::client::{self, AgentMessage, AiConfig, AiTurn, ChatMessage, ToolDef};
 use crate::ai::prompt;
 use crate::ai::schema::{self, SchemaInfo};
 use crate::connection::manager::ConnectionManager;
@@ -64,6 +64,18 @@ pub async fn ai_chat(
 ) -> Result<String, AppError> {
     let config = load_ai_config(&pool).await?;
     client::chat_completion(&config, &messages).await
+}
+
+/// Agent 一轮: 前端传完整对话历史 + 工具定义, 返回模型的文本回复 / 工具调用请求.
+/// agent 循环在前端跑 (UI 工具如改编辑器需要前端执行), 这里只做一次模型往返.
+#[tauri::command]
+pub async fn ai_agent_turn(
+    pool: State<'_, DbPool>,
+    messages: Vec<AgentMessage>,
+    tools: Vec<ToolDef>,
+) -> Result<AiTurn, AppError> {
+    let config = load_ai_config(&pool).await?;
+    client::chat_turn(&config, &messages, &tools).await
 }
 
 #[tauri::command]

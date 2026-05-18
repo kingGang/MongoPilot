@@ -34,7 +34,7 @@ export interface HistoryEntry {
   createdAt: string;
 }
 
-export type ResultTabKind = "find" | "explain";
+export type ResultTabKind = "find" | "explain" | "console";
 
 /** 一次查询执行产生的结果 tab —— 承载所有执行态数据.
  *  每次 Run / Explain 追加一个, 每个编辑器 tab 内最多保留 10 个 (FIFO 淘汰). */
@@ -59,6 +59,8 @@ export interface ResultTab {
   /** 用户点 Stop 后置 true, 后续 await 回来的结果会被丢弃 (后端查询无法真正取消,
    *  但 UI 立刻停止转圈). */
   aborted: boolean;
+  /** kind === "console" 时: print()/printjson() 累积的输出行 */
+  consoleLines?: string[];
 }
 
 /** 特殊执行路径: 设置后, Run 不走通用 run_query 执行器, 改走对应后端命令. */

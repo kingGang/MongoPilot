@@ -1,5 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AiSettings, ChatMessage, SchemaInfo } from "@/types/ai";
+import type {
+  AiSettings,
+  ChatMessage,
+  SchemaInfo,
+  AgentMessage,
+  ToolDef,
+  AiTurn,
+} from "@/types/ai";
 
 export async function getAiSettings(): Promise<AiSettings | null> {
   return invoke<AiSettings | null>("get_ai_settings");
@@ -11,6 +18,11 @@ export async function saveAiSettings(settings: AiSettings): Promise<void> {
 
 export async function aiChat(messages: ChatMessage[]): Promise<string> {
   return invoke<string>("ai_chat", { messages });
+}
+
+/** Agent 一轮: 传完整对话历史 + 工具定义, 返回模型文本回复 / 工具调用请求 */
+export async function aiAgentTurn(messages: AgentMessage[], tools: ToolDef[]): Promise<AiTurn> {
+  return invoke<AiTurn>("ai_agent_turn", { messages, tools });
 }
 
 export async function nl2query(

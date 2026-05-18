@@ -43,6 +43,11 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
     sqlx::raw_sql(migration_003).execute(pool).await.map_err(AppError::Database)?;
     let migration_004 = include_str!("../../migrations/004_read_only.sql");
     sqlx::raw_sql(migration_004).execute(pool).await.ok(); // ok(): 列已存在时忽略
+    let migration_005 = include_str!("../../migrations/005_scripts.sql");
+    sqlx::raw_sql(migration_005)
+        .execute(pool)
+        .await
+        .map_err(AppError::Database)?;
     Ok(())
 }
 

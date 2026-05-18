@@ -52,6 +52,7 @@ pub fn run() {
             commands::database::list_collections,
             commands::database::drop_database,
             commands::query::run_query,
+            commands::query::run_script_ops,
             commands::query::get_query_history,
             commands::query::search_query_history,
             commands::query::clear_query_history,
@@ -80,6 +81,7 @@ pub fn run() {
             commands::ai::get_ai_settings,
             commands::ai::save_ai_settings,
             commands::ai::ai_chat,
+            commands::ai::ai_agent_turn,
             commands::ai::nl2query,
             commands::ai::analyze_collection_schema,
             commands::ai::suggest_indexes,
@@ -89,6 +91,17 @@ pub fn run() {
             commands::export::read_import_file,
             commands::export::import_documents,
             commands::export::stream_import,
+            commands::script::list_scripts,
+            commands::script::list_script_folders,
+            commands::script::get_script,
+            commands::script::resolve_script_ref,
+            commands::script::save_script,
+            commands::script::delete_script,
+            commands::script::create_script_folder,
+            commands::script::delete_script_folder,
+            commands::script::rename_script_folder,
+            commands::script::import_script_files,
+            commands::script::import_script_directory,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

@@ -5,5 +5,6 @@ pub mod database;
 pub mod document;
 pub mod export;
 pub mod query;
+pub mod script;
 pub mod server;
 pub mod user;

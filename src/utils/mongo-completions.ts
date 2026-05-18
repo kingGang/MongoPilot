@@ -3,6 +3,9 @@
  * 提供 db.collection.method() 风格的智能提示
  */
 import * as monaco from "monaco-editor";
+import { MONGO_SNIPPETS, renderSnippet, type SnippetDef } from "./mongo-snippets";
+
+const SNIPPET_COLL_PREFIX = "db.${COLL}.";
 
 // ---- MongoDB 方法定义 ----
 
@@ -445,6 +448,102 @@ const dbMethods: MethodDef[] = [
     detail: "method mongo.Database.version() : string",
     documentation: "Returns the version of the MongoDB instance.",
     kind: monaco.languages.CompletionItemKind.Method,
+  },
+];
+
+// ---- 全局函数 / BSON 构造器 / mongosh 内置 ----
+
+const globalFunctions: MethodDef[] = [
+  {
+    label: "ObjectId",
+    insertText: 'ObjectId("${1}")',
+    detail: "BSON ObjectId(hexString?)",
+    documentation: "构造一个 ObjectId。不传参生成新的。",
+    kind: monaco.languages.CompletionItemKind.Constructor,
+  },
+  {
+    label: "ISODate",
+    insertText: 'ISODate("${1}")',
+    detail: "ISODate(dateString?)",
+    documentation: '构造一个日期。不传参为当前时间, 例如 ISODate("2025-01-01")。',
+    kind: monaco.languages.CompletionItemKind.Constructor,
+  },
+  {
+    label: "NumberLong",
+    insertText: 'NumberLong("${1}")',
+    detail: "NumberLong(value)",
+    documentation: "64 位整数 (Int64)。",
+    kind: monaco.languages.CompletionItemKind.Constructor,
+  },
+  {
+    label: "NumberInt",
+    insertText: "NumberInt(${1})",
+    detail: "NumberInt(value)",
+    documentation: "32 位整数 (Int32)。",
+    kind: monaco.languages.CompletionItemKind.Constructor,
+  },
+  {
+    label: "NumberDecimal",
+    insertText: 'NumberDecimal("${1}")',
+    detail: "NumberDecimal(value)",
+    documentation: "高精度十进制数 (Decimal128)。",
+    kind: monaco.languages.CompletionItemKind.Constructor,
+  },
+  {
+    label: "Double",
+    insertText: "Double(${1})",
+    detail: "Double(value)",
+    documentation: "双精度浮点数。",
+    kind: monaco.languages.CompletionItemKind.Constructor,
+  },
+  {
+    label: "UUID",
+    insertText: 'UUID("${1}")',
+    detail: "UUID(hexString?)",
+    documentation: "构造 UUID。不传参生成随机 UUID。",
+    kind: monaco.languages.CompletionItemKind.Constructor,
+  },
+  {
+    label: "Timestamp",
+    insertText: "Timestamp(${1:0}, ${2:0})",
+    detail: "Timestamp(t, i)",
+    documentation: "BSON 时间戳。",
+    kind: monaco.languages.CompletionItemKind.Constructor,
+  },
+  {
+    label: "Date",
+    insertText: "new Date(${1})",
+    detail: "new Date(...)",
+    documentation: "JavaScript 日期对象。",
+    kind: monaco.languages.CompletionItemKind.Constructor,
+  },
+  {
+    label: "Buffer.from",
+    insertText: 'Buffer.from("${1}", "${2:utf8}")',
+    detail: "Buffer.from(input, encoding)",
+    documentation: "构造 Buffer (脚本里做 base64 / hex 编解码常用)。",
+    kind: monaco.languages.CompletionItemKind.Function,
+  },
+  {
+    label: "print",
+    insertText: "print(${1})",
+    detail: "print(...args)",
+    documentation: "打印输出到结果的 Console 区。",
+    kind: monaco.languages.CompletionItemKind.Function,
+  },
+  {
+    label: "printjson",
+    insertText: "printjson(${1})",
+    detail: "printjson(obj)",
+    documentation: "以 JSON 格式打印对象到 Console 区。",
+    kind: monaco.languages.CompletionItemKind.Function,
+  },
+  {
+    label: "load",
+    insertText: 'load("${1}")',
+    detail: "load(path)",
+    documentation: "引入外部脚本文件 (绝对路径) 或脚本库脚本 (文件夹/脚本名)。",
+    kind: monaco.languages.CompletionItemKind.Function,
   },
 ];
 
@@ -897,6 +996,33 @@ let _registered = false;
 export interface CompletionOptions {
   collectionNames?: () => string[];
   getFieldNames?: (collection: string) => Promise<FieldCompletionInfo[]>;
+  /** 当前 tab 绑定的集合名 (片段补全里渲染 ${COLL} 占位) */
+  currentCollection?: () => string;
+}
+
+/**
+ * 把片段转成 Monaco CompletionItem (snippet kind).
+ *
+ * sortText 策略: "<method> <label>" —— 让 "find — 条件查询" 排在方法 "find" 之后、
+ * 方法 "findOne" 之前 (lex 比较: "find" < "find …" < "findOne", 因为 ' ' (32) < 'O' (79)).
+ * 这样相同关键字的方法 + 片段在补全列表里挨着出现.
+ */
+function snippetToItem(
+  snip: SnippetDef,
+  body: string,
+  range: monaco.IRange,
+): monaco.languages.CompletionItem {
+  const dashIdx = snip.label.indexOf(" — ");
+  const methodKey = dashIdx > 0 ? snip.label.slice(0, dashIdx).trim() : snip.label;
+  return {
+    label: snip.label,
+    kind: monaco.languages.CompletionItemKind.Snippet,
+    insertText: body,
+    detail: `snippet — ${snip.group}`,
+    documentation: { value: `**${snip.desc}**\n\n\`\`\`js\n${body}\n\`\`\`` },
+    range,
+    sortText: `${methodKey} ${snip.label}`,
+  };
 }
 
 export function registerMongoCompletions(options?: CompletionOptions): void;
@@ -968,6 +1094,12 @@ export function registerMongoCompletions(arg?: CompletionOptions | (() => string
             documentation: { value: m.documentation },
             range,
           });
+        }
+        // 片段: 只挑 `db.${COLL}.` 开头的, 剥掉前缀后插入 (用户输入处已经有 db.coll.)
+        for (const snip of MONGO_SNIPPETS) {
+          if (!snip.body.startsWith(SNIPPET_COLL_PREFIX)) continue;
+          const body = snip.body.slice(SNIPPET_COLL_PREFIX.length);
+          suggestions.push(snippetToItem(snip, body, range));
         }
         return { suggestions };
       }
@@ -1130,6 +1262,35 @@ export function registerMongoCompletions(arg?: CompletionOptions | (() => string
           }
 
           return { suggestions };
+        }
+      }
+
+      // 6. 兜底: 一般 JS 位置 (不在引号里) -> 提供全局函数 / BSON 构造器 / db / 代码片段
+      if (!isInsideQuotes(textUntilPosition)) {
+        for (const m of globalFunctions) {
+          suggestions.push({
+            label: m.label,
+            kind: m.kind,
+            insertText: m.insertText,
+            insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+            detail: m.detail,
+            documentation: { value: m.documentation },
+            range,
+          });
+        }
+        suggestions.push({
+          label: "db",
+          kind: monaco.languages.CompletionItemKind.Variable,
+          insertText: "db",
+          detail: "当前数据库",
+          documentation: { value: "MongoDB 数据库句柄, db.<集合>.<方法>()" },
+          range,
+        });
+        // 代码片段: 全量列出, ${COLL} 用当前 tab 的集合名 (没有就 collection 占位)
+        const coll = opts.currentCollection?.() || "";
+        for (const snip of MONGO_SNIPPETS) {
+          const body = renderSnippet(snip.body, coll);
+          suggestions.push(snippetToItem(snip, body, range));
         }
       }
 

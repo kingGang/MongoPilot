@@ -29,6 +29,8 @@ const renderError = ref<string | null>(null);
 // 从 resultTab 派生所有字段
 const result = computed(() => props.resultTab?.result ?? null);
 const explainResult = computed(() => props.resultTab?.explainResult ?? null);
+const isConsole = computed(() => props.resultTab?.kind === "console");
+const consoleLines = computed(() => props.resultTab?.consoleLines ?? []);
 const error = computed(() => props.resultTab?.error ?? null);
 const loading = computed(() => props.resultTab?.loading ?? false);
 const queryText = computed(() => props.resultTab?.queryText ?? "");
@@ -368,6 +370,12 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
         <n-alert type="error" title="查询错误">{{ error }}</n-alert>
       </div>
       <ExplainView v-else-if="explainResult" :explain-result="explainResult" />
+      <div v-else-if="isConsole" class="console-view">
+        <div v-if="consoleLines.length === 0" class="result-empty">
+          <n-empty description="暂无 print() 输出" />
+        </div>
+        <pre v-else class="console-output">{{ consoleLines.join("\n") }}</pre>
+      </div>
       <div v-else-if="result" class="result-content">
         <div v-if="renderError" class="result-error">
           <n-alert type="warning" title="渲染错误">
@@ -454,6 +462,17 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
 @keyframes spin { to { transform: rotate(360deg); } }
 .result-error { padding: 16px; overflow: auto; }
 .result-empty { display: flex; align-items: center; justify-content: center; height: 100%; }
+.console-view { height: 100%; overflow: auto; background: #1e1e1e; }
+.console-output {
+  margin: 0;
+  padding: 10px 14px;
+  font-family: "Fira Code", "Consolas", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #d4d4d4;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 .search-bar { display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: #fffbe6; border-bottom: 1px solid #e0e0e0; flex-shrink: 0; }
 .search-count {
   font-size: 12px;

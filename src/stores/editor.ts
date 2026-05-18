@@ -1,4 +1,4 @@
-import { defineStore } from "pinia";
+import { defineStore, acceptHMRUpdate } from "pinia";
 import { ref, computed } from "vue";
 import type { EditorTab, ResultTab, ResultTabKind, TabExecutor } from "@/types/database";
 import * as queryApi from "@/api/query";
@@ -6,6 +6,73 @@ import * as collApi from "@/api/collectionMgmt";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useConnectionStore } from "@/stores/connection";
+import {
+  collectScriptOps,
+  extractDbStatements,
+  extractLoadPaths,
+  needsPreEvaluation,
+  preEvaluateStatement,
+  scriptOpToStatement,
+} from "@/utils/query-preeval";
+
+/** load("...") 引用是不是绝对文件系统路径 (Windows 盘符 / UNC / Unix 绝对路径) */
+function isFilesystemPath(p: string): boolean {
+  return /^[a-zA-Z]:[\\/]/.test(p) || p.startsWith("\\\\") || p.startsWith("/");
+}
+
+/**
+ * 解析单个 load("...") 引用的内容.
+ * 绝对路径 -> 读文件系统; 其它 -> 当成脚本库引用 (文件夹/脚本名). 任一失败时再试另一边.
+ */
+async function resolveLoadContent(path: string): Promise<string | null> {
+  const fromFs = () => invoke<string>("read_import_file", { path });
+  const fromScript = () => invoke<string>("resolve_script_ref", { reference: path });
+  const looksFs = isFilesystemPath(path);
+  try {
+    return looksFs ? await fromFs() : await fromScript();
+  } catch {
+    try {
+      return looksFs ? await fromScript() : await fromFs();
+    } catch {
+      return null;
+    }
+  }
+}
+
+/** 递归读取 load("...") 引用的内容 (文件系统或脚本库); 带 visited 防环 + 深度上限 */
+async function readLoadedHelpers(
+  content: string,
+  visited: Set<string>,
+  depth: number,
+): Promise<string> {
+  if (depth > 5) return "";
+  let acc = "";
+  for (const path of extractLoadPaths(content)) {
+    const norm = path.replace(/\\/g, "/");
+    if (visited.has(norm)) continue;
+    visited.add(norm);
+    const fileContent = await resolveLoadContent(path);
+    if (fileContent == null) continue; // 读不到 -> 跳过, 不阻断
+    // 先递归处理被引入文件里的 load()
+    const nested = await readLoadedHelpers(fileContent, visited, depth + 1);
+    acc += `${nested}\n// ===== loaded: ${path} =====\n${fileContent}\n`;
+  }
+  return acc;
+}
+
+/**
+ * 编辑器里有 helper 定义 / load() 引用时, 把语句参数里的函数调用在 webview JS 引擎里
+ * 求值成纯 JSON. 求值失败时退回原文.
+ */
+async function resolveQueryText(fullContent: string, statement: string): Promise<string> {
+  if (!needsPreEvaluation(fullContent)) return statement;
+  try {
+    const loadedHelpers = await readLoadedHelpers(fullContent, new Set(), 0);
+    return preEvaluateStatement(fullContent, statement, loadedHelpers);
+  } catch {
+    return statement;
+  }
+}
 
 const MAX_RESULT_TABS = 10;
 
@@ -53,6 +120,20 @@ function stripJsCommentsInline(text: string): string {
 export const useEditorStore = defineStore("editor", () => {
   const tabs = ref<EditorTab[]>([]);
   const activeTabId = ref<string | null>(null);
+
+  /** AI 提议但未确认的编辑: tabId -> 提议的新内容. 编辑器里以 diff 展示, 用户 Accept 才应用 */
+  const pendingEdits = ref<Record<string, string>>({});
+
+  /** 每个 tab 当前在编辑器里选中的文本 (MonacoEditor 实时写入, AI 工具读取) */
+  const selectionByTab = ref<Record<string, string>>({});
+  function setSelection(id: string, text: string) {
+    // 选区频繁变化, 只在真正变了时才写, 避免无谓的响应式触发
+    if (selectionByTab.value[id] === text) return;
+    selectionByTab.value = { ...selectionByTab.value, [id]: text };
+  }
+  function getSelection(id: string): string {
+    return selectionByTab.value[id] ?? "";
+  }
 
   const activeTab = computed(() => tabs.value.find((t) => t.id === activeTabId.value) ?? null);
 
@@ -117,6 +198,7 @@ export const useEditorStore = defineStore("editor", () => {
     const idx = tabs.value.findIndex((t) => t.id === id);
     if (idx === -1) return;
     tabs.value.splice(idx, 1);
+    rejectEdit(id); // 连带丢弃未确认的 AI 提议
     if (activeTabId.value === id) {
       activeTabId.value = tabs.value[Math.min(idx, tabs.value.length - 1)]?.id ?? null;
     }
@@ -127,9 +209,30 @@ export const useEditorStore = defineStore("editor", () => {
     if (tab) tab.content = content;
   }
 
+  // ---- AI 提议编辑 (pending edit) ----
+  /** AI 提议把某个 tab 的内容替换成 content; 不立即生效, 等用户在 diff 里确认 */
+  function proposeEdit(id: string, content: string) {
+    if (!tabs.value.some((t) => t.id === id)) return;
+    pendingEdits.value = { ...pendingEdits.value, [id]: content };
+  }
+  /** 接受提议: 应用新内容并清掉 pending */
+  function acceptEdit(id: string) {
+    const content = pendingEdits.value[id];
+    if (content === undefined) return;
+    setContent(id, content);
+    rejectEdit(id);
+  }
+  /** 拒绝提议: 丢弃 pending, 不改内容 */
+  function rejectEdit(id: string) {
+    if (pendingEdits.value[id] === undefined) return;
+    const next = { ...pendingEdits.value };
+    delete next[id];
+    pendingEdits.value = next;
+  }
+
   // ---- 结果 tab 管理 ----
   function buildResultTitle(kind: ResultTabKind, existing: ResultTab[]): string {
-    const base = kind === "find" ? "Find" : "Explain";
+    const base = kind === "find" ? "Find" : kind === "explain" ? "Explain" : "Console";
     const same = existing.filter((r) => r.kind === kind).length;
     return same === 0 ? base : `${base} (${same + 1})`;
   }
@@ -149,7 +252,23 @@ export const useEditorStore = defineStore("editor", () => {
       pageSize: 50,
       createdAt: Date.now(),
       aborted: false,
+      consoleLines: kind === "console" ? [] : undefined,
     };
+  }
+
+  /** 把 print()/printjson() 输出追加到该编辑器 tab 的 Console 结果页 (单例, 复用) */
+  function appendConsole(tab: EditorTab, lines: string[]) {
+    if (lines.length === 0) return;
+    let rt = tab.resultTabs.find((r) => r.kind === "console") ?? null;
+    if (!rt) {
+      const draft = newResultTab("console", "", tab.resultTabs);
+      pushResultTab(tab, draft);
+      rt = tab.resultTabs.find((r) => r.id === draft.id) ?? null;
+    }
+    if (!rt) return;
+    const stamp = new Date().toLocaleTimeString();
+    rt.consoleLines = [...(rt.consoleLines ?? []), `--- ${stamp} ---`, ...lines];
+    rt.loading = false;
   }
 
   /** 新增 result tab 并 set active; 超过上限就淘汰最早那个 */
@@ -294,14 +413,44 @@ export const useEditorStore = defineStore("editor", () => {
     const stripped = stripJsCommentsInline(text).trim();
     if (!stripped) return;
 
-    const rt = spawnResultTab(tab, "find", text);
+    // 数据库未选时 namespace 会变成 ".collection" -> 提前给友好提示, 不打后端.
+    // (show dbs / show databases 不依赖当前库, 放行)
+    const isShowDbs = /^show\s+(dbs|databases)\b/.test(stripped);
+    if (!tab.database && !isShowDbs) {
+      const rt = spawnResultTab(tab, "find", text);
+      if (rt) {
+        rt.error = "请先选择数据库 (工具栏右侧的数据库下拉)";
+        rt.loading = false;
+      }
+      return;
+    }
+
+    // 选中的不是直接以 db. 开头 (例如选了 "helper 函数 + 一条查询" 整段):
+    //   - 里面有 db.xxx 语句  -> 抽出最后一条当作要跑的查询, 走预求值
+    //   - 完全没有 db 语句、又有 helper/load -> 才是真正的脚本模式 (收集写操作)
+    let runText = text;
+    if (!stripped.startsWith("db.") && !stripped.startsWith("use ")) {
+      const dbStmts = extractDbStatements(text);
+      if (dbStmts.length > 0) {
+        runText = dbStmts[dbStmts.length - 1];
+      } else if (needsPreEvaluation(tab.content)) {
+        await executeScript(tab, text);
+        return;
+      }
+    }
+
+    // 预求值: helper 函数调用 / load() 引入 -> 纯 JSON 参数. resolved 同时存进 result tab,
+    // 翻页时直接复用 resolved 文本, 无需重复求值.
+    const resolved = await resolveQueryText(tab.content, runText);
+
+    const rt = spawnResultTab(tab, "find", resolved);
     if (!rt) return;
 
     try {
       const res = await queryApi.runQuery(
         tab.connectionId,
         tab.database,
-        text,
+        resolved,
         0,
         rt.pageSize,
         rt.currentQueryId ?? undefined,
@@ -313,6 +462,118 @@ export const useEditorStore = defineStore("editor", () => {
       rt.error = friendlyError(e);
     } finally {
       if (!rt.aborted) rt.loading = false;
+    }
+  }
+
+  /**
+   * 脚本模式执行: 整段命令式脚本在 webview JS 引擎里跑一遍 ——
+   * db 读操作真发后端拿数据, 写操作收集后批量执行, print() 输出捕获展示。
+   */
+  async function executeScript(tab: EditorTab, text: string) {
+    const rt = spawnResultTab(tab, "find", text);
+    if (!rt) return;
+    const start = Date.now();
+    try {
+      const loadedHelpers = await readLoadedHelpers(tab.content, new Set(), 0);
+      // 脚本里的 db 读操作真去后端执行 (read-then-write 脚本需要真实数据)
+      const runRead = async (statement: string) => {
+        const res = await queryApi.runQuery(tab.connectionId, tab.database, statement, 0, 1000);
+        return { documents: res.documents, count: res.count };
+      };
+      const { ops, output, error } = await collectScriptOps(tab.content, loadedHelpers, runRead);
+      if (rt.aborted) return;
+
+      if (error) {
+        rt.error = `脚本执行出错: ${error}`;
+        rt.loading = false;
+        return;
+      }
+
+      // 收集到写操作 -> 批量发后端执行
+      let summary: {
+        total: number;
+        ok: number;
+        failed: number;
+        firstError: string | null;
+        elapsedMs: number;
+      } | null = null;
+      if (ops.length > 0) {
+        const statements = ops.map(scriptOpToStatement);
+        summary = await invoke("run_script_ops", {
+          request: {
+            connectionId: tab.connectionId,
+            database: tab.database,
+            statements,
+          },
+        });
+        if (rt.aborted) return;
+      }
+
+      // print() 输出单独进 Console 结果页
+      if (output.length > 0) appendConsole(tab, output);
+
+      // 结果文档: 写操作汇总
+      const doc: Record<string, unknown> = {};
+      if (summary) {
+        doc["写操作"] = `${summary.ok} 成功 / ${summary.failed} 失败 (共 ${summary.total})`;
+        if (summary.firstError) doc["首个错误"] = summary.firstError;
+      } else {
+        doc["写操作"] = "无 (脚本只有读操作, 或写操作被注释掉了)";
+      }
+      if (output.length > 0) doc["脚本输出"] = `${output.length} 行 -> 见 Console 结果页`;
+      else if (!summary) doc["提示"] = "脚本跑完了, 但既没有写操作也没有 print 输出。";
+
+      rt.result = {
+        documents: [doc],
+        count: 1,
+        totalCount: 1,
+        executionTimeMs: Date.now() - start,
+      };
+      // appendConsole 会把 Console 页设为 active; 焦点拉回写操作汇总页
+      tab.activeResultTabId = rt.id;
+    } catch (e) {
+      if (rt.aborted) return;
+      rt.error = friendlyError(e);
+    } finally {
+      if (!rt.aborted) rt.loading = false;
+    }
+  }
+
+  /**
+   * 运行编辑器里的**全部**语句 —— 顺序执行每一条 db.xxx 语句, 各自产生一个结果 tab。
+   * 没有可拆分的 db 语句、但有 helper/load -> 退回脚本模式整体跑。
+   */
+  async function executeAll(editorTabId: string) {
+    const tab = tabs.value.find((t) => t.id === editorTabId);
+    if (!tab) return;
+    const content = tab.content.trim();
+    if (!content) return;
+    const stripped = stripJsCommentsInline(content).trim();
+    if (!stripped) return;
+
+    const isShowDbs = /^show\s+(dbs|databases)\b/.test(stripped);
+    if (!tab.database && !isShowDbs) {
+      const rt = spawnResultTab(tab, "find", content);
+      if (rt) {
+        rt.error = "请先选择数据库 (工具栏右侧的数据库下拉)";
+        rt.loading = false;
+      }
+      return;
+    }
+
+    const statements = extractDbStatements(content);
+    if (statements.length === 0) {
+      if (needsPreEvaluation(tab.content)) {
+        await executeScript(tab, content);
+      } else {
+        // 单条普通语句 (整段就是一条 db.xxx 或 use)
+        await executeQuery(editorTabId, content);
+      }
+      return;
+    }
+    // 逐条顺序执行, 每条一个结果 tab
+    for (const stmt of statements) {
+      await executeQuery(editorTabId, stmt);
     }
   }
 
@@ -347,14 +608,25 @@ export const useEditorStore = defineStore("editor", () => {
     const stripped = stripJsCommentsInline(text).trim();
     if (!stripped) return;
 
-    const rt = spawnResultTab(tab, "explain", text);
+    if (!tab.database) {
+      const rt = spawnResultTab(tab, "explain", text);
+      if (rt) {
+        rt.error = "请先选择数据库 (工具栏右侧的数据库下拉)";
+        rt.loading = false;
+      }
+      return;
+    }
+
+    const resolved = await resolveQueryText(tab.content, text);
+
+    const rt = spawnResultTab(tab, "explain", resolved);
     if (!rt) return;
 
     try {
       const res = await invoke<Record<string, unknown>>("explain_shell_query", {
         connectionId: tab.connectionId,
         database: tab.database,
-        queryText: text,
+        queryText: resolved,
       });
       if (rt.aborted) return;
       rt.explainResult = res;
@@ -454,11 +726,20 @@ export const useEditorStore = defineStore("editor", () => {
     activeTabId,
     activeTab,
     activeResultTab,
+    pendingEdits,
+    proposeEdit,
+    acceptEdit,
+    rejectEdit,
+    selectionByTab,
+    setSelection,
+    getSelection,
     createTab,
     closeTab,
     setContent,
     executeQuery,
+    executeAll,
     executeExplain,
+    appendConsole,
     pushExternalResult,
     setTabExecutor,
     setTabSkipLint,
@@ -472,3 +753,8 @@ export const useEditorStore = defineStore("editor", () => {
     stopResultTab,
   };
 });
+
+// Vite HMR: 让 editor store 改动能干净热替换, 不再触发整页 reload / 旧代码残留
+if (import.meta.hot) {
+  import.meta.hot.accept(acceptHMRUpdate(useEditorStore, import.meta.hot));
+}

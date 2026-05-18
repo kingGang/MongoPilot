@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, watch } from "vue";
+import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from "vue";
 import * as monaco from "monaco-editor";
 // 显式导入语言支持（防止 Vite/esbuild tree-shaking 丢弃 side-effect imports）
 import "monaco-editor/esm/vs/basic-languages/javascript/javascript.contribution";
@@ -15,17 +15,27 @@ import {
 import { useEditorStore } from "@/stores/editor";
 import { useDatabaseStore } from "@/stores/database";
 import * as aiApi from "@/api/ai";
+import { formatMongoShell } from "@/utils/mongo-format";
+import { editorSettings } from "@/utils/editor-settings";
 
 const props = defineProps<{
   modelValue: string;
   language?: string;
   /** 每次递增时触发执行当前语句 */
   runTrigger?: number;
+  /** 每次递增时触发格式化 (工具栏 Format 按钮) */
+  formatTrigger?: number;
+  /** 所属编辑器 tab id —— AI 提议编辑的 diff 确认需要它 */
+  tabId?: string;
 }>();
 
 const emit = defineEmits<{
   "update:modelValue": [value: string];
   run: [statement: string];
+  /** 运行编辑器里所有语句 (Ctrl+Shift+Enter / 工具栏 Run All) */
+  runAll: [];
+  /** 右键 "AI 分析选中代码" —— 选区已写入 editorStore, 父组件打开 AI 面板并触发 agent */
+  aiAnalyze: [];
 }>();
 
 const editorRef = ref<HTMLDivElement>();
@@ -33,6 +43,65 @@ let editor: monaco.editor.IStandaloneCodeEditor | null = null;
 let statementDecorations: monaco.editor.IEditorDecorationsCollection | null = null;
 
 const editorStore = useEditorStore();
+
+// ---- AI 提议编辑: diff 确认 ----
+const diffRef = ref<HTMLDivElement>();
+let diffEditor: monaco.editor.IStandaloneDiffEditor | null = null;
+let diffModels: { original: monaco.editor.ITextModel; modified: monaco.editor.ITextModel } | null =
+  null;
+
+/** 当前 tab 是否有 AI 提议的、未确认的编辑 */
+const pendingContent = computed(() =>
+  props.tabId ? editorStore.pendingEdits[props.tabId] : undefined,
+);
+const hasPendingEdit = computed(() => pendingContent.value !== undefined);
+
+/** 建 / 更新 diff 编辑器: 左=当前内容, 右=AI 提议内容 (只读) */
+function setupDiff(modified: string) {
+  if (!diffRef.value) return;
+  if (!diffEditor) {
+    diffEditor = monaco.editor.createDiffEditor(diffRef.value, {
+      readOnly: true,
+      automaticLayout: true,
+      minimap: { enabled: false },
+      fontSize: 14,
+      renderSideBySide: true,
+      theme: MONGO_THEME_LIGHT,
+      scrollBeyondLastLine: false,
+    });
+  }
+  const old = diffModels;
+  diffModels = {
+    original: monaco.editor.createModel(props.modelValue, MONGO_LANGUAGE_ID),
+    modified: monaco.editor.createModel(modified, MONGO_LANGUAGE_ID),
+  };
+  diffEditor.setModel(diffModels);
+  if (old) {
+    old.original.dispose();
+    old.modified.dispose();
+  }
+}
+
+function onAcceptEdit() {
+  if (props.tabId) editorStore.acceptEdit(props.tabId);
+}
+function onRejectEdit() {
+  if (props.tabId) editorStore.rejectEdit(props.tabId);
+}
+
+/** 把编辑器当前选区文本同步进 editorStore, 供 AI 工具 get_editor_selection 读取 */
+function syncSelection() {
+  if (!editor || !props.tabId) return;
+  const sel = editor.getSelection();
+  const text = sel && !sel.isEmpty() ? editor.getModel()?.getValueInRange(sel) ?? "" : "";
+  editorStore.setSelection(props.tabId, text);
+}
+
+watch(pendingContent, async (val) => {
+  if (val === undefined) return;
+  await nextTick();
+  setupDiff(val);
+});
 const dbStore = useDatabaseStore();
 
 // ---- Schema 缓存 ----
@@ -82,6 +151,7 @@ registerMongoCompletions({
     return colls.map((c) => c.name);
   },
   getFieldNames,
+  currentCollection: () => editorStore.activeTab?.collection || "",
 });
 
 // ---- 语句解析 ----
@@ -143,6 +213,45 @@ function bracketDelta(line: string): number {
   return d;
 }
 
+/** 检测 top-level JS 代码块 (function / const / let / var / class / if / for / while / import / export):
+ *  返回这些块所覆盖的编辑器行号集合 (1-indexed), lint 不再报"无法识别"
+ */
+function buildJsCodeBlocks(lines: string[], commentLines: Set<number>): Set<number> {
+  const covered = new Set<number>();
+  let inBlock = false;
+  let depth = 0;
+  const starterRe =
+    /^(async\s+)?function\b|^const\b|^let\b|^var\b|^class\b|^export\b|^import\b|^if\s*\(|^for\s*\(|^while\s*\(|^try\b|^switch\s*\(|^[a-zA-Z_$][\w$]*\s*\(/;
+  for (let i = 0; i < lines.length; i++) {
+    if (commentLines.has(i)) {
+      if (inBlock) covered.add(i + 1);
+      continue;
+    }
+    const trimmed = lines[i].trim();
+    if (!inBlock) {
+      if (!trimmed) continue;
+      if (
+        trimmed.startsWith("db.") ||
+        trimmed.startsWith("use ") ||
+        trimmed.startsWith("show ")
+      ) {
+        continue;
+      }
+      if (starterRe.test(trimmed)) {
+        inBlock = true;
+        depth = bracketDelta(lines[i]);
+        covered.add(i + 1);
+        if (depth <= 0) inBlock = false; // 单行声明: const foo = 1;
+      }
+    } else {
+      covered.add(i + 1);
+      depth += bracketDelta(lines[i]);
+      if (depth <= 0) inBlock = false;
+    }
+  }
+  return covered;
+}
+
 function parseStatements(content: string): StatementRange[] {
   const lines = content.split("\n");
   const commentLines = buildCommentSet(lines);
@@ -177,18 +286,35 @@ function parseStatements(content: string): StatementRange[] {
     const line = lines[i];
     const trimmed = line.trim();
 
-    if (trimmed.startsWith("db.") || trimmed.startsWith("use ")) {
+    if (
+      trimmed.startsWith("db.") ||
+      trimmed.startsWith("use ") ||
+      trimmed.startsWith("show ")
+    ) {
       // 新语句开头之前先收尾旧的
       flush();
       current = { startLine: i + 1, lines: [line] };
       depth = bracketDelta(line);
+    } else if (current && trimmed.startsWith(".")) {
+      // 链式调用续行 (例如格式化后的 .projection({}) 单独成行, 即便上一行已闭合也算续行)
+      current.lines.push(line);
+      depth += bracketDelta(line);
     } else if (current && (trimmed !== "" || depth > 0)) {
       // 续行: 非空, 或语句未闭合 (允许语句中间出现空行)
       current.lines.push(line);
       depth += bracketDelta(line);
     } else if (current && trimmed === "" && depth === 0) {
-      // 完整语句外的空行 → 收尾
-      flush();
+      // 空行: 若下一非空非注释行是 .xxx (链式), 视为续行, 不 flush
+      let nextNonEmpty = -1;
+      for (let k = i + 1; k < lines.length; k++) {
+        if (commentLines.has(k)) continue;
+        if (lines[k].trim()) { nextNonEmpty = k; break; }
+      }
+      if (nextNonEmpty >= 0 && lines[nextNonEmpty].trim().startsWith(".")) {
+        current.lines.push(line);
+      } else {
+        flush();
+      }
     }
     // !current && trimmed === "" → 直接忽略
   }
@@ -315,17 +441,102 @@ let lintTimer: ReturnType<typeof setTimeout> | null = null;
  * 例: {_id:1, name:"test"} → {"_id":1, "name":"test"}
  *     ObjectId("abc")      → "ObjectId(abc)"
  */
+/**
+ * 把所有 `identifier(...)` 调用 (含 `new Foo(...)`) 替换成 JSON 安全的占位字符串.
+ * 字符串感知: 不动字符串内部的同样写法; 括号配对感知: 支持嵌套.
+ * 覆盖范围: ObjectId/ISODate 等 shell 构造器 + 用户自定义 helper 函数 (encryptPhoneNumber(...) 之类).
+ */
+function replaceFunctionCalls(text: string): string {
+  let out = "";
+  const n = text.length;
+  let i = 0;
+  const isIdentStart = (c: string) => /[a-zA-Z_$]/.test(c);
+  const isIdentChar = (c: string) => /[a-zA-Z0-9_$]/.test(c);
+
+  while (i < n) {
+    const c = text[i];
+    // 跳过字符串
+    if (c === '"' || c === "'") {
+      const q = c;
+      out += c;
+      i++;
+      while (i < n) {
+        out += text[i];
+        if (text[i] === "\\" && i + 1 < n) {
+          out += text[i + 1];
+          i += 2;
+          continue;
+        }
+        if (text[i] === q) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (isIdentStart(c)) {
+      const callStart = i;
+      let j = i;
+      while (j < n && isIdentChar(text[j])) j++;
+      let ident = text.slice(i, j);
+      // new Foo(...) : 把 new + 构造器名一并算进 callStart..
+      if (ident === "new") {
+        let p = j;
+        while (p < n && /\s/.test(text[p])) p++;
+        if (p < n && isIdentStart(text[p])) {
+          let q = p;
+          while (q < n && isIdentChar(text[q])) q++;
+          j = q;
+          ident = text.slice(p, q);
+        }
+      }
+      // 跳过空白看是否跟 (
+      let k = j;
+      while (k < n && /\s/.test(text[k])) k++;
+      if (k < n && text[k] === "(") {
+        // 配对找到对应 )
+        let depth = 0;
+        let m = k;
+        let inStr = false;
+        let strCh = "";
+        for (; m < n; m++) {
+          const ch = text[m];
+          if (inStr) {
+            if (ch === "\\") { m++; continue; }
+            if (ch === strCh) inStr = false;
+            continue;
+          }
+          if (ch === '"' || ch === "'") { inStr = true; strCh = ch; continue; }
+          if (ch === "(") depth++;
+          else if (ch === ")") {
+            depth--;
+            if (depth === 0) break;
+          }
+        }
+        if (m < n && depth === 0) {
+          out += JSON.stringify(text.slice(callStart, m + 1));
+          i = m + 1;
+          continue;
+        }
+      }
+      // 不是函数调用, 原样输出标识符
+      out += text.slice(callStart, j);
+      i = j;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
 function relaxJsonForValidation(text: string): string {
   // 0. 剥掉 JS 风格注释 (//... 与 /* ... */); 字符串内的同样写法保留.
-  //    在 shell 类型替换之前做, 因为注释内可能包含 `ObjectId(...)` 等字面量.
   let result = stripJsComments(text);
-  // 1. 将 MongoDB Shell 类型构造器替换为普通字符串，避免 JSON.parse 报错
-  //    ObjectId("..."), ISODate("..."), NumberLong("..."), NumberDecimal("..."),
-  //    UUID("..."), BinData(...), Timestamp(...), new Date("..."), RegExp(...)
-  result = result.replace(
-    /(?:new\s+)?(?:ObjectId|ISODate|UUID|NumberLong|NumberInt|NumberDecimal|Double|BinData|Timestamp|Date|RegExp)\s*\([^)]*\)/g,
-    (m) => JSON.stringify(m),
-  );
+  // 1. 把所有 identifier(...) 调用替换成占位字符串.
+  //    覆盖 ObjectId/ISODate 等 shell 类型, 也覆盖用户自定义 helper 函数调用.
+  result = replaceFunctionCalls(result);
   // 正则字面量 /pattern/flags
   result = result.replace(/\/(?:[^/\\]|\\.)+\/[gimsuy]*/g, (m) => JSON.stringify(m));
 
@@ -336,8 +547,6 @@ function relaxJsonForValidation(text: string): string {
   );
   // 3. 去除尾随逗号 (Shell 风格 mongo 容忍 {a:1,} / [1,2,] / 多 stage 管道 stage,)
   //    JSON.parse 不容尾随逗号, 会让 $project 等后续 stage 被误标红.
-  //    这里是 lint 用的临时字符串, 不影响编辑器内容; 字符串里的 `,]`/`,}`
-  //    极少出现, 即便误剥也只是 false negative, 不会出现 false positive.
   result = result.replace(/,(\s*[}\]])/g, "$1");
   return result;
 }
@@ -478,9 +687,16 @@ function lintContent() {
     for (let l = stmt.startLine; l <= stmt.endLine; l++) coveredLines.add(l);
   }
   const commentLines = buildCommentSet(lines);
-  // 非空行如果不属于任何语句且不是注释，标记为错误
+  // top-level JS 代码块 (function / const / let / var 等), 也算"已覆盖"不报错
+  const jsBlockLines = buildJsCodeBlocks(lines, commentLines);
+  // 非空行如果不属于任何语句/注释/JS 块, 才标记为"无法识别"
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim() && !coveredLines.has(i + 1) && !commentLines.has(i)) {
+    if (
+      lines[i].trim() &&
+      !coveredLines.has(i + 1) &&
+      !commentLines.has(i) &&
+      !jsBlockLines.has(i + 1)
+    ) {
       markers.push({
         severity: monaco.MarkerSeverity.Error,
         message: "无法识别的语句，需要以 db. 开头",
@@ -687,6 +903,22 @@ function scheduleLint() {
   lintTimer = setTimeout(lintContent, 300);
 }
 
+/** 格式化: 有选区只格式化选区, 否则格式化全文 */
+function formatEditor() {
+  if (!editor) return;
+  const model = editor.getModel();
+  if (!model) return;
+  const sel = editor.getSelection();
+  if (sel && !sel.isEmpty()) {
+    const text = model.getValueInRange(sel);
+    editor.executeEdits("mongo-format", [{ range: sel, text: formatMongoShell(text) }]);
+  } else {
+    editor.executeEdits("mongo-format", [
+      { range: model.getFullModelRange(), text: formatMongoShell(model.getValue()) },
+    ]);
+  }
+}
+
 function handleRun() {
   // Ctrl+Enter 时编辑器仍有焦点，可以直接读选区
   if (editor) {
@@ -709,13 +941,13 @@ onMounted(() => {
     value: props.modelValue,
     language: props.language || MONGO_LANGUAGE_ID,
     theme: MONGO_THEME_LIGHT,
-    minimap: { enabled: false },
-    fontSize: 14,
+    minimap: { enabled: editorSettings.minimap },
+    fontSize: editorSettings.fontSize,
     lineNumbers: "on",
     scrollBeyondLastLine: false,
     automaticLayout: true,
     tabSize: 2,
-    wordWrap: "on",
+    wordWrap: editorSettings.wordWrap ? "on" : "off",
     suggestOnTriggerCharacters: true,
     quickSuggestions: true,
     snippetSuggestions: "inline",
@@ -753,27 +985,163 @@ onMounted(() => {
 
   editor.onDidChangeCursorSelection(() => {
     updateRunTarget();
+    syncSelection();
   });
 
   editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => handleRun());
+  // Ctrl+Shift+Enter -> 运行所有语句
+  editor.addCommand(
+    monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter,
+    () => emit("runAll"),
+  );
+  // Ctrl+/ -> 注释/取消注释 (mongosh 语言已配 comments, 这里显式绑定确保生效)
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Slash, () => {
+    editor?.getAction("editor.action.commentLine")?.run();
+  });
+
+  // 右键菜单: 格式化
+  editor.addAction({
+    id: "mongopilot.format",
+    label: "格式化 (Beautify)",
+    keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.KeyL],
+    contextMenuGroupId: "1_modification",
+    contextMenuOrder: 1.5,
+    run: () => formatEditor(),
+  });
+
+  // 右键菜单: AI 分析选中代码 (仅在有选区时出现)
+  editor.addAction({
+    id: "mongopilot.ai-analyze-selection",
+    label: "✦ AI 分析选中代码",
+    precondition: "editorHasSelection",
+    contextMenuGroupId: "navigation",
+    contextMenuOrder: 0,
+    run: () => {
+      syncSelection();
+      emit("aiAnalyze");
+    },
+  });
 });
+
+// 工具栏 Format 按钮 -> 触发格式化
+watch(
+  () => props.formatTrigger,
+  () => formatEditor(),
+);
+
+// 编辑器外观设置变化 -> 实时应用到所有编辑器实例
+watch(
+  editorSettings,
+  (s) => {
+    editor?.updateOptions({
+      fontSize: s.fontSize,
+      wordWrap: s.wordWrap ? "on" : "off",
+      minimap: { enabled: s.minimap },
+    });
+  },
+  { deep: true },
+);
 
 watch(() => props.modelValue, (newVal) => {
   if (editor && editor.getValue() !== newVal) editor.setValue(newVal);
 });
 
-onBeforeUnmount(() => { editor?.dispose(); });
+onBeforeUnmount(() => {
+  editor?.dispose();
+  diffEditor?.dispose();
+  diffModels?.original.dispose();
+  diffModels?.modified.dispose();
+});
 </script>
 
 <template>
-  <div ref="editorRef" class="monaco-editor-container" spellcheck="false" />
+  <div class="monaco-wrap">
+    <div
+      v-show="!hasPendingEdit"
+      ref="editorRef"
+      class="monaco-editor-container"
+      spellcheck="false"
+    />
+    <div v-show="hasPendingEdit" class="diff-wrap">
+      <div class="diff-bar">
+        <span class="diff-bar-label">✦ AI 提议修改 —— 确认后才会应用到编辑器</span>
+        <div class="diff-bar-actions">
+          <button class="diff-btn reject" @click="onRejectEdit">放弃</button>
+          <button class="diff-btn accept" @click="onAcceptEdit">应用修改</button>
+        </div>
+      </div>
+      <div ref="diffRef" class="diff-container" />
+    </div>
+  </div>
 </template>
 
 <style>
+.monaco-wrap { width: 100%; height: 100%; min-height: 200px; }
 .monaco-editor-container { width: 100%; height: 100%; min-height: 200px; }
 /* 当前语句高亮（浅色主题） */
 .current-statement-highlight {
   background: rgba(56, 117, 215, 0.08) !important;
   border-left: 2px solid #3875d7 !important;
+}
+/* 补全弹窗里代码片段图标染成橙色, 跟方法 (紫色六边形) / 字段 / 关键字明显区分 */
+.monaco-editor .suggest-widget .codicon-symbol-snippet,
+.monaco-editor .suggest-widget .codicon-symbol-snippet::before {
+  color: #e8a838 !important;
+}
+.monaco-editor .suggest-widget .monaco-icon-label.snippet > .monaco-icon-label-container::before {
+  color: #e8a838 !important;
+}
+/* AI 提议编辑的 diff 视图 */
+.diff-wrap {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.diff-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 10px;
+  background: #f0f7ff;
+  border-bottom: 1px solid #cfe3fb;
+  flex-shrink: 0;
+}
+.diff-bar-label {
+  font-size: 12px;
+  color: #2b6cb0;
+  font-weight: 500;
+}
+.diff-bar-actions {
+  display: flex;
+  gap: 6px;
+}
+.diff-btn {
+  font-size: 12px;
+  padding: 3px 12px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  font: inherit;
+}
+.diff-btn.accept {
+  background: #2080f0;
+  color: #fff;
+}
+.diff-btn.accept:hover {
+  background: #4098fc;
+}
+.diff-btn.reject {
+  background: #fff;
+  color: #666;
+  border-color: #d0d0d0;
+}
+.diff-btn.reject:hover {
+  background: #f5f5f5;
+}
+.diff-container {
+  flex: 1;
+  min-height: 0;
 }
 </style>

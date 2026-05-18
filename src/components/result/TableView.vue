@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, h, ref, nextTick, watch } from "vue";
-import { NDataTable, NTooltip, NDropdown, useMessage } from "naive-ui";
+import { computed, h, ref, shallowRef, nextTick, watch } from "vue";
+import { NDataTable, NDropdown, useMessage } from "naive-ui";
 import type { DataTableColumns, DataTableColumn } from "naive-ui";
 import { getBsonType, formatBsonCell, getValueColor } from "@/utils/bson-format";
 import { highlightKeyword } from "@/utils/text-highlight";
@@ -196,145 +196,173 @@ function objectPreview(val: unknown): string {
   catch { return String(val); }
 }
 
-const columns = computed<DataTableColumns>(() => {
-  if (props.documents.length === 0) return [];
+/** 列宽持久化: key -> width. 拖动结束 snapshot 一次, 下次重建列时沿用 */
+const colWidthMap = ref<Record<string, number>>({});
 
-  // 多选列 (仅当父组件传入 docKeyFn 时启用)
-  const selectionCol: DataTableColumn | null = props.docKeyFn
-    ? ({ type: "selection", width: 36, fixed: "left" } as DataTableColumn)
-    : null;
+/** 字段名集合的稳定签名 (排序后用 | 拼接) —— 仅在它变化时重建列定义,
+ *  避免 props.documents 每次变化 (翻页/搜索/编辑) 都重算列, 重置用户调好的列宽 */
+const columnKeysSig = computed(() => {
+  if (props.documents.length === 0) return "";
+  const set = new Set<string>();
+  for (const doc of props.documents) for (const k of Object.keys(doc)) set.add(k);
+  return [...set].sort().join("|");
+});
 
-  // 序号列
-  const indexCol = {
-    title: "#",
-    key: "__index",
-    width: 50,
-    render(row: Record<string, unknown>) {
-      const idx = (row as Record<string, unknown>).__rowKey as number;
-      return h("span", { style: "color:#999;font-size:11px" }, String((props.rowOffset ?? 0) + idx + 1));
-    },
-  };
+/** 默认列宽 */
+function defaultWidth(key: string): number {
+  return key === "_id" ? 240 : 160;
+}
 
-  const keySet = new Set<string>();
-  for (const doc of props.documents) {
-    for (const key of Object.keys(doc)) keySet.add(key);
+/** 拖动结束时把当前各列的实际宽度记进 colWidthMap (NaiveUI 在拖动时 mutate column.width) */
+function snapshotColWidths() {
+  for (const col of columns.value) {
+    if (!("key" in col)) continue;
+    const k = col.key;
+    if (typeof k !== "string" || k === "__index") continue;
+    if (typeof col.width === "number") {
+      colWidthMap.value[k] = col.width;
+    }
   }
-  const dataCols = Array.from(keySet).map((key) => ({
-    title: key,
-    key,
-    width: key === "_id" ? 240 : 160,
-    resizable: true,
-    ellipsis: { tooltip: false },
-    render(row: Record<string, unknown>) {
-      const val = row[key];
-      const rowIdx = (row as Record<string, unknown>).__rowKey as number;
+}
 
-      if (val === null || val === undefined) {
-        return h("span", { style: "color:#999;font-style:italic" }, "null");
-      }
+const columns = shallowRef<DataTableColumns>([]);
 
-      const type = getBsonType(val);
-      const color = getValueColor(type);
+watch(
+  [columnKeysSig, () => !!props.docKeyFn],
+  () => {
+    if (props.documents.length === 0) {
+      columns.value = [];
+      return;
+    }
 
-      // _id 列：紫色可点击，无下划线
-      if (key === "_id") {
-        const oid = type === "ObjectId"
-          ? String((val as Record<string, unknown>).$oid ?? val)
-          : formatBsonCell(val);
-        return h("span", {
-          style: "color:#c678dd;cursor:pointer",
-          innerHTML: props.searchKeyword
-            ? highlightKeyword(oid, props.searchKeyword, !!props.matchCase)
-            : oid,
-          onClick: (e: MouseEvent) => {
-            e.stopPropagation();
-            docViewerIndex.value = rowIdx;
-            showDocViewer.value = true;
-          },
-        });
-      }
+    const selectionCol: DataTableColumn | null = props.docKeyFn
+      ? ({ type: "selection", width: 36, fixed: "left" } as DataTableColumn)
+      : null;
 
-      // 内联编辑状态
-      if (isEditing(rowIdx, key)) {
-        if (type === "Boolean") {
+    const indexCol = {
+      title: "#",
+      key: "__index",
+      width: 50,
+      render(row: Record<string, unknown>) {
+        const idx = (row as Record<string, unknown>).__rowKey as number;
+        return h("span", { style: "color:#999;font-size:11px" }, String((props.rowOffset ?? 0) + idx + 1));
+      },
+    };
+
+    const keySet = new Set<string>();
+    for (const doc of props.documents) for (const k of Object.keys(doc)) keySet.add(k);
+
+    const dataCols = Array.from(keySet).map((key) => ({
+      title: key,
+      key,
+      width: colWidthMap.value[key] ?? defaultWidth(key),
+      resizable: true,
+      ellipsis: { tooltip: false },
+      render(row: Record<string, unknown>) {
+        const val = row[key];
+        const rowIdx = (row as Record<string, unknown>).__rowKey as number;
+
+        if (val === null || val === undefined) {
+          return h("span", { style: "color:#999;font-style:italic" }, "null");
+        }
+
+        const type = getBsonType(val);
+        const color = getValueColor(type);
+
+        // _id 列：紫色可点击
+        if (key === "_id") {
+          const oid = type === "ObjectId"
+            ? String((val as Record<string, unknown>).$oid ?? val)
+            : formatBsonCell(val);
+          return h("span", {
+            style: "color:#c678dd;cursor:pointer",
+            innerHTML: props.searchKeyword
+              ? highlightKeyword(oid, props.searchKeyword, !!props.matchCase)
+              : oid,
+            onClick: (e: MouseEvent) => {
+              e.stopPropagation();
+              docViewerIndex.value = rowIdx;
+              showDocViewer.value = true;
+            },
+          });
+        }
+
+        // 内联编辑状态
+        if (isEditing(rowIdx, key)) {
+          if (type === "Boolean") {
+            return h("div", { class: "inline-editing" }, [
+              h("select", {
+                value: editingValue.value,
+                class: "inline-select",
+                onChange: (e: Event) => { editingValue.value = (e.target as HTMLSelectElement).value; },
+                onBlur: () => commitEdit(),
+                onKeydown: (e: KeyboardEvent) => {
+                  if (e.key === "Enter") commitEdit();
+                  if (e.key === "Escape") cancelEdit();
+                },
+              }, [
+                h("option", { value: "true" }, "true"),
+                h("option", { value: "false" }, "false"),
+              ]),
+            ]);
+          }
           return h("div", { class: "inline-editing" }, [
-            h("select", {
+            h("input", {
               value: editingValue.value,
-              class: "inline-select",
-              onChange: (e: Event) => { editingValue.value = (e.target as HTMLSelectElement).value; },
+              class: "inline-input",
+              type: (type === "Int32" || type === "Double") ? "number" : "text",
+              autofocus: true,
+              onInput: (e: Event) => { editingValue.value = (e.target as HTMLInputElement).value; },
               onBlur: () => commitEdit(),
               onKeydown: (e: KeyboardEvent) => {
                 if (e.key === "Enter") commitEdit();
                 if (e.key === "Escape") cancelEdit();
               },
-            }, [
-              h("option", { value: "true" }, "true"),
-              h("option", { value: "false" }, "false"),
-            ]),
+              onVnodeMounted: (vnode: any) => {
+                nextTick(() => vnode.el?.focus?.());
+              },
+            }),
           ]);
         }
-        return h("div", { class: "inline-editing" }, [
-          h("input", {
-            value: editingValue.value,
-            class: "inline-input",
-            type: (type === "Int32" || type === "Double") ? "number" : "text",
-            autofocus: true,
-            onInput: (e: Event) => { editingValue.value = (e.target as HTMLInputElement).value; },
-            onBlur: () => commitEdit(),
-            onKeydown: (e: KeyboardEvent) => {
-              if (e.key === "Enter") commitEdit();
-              if (e.key === "Escape") cancelEdit();
-            },
-            onVnodeMounted: (vnode: any) => {
-              nextTick(() => vnode.el?.focus?.());
-            },
-          }),
-        ]);
-      }
 
-      // 复杂类型：hover 预览 + 点击编辑对话框
-      if (type === "Document" || type === "Array") {
-        const label = type === "Document"
-          ? `{${Object.keys(val as object).length} fields}`
-          : `[${(val as unknown[]).length}]`;
-        return h(
-          NTooltip,
-          { trigger: "hover", placement: "bottom-start", delay: 300, style: "max-width:500px" },
-          {
-            trigger: () => h("span", {
-              style: "color:#61afef;cursor:pointer",
-              onClick: (e: MouseEvent) => { e.stopPropagation(); openDetail(key, val, row); },
-            }, label),
-            default: () => h("pre", {
-              style: "margin:0;font-size:12px;color:#d4d4d4;white-space:pre-wrap;max-height:200px;overflow:auto",
-            }, objectPreview(val)),
-          },
-        );
-      }
+        // 复杂类型: 用原生 title (浏览器气泡, 无 Vue 开销) 做 hover 预览, 点击进编辑对话框.
+        //   —— 之前每格挂一个 NTooltip 实例, 列宽拖动时每次 mousemove 都要重渲染, 卡顿主因.
+        if (type === "Document" || type === "Array") {
+          const label = type === "Document"
+            ? `{${Object.keys(val as object).length} fields}`
+            : `[${(val as unknown[]).length}]`;
+          return h("span", {
+            style: "color:#61afef;cursor:pointer",
+            title: objectPreview(val),
+            onClick: (e: MouseEvent) => { e.stopPropagation(); openDetail(key, val, row); },
+          }, label);
+        }
 
-      // 简单类型：双击进入编辑
-      const text = formatBsonCell(val);
-      if (props.searchKeyword) {
+        // 简单类型: 双击进入编辑
+        const text = formatBsonCell(val);
+        if (props.searchKeyword) {
+          return h("span", {
+            style: `${color ? `color:${color};` : ""}cursor:text`,
+            innerHTML: highlightKeyword(text, props.searchKeyword, !!props.matchCase),
+            onDblclick: (e: MouseEvent) => {
+              e.stopPropagation();
+              startEdit(rowIdx, key, val, type);
+            },
+          });
+        }
         return h("span", {
           style: `${color ? `color:${color};` : ""}cursor:text`,
-          innerHTML: highlightKeyword(text, props.searchKeyword, !!props.matchCase),
           onDblclick: (e: MouseEvent) => {
             e.stopPropagation();
             startEdit(rowIdx, key, val, type);
           },
-        });
-      }
-      return h("span", {
-        style: `${color ? `color:${color};` : ""}cursor:text`,
-        onDblclick: (e: MouseEvent) => {
-          e.stopPropagation();
-          startEdit(rowIdx, key, val, type);
-        },
-      }, text);
-    },
-  }));
-  return selectionCol ? [selectionCol, indexCol, ...dataCols] : [indexCol, ...dataCols];
-});
+        }, text);
+      },
+    }));
+    columns.value = selectionCol ? [selectionCol, indexCol, ...dataCols] : [indexCol, ...dataCols];
+  },
+  { immediate: true },
+);
 
 const scrollX = computed(() => {
   let total = 0;
@@ -426,7 +454,7 @@ async function handleCtxSelect(action: string) {
 </script>
 
 <template>
-  <div class="table-view">
+  <div class="table-view" @mouseup="snapshotColWidths">
     <n-data-table
       :columns="columns"
       :data="data"
@@ -475,6 +503,15 @@ async function handleCtxSelect(action: string) {
 <style scoped>
 .table-view {
   height: 100%;
+}
+/* 列宽拖动时减小重排范围 + 关掉单元格上的 CSS 过渡, 让拖动感觉跟手 */
+.table-view :deep(.n-data-table-td) {
+  contain: layout paint;
+  transition: none !important;
+}
+.table-view :deep(.n-data-table-resize-button) {
+  /* 加宽拖动热区, 更容易抓住 */
+  width: 8px !important;
 }
 .table-view :deep(tr.row-matched > td) {
   background: #fff8e1 !important;

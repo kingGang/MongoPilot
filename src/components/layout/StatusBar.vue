@@ -1,10 +1,21 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
+import { getVersion } from "@tauri-apps/api/app";
 import { useConnectionStore } from "@/stores/connection";
 import { useEditorStore } from "@/stores/editor";
 
 const connStore = useConnectionStore();
 const editorStore = useEditorStore();
+
+// 版本号从 tauri.conf.json 运行时读取, 发版只需改 conf 文件, 不用动这里
+const appVersion = ref("");
+getVersion()
+  .then((v) => {
+    appVersion.value = v;
+  })
+  .catch(() => {
+    /* 非 Tauri 环境 (纯 vite preview) 静默 */
+  });
 
 const activeCount = computed(() => connStore.activeIds.size);
 const tab = computed(() => editorStore.activeTab);
@@ -49,7 +60,9 @@ const execInfo = computed(() => {
       <span v-if="resultTab?.loading" class="status-item loading-text">Executing...</span>
       <span v-else-if="execInfo" class="status-item">{{ execInfo }}</span>
       <span v-if="resultTab" class="status-item">{{ pageInfo }}</span>
-      <span class="status-item version">MongoPilot v0.1.0</span>
+      <span class="status-item version">
+        MongoPilot{{ appVersion ? ` v${appVersion}` : "" }}
+      </span>
     </div>
   </div>
 </template>

@@ -5,6 +5,12 @@ import { getBsonType, formatTreeValue, extractIdDisplay, getTypeColor, getValueC
 import { highlightKeyword } from "@/utils/text-highlight";
 import ValueDetail from "./ValueDetail.vue";
 import DocumentViewer from "./DocumentViewer.vue";
+import {
+  buildUpdateOneQuery,
+  buildInsertOneQuery,
+  buildDeleteOneQuery,
+  buildFindByIdQuery,
+} from "@/utils/mongo-shell-format";
 
 const props = defineProps<{
   documents: Record<string, unknown>[];
@@ -122,12 +128,15 @@ const ctxMenuX = ref(0);
 const ctxMenuY = ref(0);
 const ctxRow = ref<RowItem | null>(null);
 
-const ctxMenuOptions = computed(() => {
+type CtxItem =
+  | { label: string; key: string }
+  | { type: "divider"; key: string }
+  | { label: string; key: string; children: { label: string; key: string }[] };
+
+const ctxMenuOptions = computed<CtxItem[]>(() => {
   const r = ctxRow.value;
   if (!r) return [];
-  const items = [
-    { label: "复制值", key: "copy-value" },
-  ];
+  const items: CtxItem[] = [{ label: "复制值", key: "copy-value" }];
   if (r.isDocRoot) {
     items.unshift({ label: "复制文档 (JSON)", key: "copy-doc" });
   } else {
@@ -135,6 +144,17 @@ const ctxMenuOptions = computed(() => {
   }
   if (r.isDocRoot) {
     items.push({ label: "查看文档", key: "view-doc" });
+    items.push({ type: "divider", key: "d-stmt" });
+    items.push({
+      label: "生成语句到新标签页",
+      key: "gen",
+      children: [
+        { label: "find — 按 _id 查询", key: "gen-find" },
+        { label: "updateOne — $set 该文档", key: "gen-update" },
+        { label: "insertOne — 复制该文档", key: "gen-insert" },
+        { label: "deleteOne — 按 _id 删除", key: "gen-delete" },
+      ],
+    });
   }
   return items;
 });
@@ -167,9 +187,19 @@ async function handleCtxSelect(action: string) {
       }
     } else if (action === "view-doc") {
       openDocViewer(r.docIndex, new MouseEvent("click"));
+    } else if (action.startsWith("gen-")) {
+      const doc = props.documents[r.docIndex];
+      if (!doc) return;
+      const coll = props.collection || "collection";
+      let queryText = "";
+      if (action === "gen-find") queryText = buildFindByIdQuery(coll, doc);
+      else if (action === "gen-update") queryText = buildUpdateOneQuery(coll, doc);
+      else if (action === "gen-insert") queryText = buildInsertOneQuery(coll, doc);
+      else if (action === "gen-delete") queryText = buildDeleteOneQuery(coll, doc);
+      if (queryText) emit("editInTab", { doc, queryText });
     }
   } catch {
-    message.error("复制失败");
+    message.error("操作失败");
   }
 }
 

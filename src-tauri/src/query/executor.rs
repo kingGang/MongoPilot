@@ -44,8 +44,102 @@ pub async fn execute_shell_query(
     query_text: &str,
     pagination: Option<Pagination>,
 ) -> Result<QueryResult, AppError> {
-    let query = query_text.trim();
+    // 剥掉前导/中间的 //... 与 /* ... */ 注释 (允许脚本里写说明),
+    // 否则 db. 前缀检查会被首行注释卡住.
+    let cleaned = strip_comments(query_text);
+    let query = cleaned.trim();
     let start = std::time::Instant::now();
+
+    // ---- show 元命令 (show dbs / collections / users / roles / profile) ----
+    if let Some(rest) = query.strip_prefix("show ") {
+        let what = rest.trim();
+        let documents: Vec<Document> = match what {
+            "dbs" | "databases" => {
+                let dbs = client.list_databases().await.map_err(AppError::Mongo)?;
+                dbs.into_iter()
+                    .map(|d| {
+                        doc! {
+                            "name": d.name,
+                            "sizeOnDisk": d.size_on_disk as i64,
+                            "empty": d.size_on_disk == 0,
+                        }
+                    })
+                    .collect()
+            }
+            "collections" | "tables" => {
+                let names = client
+                    .database(database)
+                    .list_collection_names()
+                    .await
+                    .map_err(AppError::Mongo)?;
+                names.into_iter().map(|n| doc! { "name": n }).collect()
+            }
+            "users" => {
+                let result = client
+                    .database(database)
+                    .run_command(doc! { "usersInfo": 1 })
+                    .await
+                    .map_err(AppError::Mongo)?;
+                result
+                    .get_array("users")
+                    .ok()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|b| b.as_document().cloned())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            }
+            "roles" => {
+                let result = client
+                    .database(database)
+                    .run_command(doc! { "rolesInfo": 1, "showBuiltinRoles": true })
+                    .await
+                    .map_err(AppError::Mongo)?;
+                result
+                    .get_array("roles")
+                    .ok()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|b| b.as_document().cloned())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            }
+            "profile" => {
+                let coll = client
+                    .database(database)
+                    .collection::<Document>("system.profile");
+                let mut cursor = coll
+                    .find(doc! {})
+                    .sort(doc! { "ts": -1 })
+                    .limit(20)
+                    .await
+                    .map_err(AppError::Mongo)?;
+                let mut docs = Vec::new();
+                use futures::StreamExt;
+                while let Some(d) = cursor.next().await {
+                    docs.push(d.map_err(AppError::Mongo)?);
+                }
+                docs
+            }
+            other => {
+                return Err(AppError::InvalidInput(format!(
+                    "不支持的 show 命令: \"{}\" (支持 dbs / collections / users / roles / profile)",
+                    other
+                )));
+            }
+        };
+        let count = documents.len() as i64;
+        let elapsed = start.elapsed().as_millis() as i64;
+        return Ok(QueryResult {
+            documents,
+            count,
+            total_count: count,
+            execution_time_ms: elapsed,
+            pending_count: None,
+        });
+    }
 
     let query = if let Some(stripped) = query.strip_prefix("db.") {
         stripped
@@ -233,18 +327,29 @@ async fn execute_find(
     rest: &str,
     pagination: Option<Pagination>,
 ) -> Result<QueryResult, AppError> {
-    let filter_str = extract_parens(rest, "find")?;
-    let filter: Document = parse_json_arg(&filter_str)?;
+    let args_str = extract_parens(rest, "find")?;
+    // find 接受 (filter) 或 (filter, projection); 用顶层逗号拆分.
+    let (filter_str, inline_proj_str) = match split_two_args(&args_str) {
+        Ok((f, p)) => (f, Some(p)),
+        Err(_) => (args_str.clone(), None),
+    };
+    let filter: Document = if filter_str.trim().is_empty() {
+        doc! {}
+    } else {
+        parse_json_arg(&filter_str)?
+    };
 
     // 解析链式调用：.projection({}) .sort({}) .limit(N) .skip(N)
     let after_find = &rest[rest.find(')').unwrap_or(rest.len()) + 1..];
-    let projection = parse_chained_arg(after_find, ".projection(");
+    let chained_projection = parse_chained_arg(after_find, ".projection(");
     let sort = parse_chained_arg(after_find, ".sort(");
     let user_limit = parse_chained_limit(after_find);
     let user_skip = parse_chained_skip(after_find);
 
+    // projection 优先级: 链式 .projection() > 内联第 2 参 (mongosh 行为)
+    let proj_to_use = chained_projection.or(inline_proj_str);
     let mut proj_doc: Option<Document> = None;
-    if let Some(proj_str) = projection {
+    if let Some(proj_str) = proj_to_use {
         let d: Document = parse_json_arg(&proj_str)?;
         if !d.is_empty() { proj_doc = Some(d); }
     }

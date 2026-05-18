@@ -24,6 +24,21 @@ impl ConnectionManager {
         }
     }
 
+    /// 把 MongoDB driver 的错误翻译成中文可读提示, 不认识的就原样回 AppError::Mongo
+    fn classify_mongo_error(err: mongodb::error::Error) -> AppError {
+        let s = err.to_string();
+        if s.contains("Authentication failed")
+            || s.contains("AuthenticationFailed")
+            || s.contains("SCRAM failure")
+            || s.contains("code: 18")
+        {
+            return AppError::Connection(format!(
+                "认证失败: 请检查 1) 用户名/密码 2) 认证数据库 (大多数账号挂在 admin 库, 留空时会自动用 admin) 3) 密码中的特殊字符. 原始错误: {s}"
+            ));
+        }
+        AppError::Mongo(err)
+    }
+
     /// 检查连接是否为只读
     pub async fn is_read_only(&self, id: &str) -> bool {
         let map = self.read_only.read().await;
@@ -130,7 +145,7 @@ impl ConnectionManager {
             .database("admin")
             .run_command(mongodb::bson::doc! { "ping": 1 })
             .await
-            .map_err(AppError::Mongo)?;
+            .map_err(Self::classify_mongo_error)?;
 
         let mut clients = self.clients.write().await;
         clients.insert(config.id.clone(), client);
@@ -169,7 +184,7 @@ impl ConnectionManager {
             .database("admin")
             .run_command(mongodb::bson::doc! { "buildInfo": 1 })
             .await
-            .map_err(AppError::Mongo)?;
+            .map_err(Self::classify_mongo_error)?;
 
         let version = result
             .get_str("version")
@@ -180,7 +195,7 @@ impl ConnectionManager {
             .database("admin")
             .run_command(mongodb::bson::doc! { "hello": 1 })
             .await
-            .map_err(AppError::Mongo)?;
+            .map_err(Self::classify_mongo_error)?;
 
         let is_primary = hello.get_bool("isWritablePrimary").unwrap_or(false);
         let set_name = hello.get_str("setName").ok().map(|s| s.to_string());

@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
 import { NModal, NCard, NForm, NFormItem, NInput, NSelect, NInputNumber, NButton, NSpace, useMessage } from "naive-ui";
-import * as aiApi from "@/api/ai";
+import { useAiStore } from "@/stores/ai";
 import type { AiSettings } from "@/types/ai";
 
 const props = defineProps<{ show: boolean }>();
 const emit = defineEmits<{ "update:show": [value: boolean] }>();
 
 const message = useMessage();
+const aiStore = useAiStore();
 const settings = ref<AiSettings>({
   provider: "claude",
   apiKey: "",
@@ -36,8 +37,8 @@ const modelOptions: Record<string, { label: string; value: string }[]> = {
 };
 
 onMounted(async () => {
-  const saved = await aiApi.getAiSettings();
-  if (saved) Object.assign(settings.value, saved);
+  await aiStore.loadSettings();
+  if (aiStore.settings) Object.assign(settings.value, aiStore.settings);
 });
 
 async function handleSave() {
@@ -45,8 +46,13 @@ async function handleSave() {
     message.warning("请输入 API Key");
     return;
   }
+  if (settings.value.provider === "custom" && !settings.value.baseUrl?.trim()) {
+    message.warning("自定义提供商需要填写 Base URL");
+    return;
+  }
   try {
-    await aiApi.saveAiSettings(settings.value);
+    // 走 store, 让 isConfigured 立即更新 (不然"请先配置"横幅不消失)
+    await aiStore.updateSettings({ ...settings.value });
     message.success("AI 设置已保存");
     emit("update:show", false);
   } catch (e) {

@@ -99,10 +99,15 @@ impl ConnectionConfig {
         // Build query params
         let mut params: Vec<String> = Vec::new();
 
-        if let Some(auth_db) = &self.auth_db {
-            if !auth_db.is_empty() {
-                params.push(format!("authSource={}", auth_db));
-            }
+        // 认证数据库: 用户没填且开了密码认证就默认 admin (mongosh 标准行为).
+        // 99% 的 MongoDB 用户挂在 admin 库, 不显式声明 authSource 时会拿 path 里的库去找用户, 多半失败.
+        let effective_auth_db: Option<String> = match &self.auth_db {
+            Some(d) if !d.is_empty() => Some(d.clone()),
+            _ if self.auth_type != "none" && self.username.is_some() => Some("admin".to_string()),
+            _ => None,
+        };
+        if let Some(auth_db) = &effective_auth_db {
+            params.push(format!("authSource={}", auth_db));
         }
 
         if let Some(rs) = &self.replica_set {

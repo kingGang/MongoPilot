@@ -79,3 +79,38 @@ export function buildUpdateOneQuery(collection: string, doc: Record<string, unkn
 
   return `${collRef}.updateOne(${filter}, {\n    $set: ${setBody}\n})`;
 }
+
+/** `db.<coll>` 或 `db.getCollection("<coll>")` (集合名带点时用后者) */
+function collRefOf(collection: string): string {
+  return collection.includes(".") ? `db.getCollection("${collection}")` : `db.${collection}`;
+}
+
+/** `db.<coll>.insertOne({...})` —— 整个文档作为插入体, 去掉 _id 让服务端生成新的 */
+export function buildInsertOneQuery(collection: string, doc: Record<string, unknown>): string {
+  const body: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(doc)) {
+    if (k === "_id") continue;
+    body[k] = v;
+  }
+  return `${collRefOf(collection)}.insertOne(${toShellString(body, 0)})`;
+}
+
+/** `db.<coll>.deleteOne({_id: ...})` —— 按 _id 删除该文档 */
+export function buildDeleteOneQuery(collection: string, doc: Record<string, unknown>): string {
+  const id = doc._id;
+  const filter =
+    id !== undefined
+      ? `{ _id: ${toShellValue(id)} }`
+      : `{ /* TODO: 填写 filter —— 该文档无 _id */ }`;
+  return `${collRefOf(collection)}.deleteOne(${filter})`;
+}
+
+/** `db.<coll>.find({_id: ...})` —— 按 _id 查回该文档 */
+export function buildFindByIdQuery(collection: string, doc: Record<string, unknown>): string {
+  const id = doc._id;
+  const filter =
+    id !== undefined
+      ? `{ _id: ${toShellValue(id)} }`
+      : `{ /* TODO: 填写 filter —— 该文档无 _id */ }`;
+  return `${collRefOf(collection)}.find(${filter})`;
+}
