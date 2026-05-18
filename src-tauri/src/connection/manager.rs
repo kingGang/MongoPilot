@@ -191,14 +191,36 @@ impl ConnectionManager {
             .unwrap_or("unknown")
             .to_string();
 
-        let hello = client
-            .database("admin")
+        // `hello` 是 MongoDB 4.4.1 才加的; 4.2.x 及更老只有 `isMaster`.
+        // 先试 hello, 服务器返回 CommandNotFound 时退回 isMaster.
+        let admin = client.database("admin");
+        let info_doc: mongodb::bson::Document = match admin
             .run_command(mongodb::bson::doc! { "hello": 1 })
             .await
-            .map_err(Self::classify_mongo_error)?;
+        {
+            Ok(d) => d,
+            Err(e) => {
+                let s = e.to_string();
+                if s.contains("CommandNotFound") || s.contains("no such command") {
+                    admin
+                        .run_command(mongodb::bson::doc! { "isMaster": 1 })
+                        .await
+                        .map_err(Self::classify_mongo_error)?
+                } else {
+                    return Err(Self::classify_mongo_error(e));
+                }
+            }
+        };
 
-        let is_primary = hello.get_bool("isWritablePrimary").unwrap_or(false);
-        let set_name = hello.get_str("setName").ok().map(|s| s.to_string());
+        // hello 返回 isWritablePrimary, isMaster 返回 ismaster —— 两边都兼容
+        let is_primary = info_doc
+            .get_bool("isWritablePrimary")
+            .or_else(|_| info_doc.get_bool("ismaster"))
+            .unwrap_or(false);
+        let set_name = info_doc
+            .get_str("setName")
+            .ok()
+            .map(|s: &str| s.to_string());
 
         let topology = if set_name.is_some() {
             if is_primary { "Primary" } else { "Secondary" }
