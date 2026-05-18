@@ -26,14 +26,13 @@ pub fn run() {
 
             key_store::initialize(&app_data_dir).expect("加密密钥初始化失败");
 
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let pool = database::init_db(&app_data_dir)
-                    .await
-                    .expect("数据库初始化失败");
-                handle.manage(pool);
-                handle.manage(ConnectionManager::new());
-            });
+            // 同步初始化 SQLite 数据库 (含首次启动的 5 条迁移), 保证窗口打开前
+            // SqlitePool / ConnectionManager 已经 manage 上, 避免前端首次 invoke
+            // (例如 ServerTree 立刻调 list_connections) 拿不到 State 而白屏.
+            let pool = tauri::async_runtime::block_on(database::init_db(&app_data_dir))
+                .expect("数据库初始化失败");
+            app.manage(pool);
+            app.manage(ConnectionManager::new());
 
             Ok(())
         })
