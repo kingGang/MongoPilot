@@ -23,3 +23,6 @@ import("monaco-editor/esm/vs/editor/editor.worker?worker")
 const app = createApp(App);
 app.use(createPinia());
 app.mount("#app");
+
+// Vue mount 完成 -> 移除启动 splash (在 index.html 里), 避免首次启动一片空白
+document.getElementById("app-splash")?.remove();
