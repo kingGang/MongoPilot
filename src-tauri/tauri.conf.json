@@ -1,6 +1,6 @@
 {
   "productName": "MongoPilot",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "identifier": "com.mongopilot.app",
   "build": {
     "frontendDist": "../dist",
@@ -15,7 +15,8 @@
         "width": 1280,
         "height": 800,
         "minWidth": 960,
-        "minHeight": 600
+        "minHeight": 600,
+        "visible": false
       }
     ],
     "security": {
