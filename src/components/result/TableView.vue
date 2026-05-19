@@ -16,6 +16,8 @@ const props = defineProps<{
   rowOffset?: number;
   docKeyFn?: (doc: Record<string, unknown>) => string | null;
   selectedKeys?: Set<string>;
+  /** 已编辑字段集合, 元素格式: `${docKey}::${field}` —— 给单元格画 dirty 标识 */
+  dirtyFields?: Set<string>;
   searchKeyword?: string;
   matchCase?: boolean;
   activeMatchDocIndex?: number;
@@ -26,7 +28,31 @@ const emit = defineEmits<{
   updated: [];
   setSelection: [keys: string[]];
   editInTab: [payload: { doc: Record<string, unknown>; queryText: string }];
+  /** 编辑成功 -> 上报 (docKey, field) */
+  dirty: [docKey: string, field: string];
 }>();
+
+/** 给定一行 + 字段名: 是否在 dirty 集合里 */
+function isCellDirty(row: Record<string, unknown>, key: string): boolean {
+  if (!props.dirtyFields || props.dirtyFields.size === 0) return false;
+  if (!props.docKeyFn) return false;
+  const k = props.docKeyFn(row);
+  if (!k) return false;
+  return props.dirtyFields.has(`${k}::${key}`);
+}
+
+/** 上报某行某字段 dirty */
+function emitDirty(doc: Record<string, unknown>, field: string) {
+  if (!props.docKeyFn) return;
+  const k = props.docKeyFn(doc);
+  if (k) emit("dirty", k, field);
+}
+
+/** ValueDetail 保存成功 -> 标 dirty + 通知父组件 */
+function onDetailSaved() {
+  if (detailDoc.value) emitDirty(detailDoc.value, detailField.value);
+  emit("updated");
+}
 
 /** 转发 DocumentViewer 的 editInTab —— 写在 script 里避免 template 泛型 < 被 vue-tsc 误读 */
 function forwardEditInTab(payload: { doc: Record<string, unknown>; queryText: string }) {
@@ -173,6 +199,7 @@ async function commitEdit() {
     await docApi.updateDocument(props.connectionId, props.database, props.collection, idStr, updatedDoc);
     // 更新本地数据
     (doc as Record<string, unknown>)[key] = finalVal;
+    emitDirty(doc, key);
     message.success("已保存");
     emit("updated");
   } catch (e) {
@@ -228,7 +255,7 @@ function snapshotColWidths() {
 const columns = shallowRef<DataTableColumns>([]);
 
 watch(
-  [columnKeysSig, () => !!props.docKeyFn],
+  [columnKeysSig, () => !!props.docKeyFn, () => props.dirtyFields?.size ?? 0],
   () => {
     if (props.documents.length === 0) {
       columns.value = [];
@@ -258,12 +285,27 @@ watch(
       width: colWidthMap.value[key] ?? defaultWidth(key),
       resizable: true,
       ellipsis: { tooltip: false },
+      // 单元格 td 上加 dirty class (NDataTable render 时调用, 读 props.dirtyFields 走 Vue 响应式)
+      cellProps: (row: Record<string, unknown>) =>
+        isCellDirty(row, key) ? { class: "tv-cell-dirty" } : {},
       render(row: Record<string, unknown>) {
         const val = row[key];
         const rowIdx = (row as Record<string, unknown>).__rowKey as number;
 
+        // null / undefined: 双击打开 Type and Value 编辑器, 用户可改类型 + 填值
         if (val === null || val === undefined) {
-          return h("span", { style: "color:#999;font-style:italic" }, "null");
+          return h("span", {
+            style: "color:#999;font-style:italic;cursor:pointer",
+            title: "双击修改类型和值",
+            onDblclick: (e: MouseEvent) => {
+              e.stopPropagation();
+              if (!canEdit(rowIdx)) {
+                message.warning("该结果不可编辑");
+                return;
+              }
+              openDetail(key, val, row);
+            },
+          }, "null");
         }
 
         const type = getBsonType(val);
@@ -478,7 +520,7 @@ async function handleCtxSelect(action: string) {
       :collection="collection"
       :document-id="detailDocId"
       :document="detailDoc"
-      @saved="emit('updated')"
+      @saved="onDetailSaved"
     />
     <DocumentViewer
       v-model:show="showDocViewer"
@@ -508,6 +550,11 @@ async function handleCtxSelect(action: string) {
 .table-view :deep(.n-data-table-td) {
   contain: layout paint;
   transition: none !important;
+}
+/* 已修改字段标识 —— 浅黄底 + 橙色左条; 翻页 / 重查询时由父组件清除 */
+.table-view :deep(.n-data-table-td.tv-cell-dirty) {
+  background: rgba(232, 168, 56, 0.12) !important;
+  box-shadow: inset 3px 0 0 #e8a838;
 }
 .table-view :deep(.n-data-table-resize-button) {
   /* 加宽拖动热区, 更容易抓住 */

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, onMounted, onBeforeUnmount } from "vue";
 import {
   NLayout, NLayoutSider, NLayoutContent, NMessageProvider, NSplit, NModal, NIcon,
   NInput, NTree, NButton, useMessage,
@@ -380,6 +380,16 @@ const formatTrigger = ref(0);
 function handleRunQuery() {
   runTrigger.value++;
 }
+
+/** F5 默认是浏览器刷新整页 (在 webview 里会丢掉所有 tab / 结果), 拦下来改成执行当前编辑器选中或当前语句 */
+function onWindowKeyDown(e: KeyboardEvent) {
+  if (e.key === "F5" && !e.ctrlKey && !e.shiftKey && !e.altKey) {
+    e.preventDefault();
+    if (editorStore.activeTab) handleRunQuery();
+  }
+}
+onMounted(() => window.addEventListener("keydown", onWindowKeyDown));
+onBeforeUnmount(() => window.removeEventListener("keydown", onWindowKeyDown));
 
 /** MonacoEditor emit run → 携带正确的语句文本 → 执行 */
 function handleEditorRun(statement: string) {

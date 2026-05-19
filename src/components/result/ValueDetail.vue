@@ -192,6 +192,8 @@ async function handleSave() {
       const updatedDoc = { ...JSON.parse(JSON.stringify(props.document)), [props.field]: newValue };
       const idStr = props.documentId || extractId(props.document);
       await docApi.updateDocument(props.connectionId, props.database, props.collection, idStr, updatedDoc);
+      // 本地原地 mutate, Vue 响应式会让单元格立刻刷新, 不再需要整页 re-fetch
+      (props.document as Record<string, unknown>)[props.field] = newValue;
       emit("saved");
       emit("update:show", false);
     } catch (e) {

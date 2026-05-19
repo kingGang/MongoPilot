@@ -104,6 +104,16 @@ function docSelectionKey(doc: Record<string, unknown>): string | null {
 
 const selectedKeys = ref<Set<string>>(new Set());
 
+/** 修改过的字段标识: 集合元素为 `${docSelectionKey}::${fieldName}`.
+ *  翻页 / 切结果 tab / 重新查询都会清空, 视觉上提示用户"这条数据本会话被改过". */
+const dirtyFields = ref<Set<string>>(new Set());
+function markDirty(docKey: string, field: string) {
+  if (!docKey || !field) return;
+  const next = new Set(dirtyFields.value);
+  next.add(`${docKey}::${field}`);
+  dirtyFields.value = next;
+}
+
 function toggleSelect(key: string) {
   const next = new Set(selectedKeys.value);
   if (next.has(key)) next.delete(key);
@@ -127,11 +137,13 @@ watch(() => props.resultTab?.id, () => {
   searchKeyword.value = "";
   currentMatchIdx.value = 0;
   selectedKeys.value = new Set();
+  dirtyFields.value = new Set();
 });
-// 同一 result tab 内 result 换了(翻页 / refresh) —— 保留搜索栏开关,但清关键字
+// 同一 result tab 内 result 换了(翻页 / refresh) —— 保留搜索栏开关,但清关键字 / dirty
 watch(() => result.value, () => {
   searchKeyword.value = "";
   selectedKeys.value = new Set();
+  dirtyFields.value = new Set();
 });
 
 function handlePageSizeChange(size: number) { emit("pageChange", 1, size); }
@@ -387,9 +399,12 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
           v-else-if="viewMode === 'tree'"
           :documents="pagedDocuments"
           :row-offset="rowOffset"
+          :connection-id="connectionId"
+          :database="database"
           :collection="collection"
           :doc-key-fn="docSelectionKey"
           :selected-keys="selectedKeys"
+          :dirty-fields="dirtyFields"
           :search-keyword="searchKeyword"
           :match-case="matchCase"
           :active-match-doc-index="activeMatchDocIndex"
@@ -397,6 +412,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
           @toggle-select="toggleSelect"
           @set-selection="setSelectedKeys"
           @edit-in-tab="forwardEditInTab"
+          @dirty="(k: string, f: string) => markDirty(k, f)"
         />
         <TableView
           v-else-if="viewMode === 'table'"
@@ -407,12 +423,14 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
           :collection="collection"
           :doc-key-fn="docSelectionKey"
           :selected-keys="selectedKeys"
+          :dirty-fields="dirtyFields"
           :search-keyword="searchKeyword"
           :match-case="matchCase"
           :active-match-doc-index="activeMatchDocIndex"
           :match-doc-indexes="matchDocIndexes"
           @set-selection="setSelectedKeys"
           @edit-in-tab="forwardEditInTab"
+          @dirty="(k: string, f: string) => markDirty(k, f)"
         />
         <JsonTreeView v-else :documents="pagedDocuments" :row-offset="rowOffset" />
       </div>

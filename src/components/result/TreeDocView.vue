@@ -5,6 +5,7 @@ import { getBsonType, formatTreeValue, extractIdDisplay, getTypeColor, getValueC
 import { highlightKeyword } from "@/utils/text-highlight";
 import ValueDetail from "./ValueDetail.vue";
 import DocumentViewer from "./DocumentViewer.vue";
+import * as docApi from "@/api/document";
 import {
   buildUpdateOneQuery,
   buildInsertOneQuery,
@@ -15,9 +16,14 @@ import {
 const props = defineProps<{
   documents: Record<string, unknown>[];
   rowOffset?: number;
+  /** 数据库写回需要的上下文 (打开 ValueDetail 编辑后保存用) */
+  connectionId?: string;
+  database?: string;
   collection?: string;
   docKeyFn?: (doc: Record<string, unknown>) => string | null;
   selectedKeys?: Set<string>;
+  /** 已编辑字段集合, 元素格式: `${docKey}::${field}` —— 用来给单元格画 dirty 标识 */
+  dirtyFields?: Set<string>;
   searchKeyword?: string;
   matchCase?: boolean;
   activeMatchDocIndex?: number;
@@ -28,6 +34,10 @@ const emit = defineEmits<{
   toggleSelect: [key: string];
   setSelection: [keys: string[]];
   editInTab: [payload: { doc: Record<string, unknown>; queryText: string }];
+  /** 用户保存了改动 (本地已 mutate, 无需父组件重查) —— 仅作为可选信号 */
+  updated: [];
+  /** 编辑成功 -> 上报 (docKey, field) 让父组件维护 dirty 集合 */
+  dirty: [docKey: string, field: string];
 }>();
 
 // 是否启用多选 UI (需父组件提供 key 函数)
@@ -112,10 +122,189 @@ watch(
 const expanded = ref<Set<string>>(new Set());
 const selectedPath = ref<string | null>(null);
 
-// 值详情
+// 值详情 (ValueDetail 弹窗)
 const showDetail = ref(false);
 const detailField = ref("");
 const detailValue = ref<unknown>(null);
+/** 当前正在编辑的整文档 + 其 _id 字符串, 传给 ValueDetail 让保存能落库 */
+const detailDoc = ref<Record<string, unknown> | undefined>(undefined);
+const detailDocId = ref("");
+
+function extractDocId(doc: Record<string, unknown>): string {
+  const id = doc._id;
+  if (typeof id === "object" && id !== null) {
+    return String((id as Record<string, unknown>).$oid ?? JSON.stringify(id));
+  }
+  return String(id ?? "");
+}
+
+/** 上报: 这一行的某字段被改过 -> 父组件加进 dirtyFields */
+function emitDirty(docIdx: number, field: string) {
+  if (!props.docKeyFn) return;
+  const doc = props.documents[docIdx];
+  if (!doc) return;
+  const k = props.docKeyFn(doc);
+  if (k) emit("dirty", k, field);
+}
+
+/** 给定一行: 该字段在 dirtyFields 里? */
+function isCellDirty(row: RowItem): boolean {
+  if (!props.dirtyFields || props.dirtyFields.size === 0) return false;
+  if (row.docIndex < 0 || row.isDocRoot || row.key === "_id") return false;
+  if (!props.docKeyFn) return false;
+  const doc = props.documents[row.docIndex];
+  if (!doc) return false;
+  const k = props.docKeyFn(doc);
+  if (!k) return false;
+  return props.dirtyFields.has(`${k}::${row.key}`);
+}
+
+/** 只对顶层字段开放编辑: docIndex 跟得上, 非根行, 非 _id (改 _id 危险, 不允许) */
+function isEditableLeaf(row: RowItem): boolean {
+  return row.docIndex >= 0 && !row.isDocRoot && row.key !== "_id";
+}
+
+/** 这些 BSON 类型可以用单行 input/select 内联编辑;
+ *  其余 (Null / Undefined / Document / Array / Regex / Binary 等) 必须走 ValueDetail */
+function canInlineEdit(type: string): boolean {
+  return ["String", "Int32", "Int64", "Double", "Decimal128", "Boolean", "Date", "ObjectId"].includes(type);
+}
+
+// ---- 内联编辑状态 ----
+const editingDocIndex = ref<number>(-1);
+const editingKey = ref<string | null>(null);
+const editingType = ref<string>("");
+const editingValue = ref<string>("");
+const editingOriginal = ref<string>("");
+
+function isEditing(docIdx: number, key: string): boolean {
+  return editingDocIndex.value === docIdx && editingKey.value === key;
+}
+
+function cancelInlineEdit() {
+  editingDocIndex.value = -1;
+  editingKey.value = null;
+}
+
+/** 双击入口: 简单类型走格子内联; null / 复合类型弹 ValueDetail */
+function onValueDblclick(row: RowItem, e: MouseEvent) {
+  e.stopPropagation();
+  if (!isEditableLeaf(row)) return;
+  if (canInlineEdit(row.type)) startInlineEdit(row);
+  else openValueEditor(row, e);
+}
+
+function startInlineEdit(row: RowItem) {
+  if (!props.connectionId || !props.database || !props.collection) {
+    message.warning("缺少存储上下文, 无法编辑");
+    return;
+  }
+  editingDocIndex.value = row.docIndex;
+  editingKey.value = row.key;
+  editingType.value = row.type;
+  const val = row.value;
+  const obj = val as Record<string, unknown>;
+  let text: string;
+  if (row.type === "Boolean") text = String(val);
+  else if (row.type === "Int64") text = String(obj?.$numberLong ?? val);
+  else if (row.type === "Decimal128") text = String(obj?.$numberDecimal ?? val);
+  else if (row.type === "ObjectId") text = String(obj?.$oid ?? val);
+  else if (row.type === "Date") {
+    const d = obj?.$date;
+    let ms: number;
+    if (typeof d === "string") ms = new Date(d).getTime();
+    else if (typeof d === "number") ms = d;
+    else if (typeof d === "object" && d && (d as Record<string, unknown>).$numberLong)
+      ms = parseInt(String((d as Record<string, unknown>).$numberLong));
+    else ms = Date.now();
+    const date = new Date(ms);
+    if (isNaN(date.getTime())) text = String(d);
+    else {
+      const offset = -date.getTimezoneOffset();
+      const sign = offset >= 0 ? "+" : "-";
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const tzH = pad(Math.floor(Math.abs(offset) / 60));
+      const tzM = pad(Math.abs(offset) % 60);
+      text = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+        + `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}${sign}${tzH}:${tzM}`;
+    }
+  } else text = String(val ?? "");
+  editingValue.value = text;
+  editingOriginal.value = text;
+}
+
+async function commitInlineEdit() {
+  if (editingDocIndex.value < 0 || editingKey.value === null) return;
+  const docIdx = editingDocIndex.value;
+  const key = editingKey.value;
+  const type = editingType.value;
+  const raw = editingValue.value;
+
+  if (raw === editingOriginal.value) { cancelInlineEdit(); return; }
+
+  let finalVal: unknown = raw;
+  if (type === "Int32") finalVal = parseInt(raw) || 0;
+  else if (type === "Double") finalVal = parseFloat(raw) || 0;
+  else if (type === "Boolean") finalVal = raw === "true";
+  else if (type === "Int64") finalVal = { $numberLong: raw };
+  else if (type === "Decimal128") finalVal = { $numberDecimal: raw };
+  else if (type === "ObjectId") {
+    if (!/^[0-9a-fA-F]{24}$/.test(raw.trim())) {
+      message.error("ObjectId 必须是 24 位十六进制字符串");
+      return; // 留在编辑态, 用户修正
+    }
+    finalVal = { $oid: raw.trim() };
+  } else if (type === "Date") {
+    const parsed = new Date(raw);
+    if (isNaN(parsed.getTime())) {
+      message.error(`时间格式错误: "${raw}", 请使用 ISO 格式如 2025-04-01T09:34:00+08:00`);
+      return;
+    }
+    finalVal = { $date: parsed.toISOString() };
+  }
+
+  const doc = props.documents[docIdx];
+  if (!doc || !props.connectionId || !props.database || !props.collection) {
+    cancelInlineEdit();
+    return;
+  }
+  const docId = extractDocId(doc);
+  try {
+    const updatedDoc = { ...JSON.parse(JSON.stringify(doc)), [key]: finalVal };
+    await docApi.updateDocument(props.connectionId, props.database, props.collection, docId, updatedDoc);
+    (doc as Record<string, unknown>)[key] = finalVal;
+    emitDirty(docIdx, key);
+    message.success("已保存");
+    emit("updated");
+  } catch (e) {
+    message.error(`保存失败: ${e}`);
+  }
+  cancelInlineEdit();
+}
+
+/** ValueDetail 保存成功 -> 标 dirty + 通知父组件 */
+function onDetailSaved() {
+  // 用 detailField/detailDoc 反推 docIdx
+  const doc = detailDoc.value;
+  if (doc) {
+    const idx = props.documents.indexOf(doc);
+    if (idx >= 0) emitDirty(idx, detailField.value);
+  }
+  emit("updated");
+}
+
+/** 打开 Type-and-Value 编辑器. 调用前应已确认 isEditableLeaf 通过. */
+function openValueEditor(row: RowItem, e: MouseEvent) {
+  e.stopPropagation();
+  if (!isEditableLeaf(row)) return;
+  const doc = props.documents[row.docIndex];
+  if (!doc) return;
+  detailField.value = row.key;
+  detailValue.value = row.value;
+  detailDoc.value = doc;
+  detailDocId.value = extractDocId(doc);
+  showDetail.value = true;
+}
 
 // 文档查看器
 const showDocViewer = ref(false);
@@ -222,13 +411,6 @@ function isExpanded(path: string): boolean {
 
 function selectRow(path: string) {
   selectedPath.value = path;
-}
-
-function openDetail(field: string, val: unknown, e: MouseEvent) {
-  e.stopPropagation();
-  detailField.value = field;
-  detailValue.value = val;
-  showDetail.value = true;
 }
 
 function objectPreview(val: unknown, type: string): string {
@@ -377,7 +559,7 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
             <span v-else class="toggle-placeholder" />
             <span class="key-name" v-html="hl(row.key)" />
           </td>
-          <td class="col-value">
+          <td class="col-value" :class="{ 'cell-dirty': isCellDirty(row) }">
             <!-- 文档根行或 _id 字段：点击打开文档查看器 -->
             <template v-if="row.isDocRoot">
               <span
@@ -394,24 +576,57 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
                 v-html="hl(row.displayValue)"
               />
             </template>
-            <!-- Object/Array 字段：hover 预览，点击弹详情 -->
+            <!-- Object/Array 字段: hover 预览, 双击弹 ValueDetail (复合类型无法用单 input 表达) -->
             <template v-else-if="row.isObjectField">
               <n-tooltip trigger="hover" placement="bottom-start" :delay="400" style="max-width: 500px">
                 <template #trigger>
                   <span
                     class="clickable-value"
-                    @click.stop="openDetail(row.key, row.value, $event)"
+                    :title="isEditableLeaf(row) ? '双击修改类型和值' : ''"
+                    @dblclick.stop="openValueEditor(row, $event)"
                     v-html="hl(row.displayValue)"
                   />
                 </template>
                 <pre class="tooltip-preview">{{ objectPreview(row.value, row.type) }}</pre>
               </n-tooltip>
             </template>
-            <span
-              v-else
-              :style="{ color: getValueColor(row.type) }"
-              v-html="hl(row.displayValue)"
-            />
+            <!-- 简单类型: 内联编辑; null / Undefined 由 onValueDblclick 路由到 ValueDetail -->
+            <template v-else>
+              <select
+                v-if="isEditing(row.docIndex, row.key) && row.type === 'Boolean'"
+                v-model="editingValue"
+                class="tv-inline-select"
+                @vue:mounted="(v: any) => v.el?.focus?.()"
+                @blur="commitInlineEdit"
+                @keydown.enter.prevent="commitInlineEdit"
+                @keydown.escape="cancelInlineEdit"
+                @click.stop
+              >
+                <option value="true">true</option>
+                <option value="false">false</option>
+              </select>
+              <input
+                v-else-if="isEditing(row.docIndex, row.key)"
+                v-model="editingValue"
+                class="tv-inline-input"
+                :type="row.type === 'Int32' || row.type === 'Double' ? 'number' : 'text'"
+                @vue:mounted="(v: any) => v.el?.focus?.()"
+                @blur="commitInlineEdit"
+                @keydown.enter.prevent="commitInlineEdit"
+                @keydown.escape="cancelInlineEdit"
+                @click.stop
+              />
+              <span
+                v-else
+                :style="{
+                  color: getValueColor(row.type),
+                  cursor: isEditableLeaf(row) ? 'text' : 'default',
+                }"
+                :title="isEditableLeaf(row) ? '双击修改' : ''"
+                @dblclick.stop="onValueDblclick(row, $event)"
+                v-html="hl(row.displayValue)"
+              />
+            </template>
           </td>
           <td class="col-type">
             <span :style="{ color: getTypeColor(row.type) }">{{ row.type }}</span>
@@ -423,6 +638,12 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
       v-model:show="showDetail"
       :field="detailField"
       :value="detailValue"
+      :connection-id="connectionId"
+      :database="database"
+      :collection="collection"
+      :document-id="detailDocId"
+      :document="detailDoc"
+      @saved="onDetailSaved"
     />
     <DocumentViewer
       v-model:show="showDocViewer"
@@ -562,5 +783,24 @@ td:last-child {
   word-break: break-all;
   max-height: 200px;
   overflow: auto;
+}
+/* 已修改字段标识 —— 浅黄底 + 橙色左条, 翻页 / 重查询时由父组件清除 */
+.cell-dirty {
+  background: rgba(232, 168, 56, 0.12) !important;
+  box-shadow: inset 3px 0 0 #e8a838;
+}
+/* 内联编辑 input / select —— 跟 TableView 风格保持一致 */
+.tv-inline-input,
+.tv-inline-select {
+  width: 100%;
+  max-width: 100%;
+  padding: 1px 4px;
+  border: 1px solid #3875d7;
+  border-radius: 2px;
+  outline: none;
+  font-family: inherit;
+  font-size: 12px;
+  background: #fff;
+  box-sizing: border-box;
 }
 </style>
