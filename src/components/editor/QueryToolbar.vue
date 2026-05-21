@@ -247,7 +247,7 @@ function onDbSelect(name: string) {
             <template #icon><n-icon :size="15"><HistoryIcon /></n-icon></template>
           </n-button>
         </template>
-        查询历史
+        执行记录
       </n-tooltip>
       <n-tooltip trigger="hover" :delay="400">
         <template #trigger>

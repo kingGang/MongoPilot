@@ -34,6 +34,28 @@ pub fn run() {
             app.manage(pool);
             app.manage(ConnectionManager::new());
 
+            // 窗口显示策略:
+            //   - dev (debug_assertions): 立即 show, 避免 Vite HMR / dep-optimize 触发 reload
+            //     时打断 JS 的 revealWindow() 调用, 窗口永久隐藏.
+            //   - release: 保留 visible:false 让 JS 侧 revealWindow 在 Vue mount 完后 show
+            //     (修首次安装白屏); 另起 5s 兜底, 若 JS 完全失效也能让窗口最终露脸.
+            if let Some(win) = app.get_webview_window("main") {
+                #[cfg(debug_assertions)]
+                {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    let win_clone = win.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let _ = win_clone.show();
+                        let _ = win_clone.set_focus();
+                    });
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -55,6 +77,8 @@ pub fn run() {
             commands::query::get_query_history,
             commands::query::search_query_history,
             commands::query::clear_query_history,
+            commands::query::list_all_query_history,
+            commands::query::clear_all_query_history,
             commands::document::insert_document,
             commands::document::update_document,
             commands::document::delete_document,

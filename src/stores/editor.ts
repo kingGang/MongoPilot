@@ -61,6 +61,18 @@ async function readLoadedHelpers(
 }
 
 /**
+ * 检测脚本是否把 db 读操作绑到了变量上 (read-then-write 模式).
+ * 例如: `var player = db.player.findOne(...)` —— 这种模式必须走完整 script mode,
+ * 因为 preEvaluateStatement 里 db 是只捕获不执行的 Proxy, 变量拿到的是 Proxy 不是真数据,
+ * 后续 `player._id` 求值会得到一个函数, JSON.stringify 失败 -> 后端报 "expected value".
+ */
+function hasDbReadInVar(content: string): boolean {
+  // 先把字符串字面量替成空占位, 避免 var x = "db.xxx" 误判
+  const noStrings = content.replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/'(?:[^'\\]|\\.)*'/g, "''");
+  return /\b(?:var|let|const)\s+[\w$]+\s*=\s*[^;\n]*\bdb\./m.test(noStrings);
+}
+
+/**
  * 编辑器里有 helper 定义 / load() 引用时, 把语句参数里的函数调用在 webview JS 引擎里
  * 求值成纯 JSON. 求值失败时退回原文.
  */
@@ -425,6 +437,12 @@ export const useEditorStore = defineStore("editor", () => {
       return;
     }
 
+    // read-then-write 脚本: 把整段交给 script mode (preEval 单语句拿不到 var 里的真实 db 读数据)
+    if (needsPreEvaluation(tab.content) && hasDbReadInVar(tab.content)) {
+      await executeScript(tab, tab.content);
+      return;
+    }
+
     // 选中的不是直接以 db. 开头 (例如选了 "helper 函数 + 一条查询" 整段):
     //   - 里面有 db.xxx 语句  -> 抽出最后一条当作要跑的查询, 走预求值
     //   - 完全没有 db 语句、又有 helper/load -> 才是真正的脚本模式 (收集写操作)
@@ -558,6 +576,12 @@ export const useEditorStore = defineStore("editor", () => {
         rt.error = "请先选择数据库 (工具栏右侧的数据库下拉)";
         rt.loading = false;
       }
+      return;
+    }
+
+    // read-then-write 脚本: 同样必须整段走 script mode
+    if (needsPreEvaluation(tab.content) && hasDbReadInVar(tab.content)) {
+      await executeScript(tab, content);
       return;
     }
 

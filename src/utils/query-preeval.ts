@@ -513,6 +513,44 @@ const __ack__ = (method) => {
   if (method === 'findOneAndUpdate' || method === 'findOneAndReplace' || method === 'findOneAndDelete') return null;
   return { acknowledged: true, matchedCount: 0, modifiedCount: 0, deletedCount: 0, upsertedCount: 0 };
 };
+// __hydrate__: 把后端返回的 BSON Extended JSON ({$oid}/{$date}/{$numberLong}) 递归补上
+// mongosh 风格的访问方法 (_id.str / date.getTime() 等), 让用户脚本能像 mongosh 一样写.
+// 原 $xxx 字段保留, 不影响序列化回后端.
+const __hydrate__ = (v) => {
+  if (v === null || typeof v !== 'object') return v;
+  if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = __hydrate__(v[i]); return v; }
+  const keys = Object.keys(v);
+  if (keys.length === 1 && typeof v.$oid === 'string') {
+    const s = v.$oid;
+    Object.defineProperty(v, 'str', { value: s, enumerable: false });
+    v.toString = () => s;
+    v.valueOf = () => s;
+    return v;
+  }
+  if (keys.length === 1 && '$date' in v) {
+    const raw = v.$date;
+    let ms = NaN;
+    if (typeof raw === 'string') ms = new Date(raw).getTime();
+    else if (typeof raw === 'number') ms = raw;
+    else if (raw && typeof raw.$numberLong === 'string') ms = parseInt(raw.$numberLong);
+    if (!isNaN(ms)) {
+      const d = new Date(ms);
+      Object.defineProperty(v, 'getTime', { value: () => ms, enumerable: false });
+      Object.defineProperty(v, 'toISOString', { value: () => d.toISOString(), enumerable: false });
+      v.toString = () => d.toISOString();
+      v.valueOf = () => ms;
+    }
+    return v;
+  }
+  if (keys.length === 1 && typeof v.$numberLong === 'string') {
+    const n = v.$numberLong;
+    v.toString = () => n;
+    v.valueOf = () => Number(n);
+    return v;
+  }
+  for (const k of keys) v[k] = __hydrate__(v[k]);
+  return v;
+};
 // 游标: 链式方法累积, 终结方法 (toArray/forEach/...) 才真去后端查
 const __mkCursor__ = (render, baseMethod, baseArgs) => {
   const chain = [];
@@ -524,14 +562,14 @@ const __mkCursor__ = (render, baseMethod, baseArgs) => {
   const cur = new Proxy(function () {}, {
     get(_, m) {
       const mm = String(m);
-      if (mm === 'toArray') return async () => (await __runRead__(stmt())).documents;
-      if (mm === 'forEach') return async (fn) => { for (const d of (await __runRead__(stmt())).documents) fn(d); };
-      if (mm === 'map') return async (fn) => (await __runRead__(stmt())).documents.map(fn);
+      if (mm === 'toArray') return async () => (await __runRead__(stmt())).documents.map(__hydrate__);
+      if (mm === 'forEach') return async (fn) => { for (const d of (await __runRead__(stmt())).documents) fn(__hydrate__(d)); };
+      if (mm === 'map') return async (fn) => (await __runRead__(stmt())).documents.map(__hydrate__).map(fn);
       if (mm === 'count' || mm === 'size' || mm === 'itcount' || mm === 'length')
         return async () => (await __runRead__(stmt())).count;
       if (mm === 'hasNext') return async () => (await __runRead__(stmt())).documents.length > 0;
       if (mm === 'next' || mm === 'tryNext')
-        return async () => { const d = (await __runRead__(stmt())).documents; return d.length ? d[0] : null; };
+        return async () => { const d = (await __runRead__(stmt())).documents; return d.length ? __hydrate__(d[0]) : null; };
       if (mm === 'pretty' || mm === 'explain' || mm === 'close') return () => cur;
       if (mm === Symbol.iterator) return function* () {};
       // 其它当链式 (sort/limit/skip/projection/...)
@@ -554,7 +592,7 @@ const __mkColl__ = (render) => new Proxy({}, {
       }
       if (method === 'findOne') {
         const r = await __runRead__(render + '.findOne(' + __renderArgs__(args) + ')');
-        return r.documents.length ? r.documents[0] : null;
+        return r.documents.length ? __hydrate__(r.documents[0]) : null;
       }
       if (method === 'countDocuments' || method === 'count' || method === 'estimatedDocumentCount') {
         const r = await __runRead__(render + '.countDocuments(' + __renderArgs__(args) + ')');
@@ -562,11 +600,11 @@ const __mkColl__ = (render) => new Proxy({}, {
       }
       if (method === 'distinct') {
         const r = await __runRead__(render + '.distinct(' + __renderArgs__(args) + ')');
-        return r.documents;
+        return r.documents.map(__hydrate__);
       }
       // 未知方法当读处理
       const r = await __runRead__(render + '.find(' + __renderArgs__(args) + ')');
-      return r.documents;
+      return r.documents.map(__hydrate__);
     };
   },
 });

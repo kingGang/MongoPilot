@@ -613,6 +613,8 @@ const ctxMenuOptions = computed(() => {
       { label: "导入数据...", key: "import-coll" },
       { label: "导出数据...", key: "export-coll" },
       { type: "divider" as const, key: "d4b" },
+      { label: "复制集合名称", key: "copy-coll-name-from-coll" },
+      { type: "divider" as const, key: "d4c" },
       { label: "刷新", key: "refresh-coll-parent" },
       { type: "divider" as const, key: "d4" },
       { label: "删除集合", key: "drop-coll" },
@@ -822,6 +824,13 @@ async function handleCtxSelect(action: string) {
   if (action === "export-coll" && nodeKey.startsWith("coll:")) {
     const { connId, dbName, collName } = parseCollKey(nodeKey);
     emit("exportColl", connId, dbName, collName);
+  }
+  if (action === "copy-coll-name-from-coll" && nodeKey.startsWith("coll:")) {
+    const { collName } = parseCollKey(nodeKey);
+    navigator.clipboard.writeText(collName).then(
+      () => message.success(`已复制: ${collName}`),
+      () => message.error("复制失败"),
+    );
   }
 
   // ---- indexes 节点 ----

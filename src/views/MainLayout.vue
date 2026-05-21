@@ -567,8 +567,7 @@ function handleMenuAction(key: string) {
   }
 }
 
-// 查询历史需要知道当前活跃连接
-const historyConnectionId = computed(() => activeTab.value?.connectionId ?? null);
+
 </script>
 
 <template>
@@ -735,9 +734,7 @@ const historyConnectionId = computed(() => activeTab.value?.connectionId ?? null
       @insert="handleQueryBuilderInsert"
     />
     <QueryHistory
-      v-if="historyConnectionId"
       v-model:show="showHistory"
-      :connection-id="historyConnectionId"
       @select="handleHistorySelect"
     />
 

@@ -97,6 +97,27 @@ pub async fn clear_history(pool: &SqlitePool, connection_id: &str) -> Result<(),
     Ok(())
 }
 
+/// 列出所有连接的执行记录 (按时间倒序). 上限 limit, 用于"执行记录" 面板跨连接展示.
+pub async fn list_all_history(pool: &SqlitePool, limit: i64) -> Result<Vec<HistoryRow>, AppError> {
+    let rows = sqlx::query_as::<_, HistoryRow>(
+        "SELECT * FROM query_history ORDER BY created_at DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::Database)?;
+    Ok(rows)
+}
+
+/// 清空所有连接的执行记录.
+pub async fn clear_all_history(pool: &SqlitePool) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM query_history")
+        .execute(pool)
+        .await
+        .map_err(AppError::Database)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

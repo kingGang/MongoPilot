@@ -32,3 +32,13 @@ export async function searchQueryHistory(
 export async function clearQueryHistory(connectionId: string): Promise<void> {
   return invoke("clear_query_history", { connectionId });
 }
+
+/** 拉取所有连接的执行记录, 前端按 connectionId 分组展示 */
+export async function listAllQueryHistory(limit = 500): Promise<HistoryEntry[]> {
+  return invoke<HistoryEntry[]>("list_all_query_history", { limit });
+}
+
+/** 清空所有连接的执行记录 */
+export async function clearAllQueryHistory(): Promise<void> {
+  return invoke("clear_all_query_history");
+}

@@ -545,7 +545,18 @@ function relaxJsonForValidation(text: string): string {
     /([{,]\s*)([a-zA-Z_$][a-zA-Z0-9_$]*)(\s*:)/g,
     '$1"$2"$3',
   );
-  // 3. 去除尾随逗号 (Shell 风格 mongo 容忍 {a:1,} / [1,2,] / 多 stage 管道 stage,)
+  // 3. 把"裸标识符值" (脚本里引用的 var / 形参, 如 player._id / encryptedNewPhone)
+  //    也替成占位字符串. 这步在 key 加引号之后做, 避免错把刚加的 key 再吃一遍.
+  //    lookbehind: 前面不是 " ' 字母 数字 _ $ . —— 排除已在引号里 / 已是标识符一部分.
+  //    lookahead: 后面不接 ( —— 函数调用已经在第 1 步处理过.
+  result = result.replace(
+    /(?<!["'\w$.])[a-zA-Z_$][\w$]*(?:\.[a-zA-Z_$][\w$]*)*(?!\s*\()/g,
+    (m) => {
+      if (/^(true|false|null|undefined|NaN|Infinity)$/.test(m)) return m;
+      return JSON.stringify(m);
+    },
+  );
+  // 4. 去除尾随逗号 (Shell 风格 mongo 容忍 {a:1,} / [1,2,] / 多 stage 管道 stage,)
   //    JSON.parse 不容尾随逗号, 会让 $project 等后续 stage 被误标红.
   result = result.replace(/,(\s*[}\]])/g, "$1");
   return result;

@@ -39,10 +39,16 @@ function revealWindow() {
   import("@tauri-apps/api/window")
     .then((m) => {
       const win = m.getCurrentWindow();
-      win.show().catch(() => { /* 非 tauri 或已显示 */ });
-      win.setFocus().catch(() => { /* ignore */ });
+      win.show().catch(() => {
+        /* 非 tauri 或已显示 */
+      });
+      win.setFocus().catch(() => {
+        /* ignore */
+      });
     })
-    .catch(() => { /* 浏览器预览模式 (pnpm dev), 忽略 */ });
+    .catch(() => {
+      /* 浏览器预览模式 (pnpm dev), 忽略 */
+    });
 }
 // 兜底 #2: rAF 被节流 / show() 抛错时仍然能让窗口露脸 (3 秒内 UI 没渲完也强制显示)
 const _safetyTimer = setTimeout(revealWindow, 3000);

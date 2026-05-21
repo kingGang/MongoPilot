@@ -216,3 +216,18 @@ pub async fn clear_query_history(
 ) -> Result<(), AppError> {
     history_repo::clear_history(&pool, &connection_id).await
 }
+
+/// 拉取所有连接的执行记录, 由前端按 connection_id 分组展示.
+#[tauri::command]
+pub async fn list_all_query_history(
+    pool: State<'_, DbPool>,
+    limit: Option<i64>,
+) -> Result<Vec<HistoryRow>, AppError> {
+    history_repo::list_all_history(&pool, limit.unwrap_or(500)).await
+}
+
+/// 清空所有连接的执行记录.
+#[tauri::command]
+pub async fn clear_all_query_history(pool: State<'_, DbPool>) -> Result<(), AppError> {
+    history_repo::clear_all_history(&pool).await
+}
