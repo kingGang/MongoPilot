@@ -1069,6 +1069,24 @@ mod tests {
     }
 
     #[test]
+    fn extjson_oid_array_deserializes_as_objectid() {
+        // 模拟前端发来的 delete 过滤: $in 数组里是 {$oid: "..."}
+        let json = r#"{"_id":{"$in":[{"$oid":"695dbe26a0777a90234d4f29"},{"$oid":"69adfb78a0777a90234d7d73"}]}}"#;
+        let val: serde_json::Value = serde_json::from_str(json).unwrap();
+        let doc: mongodb::bson::Document = serde_json::from_value(val).unwrap();
+        let id = doc.get("_id").unwrap().as_document().expect("_id 应是嵌套文档");
+        let arr = id.get_array("$in").expect("$in 应是数组");
+        for v in arr {
+            // 这里就是问题点: 若 $oid 没被识别成 ObjectId, 这个 assert 会挂掉
+            assert!(
+                v.as_object_id().is_some(),
+                "$in 元素必须是 ObjectId, 实际是 {:?}",
+                v.element_type()
+            );
+        }
+    }
+
+    #[test]
     fn convert_objectid() {
         let result = convert_shell_types(r#"{_id: ObjectId("abc123")}"#);
         assert!(result.contains(r#"{"$oid": "abc123"}"#));

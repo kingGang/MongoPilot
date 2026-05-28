@@ -960,8 +960,17 @@ onMounted(() => {
     tabSize: 2,
     wordWrap: editorSettings.wordWrap ? "on" : "off",
     suggestOnTriggerCharacters: true,
-    quickSuggestions: true,
+    // 显式开启全部三个上下文 (字符串里 / 注释里 / 普通代码里) 都允许 quick suggestions.
+    // 之前 `quickSuggestions: true` 在某些 Monaco 版本里会被解释成只在 "other" 上下文激活,
+    // 脚本 tab 里若光标恰好被认成在字符串/注释里, 补全 widget 就不会弹.
+    quickSuggestions: { other: "on", comments: "off", strings: "on" },
     snippetSuggestions: "inline",
+    // 关闭 word-based 提示, 避免和我们的 provider 抢 suggest widget 的排序
+    wordBasedSuggestions: "off",
+    // 关键: suggest widget / hover / param-hints 用 fixed 定位挂到 body, 不会被
+    // 父容器 (.split-pane { overflow: hidden }) 裁掉. 脚本 tab 内容很长, 光标到底
+    // 部时, 默认 absolute 定位的弹窗会被 split 边界吃掉 -> 用户看不到补全.
+    fixedOverflowWidgets: true,
   });
 
   // 关闭浏览器的原生拼写检查: 整个容器 + inputarea <textarea> 都设 spellcheck=false,
@@ -978,11 +987,20 @@ onMounted(() => {
 
   statementDecorations = editor.createDecorationsCollection([]);
 
-  editor.onDidChangeModelContent(() => {
+  editor.onDidChangeModelContent((e) => {
     emit("update:modelValue", editor?.getValue() || "");
     updateStatementHighlight();
     updateRunTarget();
     scheduleLint();
+    // 用户敲触发字符 -> 强制弹补全, 防止 Monaco 在某些状态下 suggestOnTriggerCharacters
+    // 失活 (例如多 tab 切换 / HMR 后) 导致 `db.user.` 后没提示.
+    for (const ch of e.changes) {
+      if (ch.text === "." || ch.text === "$" || ch.text === "{") {
+        // setTimeout 0 让 Monaco 先处理完模型变更再触发, 否则上下文 textBefore 还没包含新字符
+        setTimeout(() => editor?.trigger("mongopilot", "editor.action.triggerSuggest", {}), 0);
+        break;
+      }
+    }
   });
 
   // 初始化

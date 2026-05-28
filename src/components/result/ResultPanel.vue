@@ -221,7 +221,15 @@ function formatIdForDisplay(id: unknown): string {
 }
 
 function handleDeleteSelected() {
-  if (!result.value || !props.collection) return;
+  if (!result.value) {
+    message.warning("没有可删除的结果");
+    return;
+  }
+  if (!props.collection) {
+    // 脚本 / 命令型 tab (没有绑定固定集合) 不允许批量删
+    message.warning("当前 tab 未绑定集合, 无法批量删除. 请在该集合的查询 tab 里再试.");
+    return;
+  }
 
   const selectedDocs = result.value.documents.filter((d) => {
     const key = docSelectionKey(d);
@@ -233,9 +241,10 @@ function handleDeleteSelected() {
     return;
   }
 
+  // 同时支持 ObjectId 形式 ({$oid}) 和字面量形式的 _id
   const ids = selectedDocs
-    .map((d) => d._id)
-    .filter((id): id is Record<string, unknown> => id !== undefined && id !== null);
+    .map((d) => d._id as unknown)
+    .filter((id) => id !== undefined && id !== null);
 
   if (ids.length === 0) {
     message.warning("勾选的文档缺少 _id, 无法删除");
@@ -272,11 +281,26 @@ function handleDeleteSelected() {
     onPositiveClick: async () => {
       try {
         const filter = { _id: { $in: ids } };
-        await docApi.deleteDocuments(props.connectionId, props.database, props.collection, filter);
-        message.success(`已删除 ${ids.length} 条文档`);
+        const n = await docApi.deleteDocuments(
+          props.connectionId,
+          props.database,
+          props.collection,
+          filter,
+        );
+        // 后端实际删除数; n 可能比勾选数少 (并发被别人删了 / _id 类型不匹配)
+        if (n === 0) {
+          message.warning(
+            `提交了 ${ids.length} 条 _id, 但后端未匹配到任何文档 (可能 _id 类型不一致或被并发删除)`,
+          );
+        } else if (Number(n) < ids.length) {
+          message.warning(`已删除 ${n} / ${ids.length} 条 (其余 ${ids.length - Number(n)} 条未匹配)`);
+        } else {
+          message.success(`已删除 ${n} 条文档`);
+        }
         selectedKeys.value = new Set();
         emit("refresh");
       } catch (e) {
+        console.error("[deleteDocuments] failed", e);
         message.error(`删除失败: ${e}`);
       }
     },

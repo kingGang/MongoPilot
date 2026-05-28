@@ -229,6 +229,144 @@ interface Captured {
 }
 
 /**
+ * 抽出脚本里**纯 helper 部分**: function 声明 + 不引用 db 的 var/let/const 赋值.
+ *
+ * 用途: 用户在 helper-rich 脚本里**选了一行非 db.* 代码**跑 (例如 `print(...)`),
+ * 期望"只跑这一行, 但让 helper 函数和上面的字面量 var 可见"。直接用整段 tab.content
+ * 跑会把整篇脚本的 print / 控制流全跑掉, 这里只留下声明类的行。
+ *
+ * 保留:
+ *   - `function fn(...) { ... }` (整段)
+ *   - `var/let/const X = <不含 db. 的表达式>;`
+ * 转换:
+ *   - `var X = db.xxx(...)` -> `var X;` (只声明不赋值, 给 selection 用 X 时是 undefined)
+ * 丢弃:
+ *   - 控制流 (if/for/while/try/...)
+ *   - `db.xxx.method(...)` 独立调用
+ *   - `print(...)` / 其它表达式语句
+ *   - 注释 (整体保留行号意义不大, 直接清掉)
+ */
+export function extractPureHelpers(content: string): string {
+  const lines = content.split("\n");
+  const out: string[] = [];
+  let inFn = false;
+  let fnBuf: string[] = [];
+  let fnDepth = 0;
+
+  for (const line of lines) {
+    if (inFn) {
+      fnBuf.push(line);
+      fnDepth += bracketDelta(line);
+      if (fnDepth <= 0) {
+        out.push(fnBuf.join("\n"));
+        fnBuf = [];
+        inFn = false;
+      }
+      continue;
+    }
+    const trimmed = line.trim();
+    // function 声明 (可能跨行) - 整段保留
+    if (/^(?:async\s+)?function\s+[\w$]/.test(trimmed)) {
+      inFn = true;
+      fnBuf = [line];
+      fnDepth = bracketDelta(line);
+      if (fnDepth <= 0) {
+        out.push(fnBuf.join("\n"));
+        fnBuf = [];
+        inFn = false;
+      }
+      continue;
+    }
+    // var/let/const X = ... - 看 RHS 有没有 db.
+    const declMatch = trimmed.match(/^(?:var|let|const)\s+([\w$]+)\b/);
+    if (declMatch) {
+      if (/\bdb\s*[.[]/.test(line)) {
+        // RHS 引用了 db, 只保留声明, 让 selection 引用时是 undefined
+        out.push(`var ${declMatch[1]};`);
+      } else {
+        // 字面量 / 调 helper 函数等纯计算, 整行保留
+        out.push(line);
+      }
+      continue;
+    }
+    // 其它一律丢
+  }
+  if (inFn && fnBuf.length > 0) out.push(fnBuf.join("\n"));
+  return out.join("\n");
+}
+
+/**
+ * 把 helperCode 改写成 "声明外提 + 执行体放进 IIFE 吃掉 return" 的形式.
+ *
+ *   var X = ...;            ->  let X; 在外层 + `X = ...;` 在 IIFE
+ *   function fn(...) { .. } ->  整段外提到外层 (函数声明本身是安全的, 不会副作用)
+ *   if (...) { return; }    ->  保留, return 只退出 IIFE, 不会把 target statement 截断
+ *
+ * 修复场景: 用户写的脚本通常是命令式的, 里面会有 `var p = db.player.findOne(...)`
+ * 配合 `if (!p) { print(...); return; }` 这种早退. preEvaluateStatement 原本把整段
+ * 当作 prelude 跑, 顶层 `return` 会把外层包装函数也一并退掉, target 语句根本没机会
+ * 跑 -> holder.cap 为 null -> 返回原始未求值语句 -> 后端拿到裸标识符报 "expected value".
+ */
+function rewriteHelperForSafeEval(content: string): { hoisted: string; body: string } {
+  const lines = content.split("\n");
+  const hoistedNames = new Set<string>();
+  const hoistedFunctions: string[] = [];
+  const bodyLines: string[] = [];
+
+  let inFn = false;
+  let fnBuf: string[] = [];
+  let fnDepth = 0;
+
+  for (const line of lines) {
+    if (inFn) {
+      fnBuf.push(line);
+      fnDepth += bracketDelta(line);
+      bodyLines.push(""); // 占位保持行号
+      if (fnDepth <= 0) {
+        hoistedFunctions.push(fnBuf.join("\n"));
+        fnBuf = [];
+        inFn = false;
+      }
+      continue;
+    }
+
+    const trimmed = line.trim();
+
+    // function 声明 (可能跨行)
+    if (/^(?:async\s+)?function\s+[\w$]/.test(trimmed)) {
+      inFn = true;
+      fnBuf = [line];
+      fnDepth = bracketDelta(line);
+      bodyLines.push("");
+      if (fnDepth <= 0) {
+        hoistedFunctions.push(fnBuf.join("\n"));
+        fnBuf = [];
+        inFn = false;
+      }
+      continue;
+    }
+
+    // var/let/const X = ... -> 把 X 提到外层 let, 行内只留赋值
+    const declMatch = line.match(/^(\s*)(?:var|let|const)\s+([\w$]+)\b/);
+    if (declMatch) {
+      hoistedNames.add(declMatch[2]);
+      bodyLines.push(line.replace(/^(\s*)(?:var|let|const)\s+([\w$]+)/, "$1$2"));
+      continue;
+    }
+
+    bodyLines.push(line);
+  }
+  // 没闭合的函数: 还是放进 hoisted, 让 new Function 编译时报错被外层 catch 吞
+  if (inFn && fnBuf.length > 0) hoistedFunctions.push(fnBuf.join("\n"));
+
+  const hoistedDecl = hoistedNames.size > 0 ? `let ${[...hoistedNames].join(", ")};` : "";
+  return {
+    hoisted: `${hoistedDecl}\n${hoistedFunctions.join("\n")}`,
+    body: bodyLines.join("\n"),
+  };
+}
+
+/**
  * 预求值: 返回参数已被求值成 JSON 字面量的等价语句.
  * 求值失败 / 语句不是 db.* 形式时, 原样返回 statement (让后端按原逻辑处理或报错).
  *
@@ -243,11 +381,13 @@ export function preEvaluateStatement(
   // load() 引入的文件也可能含 db.* 语句, 一并 strip 掉, 只留定义
   const loadedCode = loadedHelpers ? stripDbStatements(loadedHelpers) : "";
   const helperCode = `${loadedCode}\n${stripDbStatements(fullContent)}`;
+  // 把 helperCode 改写: 声明外提, 执行体进 IIFE 吃掉早 return / 抛错
+  const { hoisted, body: safeHelperBody } = rewriteHelperForSafeEval(helperCode);
   const holder: { cap: Captured | null } = { cap: null };
 
   const body = `
 ${PRELUDE}
-${helperCode}
+${hoisted}
 const __mkCursor__ = (cap) => new Proxy({}, {
   get(_, m) {
     return (...a) => { cap.chain.push({ method: String(m), args: a }); return __mkCursor__(cap); };
@@ -273,6 +413,13 @@ const db = new Proxy({}, {
     return __mkColl__('db.' + String(prop));
   },
 });
+/* helperCode 放进 IIFE: 顶层 return 只退出 IIFE; 抛错也被吞掉.
+   vars 已经在上面 hoisted 里用 let 提到外层了, IIFE 里只是赋值, 退出后 target 还能读到. */
+(() => {
+  try {
+    ${safeHelperBody}
+  } catch (e) { /* helperCode 出错不影响 target statement 求值 */ }
+})();
 ${statement}
 `;
 
@@ -282,12 +429,16 @@ ${statement}
     fn((c: Captured) => {
       holder.cap = c;
     });
-  } catch {
+  } catch (e) {
+    // helperCode 解析/执行失败时 fallback 到原 statement, 同时把错误打到 DevTools.
+    console.warn("[preEvaluateStatement] eval failed, falling back to raw statement:", e);
     return statement;
   }
 
   const c = holder.cap;
-  if (!c) return statement;
+  if (!c) {
+    return statement;
+  }
 
   const renderArgs = (args: unknown[]) =>
     args.map((a) => (a === undefined ? "undefined" : JSON.stringify(a))).join(", ");

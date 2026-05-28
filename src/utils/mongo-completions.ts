@@ -991,7 +991,8 @@ export interface FieldCompletionInfo {
 
 // ---- 注册补全 ----
 
-let _registered = false;
+/** 已注册的 provider disposable —— HMR / 重复 register 时先 dispose 旧的, 避免重复触发 */
+let _disposables: monaco.IDisposable[] = [];
 
 export interface CompletionOptions {
   collectionNames?: () => string[];
@@ -1028,8 +1029,16 @@ function snippetToItem(
 export function registerMongoCompletions(options?: CompletionOptions): void;
 export function registerMongoCompletions(collectionNames?: () => string[]): void;
 export function registerMongoCompletions(arg?: CompletionOptions | (() => string[])): void {
-  if (_registered) return;
-  _registered = true;
+  // 每次调用先 dispose 上一次的 provider, 防止 HMR / 多次注册导致补全 widget 行为异常
+  // (重复 provider 会让同一项出现多次, 或在某些 Monaco 状态下完全不弹).
+  for (const d of _disposables) {
+    try {
+      d.dispose();
+    } catch {
+      /* ignore */
+    }
+  }
+  _disposables = [];
 
   const opts: CompletionOptions =
     typeof arg === "function" ? { collectionNames: arg } : (arg ?? {});
@@ -1037,122 +1046,124 @@ export function registerMongoCompletions(arg?: CompletionOptions | (() => string
   const provider: monaco.languages.CompletionItemProvider = {
     triggerCharacters: [".", "$", '"', "'", "{"],
     provideCompletionItems: async (model, position) => {
-      const textUntilPosition = model.getValueInRange({
-        startLineNumber: 1,
-        startColumn: 1,
-        endLineNumber: position.lineNumber,
-        endColumn: position.column,
-      });
-
-      const word = model.getWordUntilPosition(position);
-      const range: monaco.IRange = {
-        startLineNumber: position.lineNumber,
-        startColumn: word.startColumn,
-        endLineNumber: position.lineNumber,
-        endColumn: word.endColumn,
-      };
-
-      const suggestions: monaco.languages.CompletionItem[] = [];
-
-      // 1. cursor chain context: .find({}).| or .aggregate([]).sort().|
-      if (isCursorContext(textUntilPosition)) {
-        for (const m of cursorMethods) {
-          suggestions.push({
-            label: m.label,
-            kind: m.kind,
-            insertText: m.insertText,
-            insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-            detail: m.detail,
-            documentation: { value: m.documentation },
-            range,
-          });
-        }
-        for (const m of collectionMethods) {
-          suggestions.push({
-            label: m.label,
-            kind: m.kind,
-            insertText: m.insertText,
-            insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-            detail: m.detail,
-            documentation: { value: m.documentation },
-            range,
-            sortText: "z" + m.label,
-          });
-        }
-        return { suggestions };
+      try {
+        return await provideCompletionsImpl(model, position);
+      } catch (err) {
+        // 一旦 provider 抛错, Monaco 会把它"标黑"在本次会话剩余时间不再调用 -> 用户感觉补全完全失效.
+        // 抓住所有错误, 至少返回空 suggestions 保住 provider 活着, 同时把堆栈打到 DevTools.
+        console.error("[mongo-completions] provideCompletionItems failed", err);
+        return { suggestions: [] };
       }
+    },
+  };
 
-      // 2. collection context: db.collName.| or db.getCollection("name").|
-      if (isCollectionContext(textUntilPosition)) {
-        for (const m of collectionMethods) {
+  async function provideCompletionsImpl(
+    model: monaco.editor.ITextModel,
+    position: monaco.Position,
+  ): Promise<monaco.languages.CompletionList> {
+    const textUntilPosition = model.getValueInRange({
+      startLineNumber: 1,
+      startColumn: 1,
+      endLineNumber: position.lineNumber,
+      endColumn: position.column,
+    });
+
+    const word = model.getWordUntilPosition(position);
+    const range: monaco.IRange = {
+      startLineNumber: position.lineNumber,
+      startColumn: word.startColumn,
+      endLineNumber: position.lineNumber,
+      endColumn: word.endColumn,
+    };
+
+    const suggestions: monaco.languages.CompletionItem[] = [];
+
+    // 1. cursor chain context: .find({}).| or .aggregate([]).sort().|
+    if (isCursorContext(textUntilPosition)) {
+      for (const m of cursorMethods) {
+        suggestions.push({
+          label: m.label,
+          kind: m.kind,
+          insertText: m.insertText,
+          insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          detail: m.detail,
+          documentation: { value: m.documentation },
+          range,
+        });
+      }
+      for (const m of collectionMethods) {
+        suggestions.push({
+          label: m.label,
+          kind: m.kind,
+          insertText: m.insertText,
+          insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          detail: m.detail,
+          documentation: { value: m.documentation },
+          range,
+          sortText: "z" + m.label,
+        });
+      }
+      return { suggestions };
+    }
+
+    // 2. collection context: db.collName.| or db.getCollection("name").|
+    if (isCollectionContext(textUntilPosition)) {
+      for (const m of collectionMethods) {
+        suggestions.push({
+          label: m.label,
+          kind: m.kind,
+          insertText: m.insertText,
+          insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          detail: m.detail,
+          documentation: { value: m.documentation },
+          range,
+        });
+      }
+      // 片段: 只挑 `db.${COLL}.` 开头的, 剥掉前缀后插入 (用户输入处已经有 db.coll.)
+      for (const snip of MONGO_SNIPPETS) {
+        if (!snip.body.startsWith(SNIPPET_COLL_PREFIX)) continue;
+        const body = snip.body.slice(SNIPPET_COLL_PREFIX.length);
+        suggestions.push(snippetToItem(snip, body, range));
+      }
+      return { suggestions };
+    }
+
+    // 3. db. context
+    if (isDbContext(textUntilPosition)) {
+      for (const m of dbMethods) {
+        suggestions.push({
+          label: m.label,
+          kind: m.kind,
+          insertText: m.insertText,
+          insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          detail: m.detail,
+          documentation: { value: m.documentation },
+          range,
+        });
+      }
+      if (opts.collectionNames) {
+        for (const name of opts.collectionNames()) {
           suggestions.push({
-            label: m.label,
-            kind: m.kind,
-            insertText: m.insertText,
-            insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-            detail: m.detail,
-            documentation: { value: m.documentation },
+            label: name,
+            kind: monaco.languages.CompletionItemKind.Field,
+            insertText: name,
+            detail: "Collection",
+            documentation: { value: `Access collection \`${name}\`` },
             range,
           });
         }
-        // 片段: 只挑 `db.${COLL}.` 开头的, 剥掉前缀后插入 (用户输入处已经有 db.coll.)
-        for (const snip of MONGO_SNIPPETS) {
-          if (!snip.body.startsWith(SNIPPET_COLL_PREFIX)) continue;
-          const body = snip.body.slice(SNIPPET_COLL_PREFIX.length);
-          suggestions.push(snippetToItem(snip, body, range));
-        }
-        return { suggestions };
       }
+      return { suggestions };
+    }
 
-      // 3. db. context
-      if (isDbContext(textUntilPosition)) {
-        for (const m of dbMethods) {
-          suggestions.push({
-            label: m.label,
-            kind: m.kind,
-            insertText: m.insertText,
-            insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-            detail: m.detail,
-            documentation: { value: m.documentation },
-            range,
-          });
-        }
-        if (opts.collectionNames) {
-          for (const name of opts.collectionNames()) {
-            suggestions.push({
-              label: name,
-              kind: monaco.languages.CompletionItemKind.Field,
-              insertText: name,
-              detail: "Collection",
-              documentation: { value: `Access collection \`${name}\`` },
-              range,
-            });
-          }
-        }
-        return { suggestions };
-      }
+    // 4. $ 操作符 (inside {} context)
+    const lineText = model.getLineContent(position.lineNumber);
+    const charBefore = lineText.substring(0, position.column - 1);
+    if (charBefore.trimEnd().endsWith("$") || /\$\w*$/.test(charBefore)) {
+      const inAggregate = /\.aggregate\s*\(\s*\[/s.test(textUntilPosition);
 
-      // 4. $ 操作符 (inside {} context)
-      const lineText = model.getLineContent(position.lineNumber);
-      const charBefore = lineText.substring(0, position.column - 1);
-      if (charBefore.trimEnd().endsWith("$") || /\$\w*$/.test(charBefore)) {
-        const inAggregate = /\.aggregate\s*\(\s*\[/s.test(textUntilPosition);
-
-        if (inAggregate) {
-          for (const m of aggregationStages) {
-            suggestions.push({
-              label: m.label,
-              kind: m.kind,
-              insertText: m.insertText,
-              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-              detail: m.detail,
-              documentation: { value: m.documentation },
-              range: { ...range, startColumn: Math.max(1, range.startColumn - 1) },
-            });
-          }
-        }
-
-        for (const m of updateOperators) {
+      if (inAggregate) {
+        for (const m of aggregationStages) {
           suggestions.push({
             label: m.label,
             kind: m.kind,
@@ -1163,74 +1174,38 @@ export function registerMongoCompletions(arg?: CompletionOptions | (() => string
             range: { ...range, startColumn: Math.max(1, range.startColumn - 1) },
           });
         }
-
-        for (const m of queryOperators) {
-          suggestions.push({
-            label: m.label,
-            kind: m.kind,
-            insertText: m.insertText,
-            insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-            detail: m.detail,
-            documentation: { value: m.documentation },
-            range: { ...range, startColumn: Math.max(1, range.startColumn - 1) },
-          });
-        }
-
-        // 也在 $ 上下文提供字段名（如 $set: { field: ... }）
-        if (opts.getFieldNames) {
-          const collName = extractCollectionName(textUntilPosition);
-          if (collName) {
-            try {
-              const fields = await opts.getFieldNames(collName);
-              for (const f of fields) {
-                suggestions.push({
-                  label: f.name,
-                  kind: monaco.languages.CompletionItemKind.Field,
-                  insertText: f.name,
-                  detail: f.collection,
-                  documentation: { value: `Field \`${f.name}\` (${f.types})` },
-                  range: { ...range, startColumn: Math.max(1, range.startColumn - 1) },
-                  sortText: "zz" + f.name, // lower priority than operators
-                });
-              }
-            } catch {
-              /* ignore schema fetch errors */
-            }
-          }
-        }
-
-        return { suggestions };
       }
 
-      // 5. 字段名提示：光标在 {} 或 "" 内部
-      const collName = extractCollectionName(textUntilPosition);
-      if (collName && opts.getFieldNames) {
-        const inBraces = isInsideBraces(textUntilPosition);
-        const inQuotes = isInsideQuotes(textUntilPosition);
+      for (const m of updateOperators) {
+        suggestions.push({
+          label: m.label,
+          kind: m.kind,
+          insertText: m.insertText,
+          insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          detail: m.detail,
+          documentation: { value: m.documentation },
+          range: { ...range, startColumn: Math.max(1, range.startColumn - 1) },
+        });
+      }
 
-        if (inBraces || inQuotes) {
+      for (const m of queryOperators) {
+        suggestions.push({
+          label: m.label,
+          kind: m.kind,
+          insertText: m.insertText,
+          insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          detail: m.detail,
+          documentation: { value: m.documentation },
+          range: { ...range, startColumn: Math.max(1, range.startColumn - 1) },
+        });
+      }
+
+      // 也在 $ 上下文提供字段名（如 $set: { field: ... }）
+      if (opts.getFieldNames) {
+        const collName = extractCollectionName(textUntilPosition);
+        if (collName) {
           try {
             const fields = await opts.getFieldNames(collName);
-
-            // 如果在引号内，调整 range 覆盖引号内的文本
-            let fieldRange = range;
-            if (inQuotes) {
-              // 找到引号起始位置
-              const lineUpToCursor = lineText.substring(0, position.column - 1);
-              const lastQuote = Math.max(
-                lineUpToCursor.lastIndexOf('"'),
-                lineUpToCursor.lastIndexOf("'"),
-              );
-              if (lastQuote >= 0) {
-                fieldRange = {
-                  startLineNumber: position.lineNumber,
-                  startColumn: lastQuote + 2, // after the quote
-                  endLineNumber: position.lineNumber,
-                  endColumn: position.column,
-                };
-              }
-            }
-
             for (const f of fields) {
               suggestions.push({
                 label: f.name,
@@ -1238,67 +1213,117 @@ export function registerMongoCompletions(arg?: CompletionOptions | (() => string
                 insertText: f.name,
                 detail: f.collection,
                 documentation: { value: `Field \`${f.name}\` (${f.types})` },
-                range: fieldRange,
+                range: { ...range, startColumn: Math.max(1, range.startColumn - 1) },
+                sortText: "zz" + f.name, // lower priority than operators
               });
-            }
-
-            // 在 {} 内也提供 $ 操作符（低优先级）
-            if (inBraces && !inQuotes) {
-              for (const m of queryOperators) {
-                suggestions.push({
-                  label: m.label,
-                  kind: m.kind,
-                  insertText: m.insertText,
-                  insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-                  detail: m.detail,
-                  documentation: { value: m.documentation },
-                  range,
-                  sortText: "zz" + m.label,
-                });
-              }
             }
           } catch {
             /* ignore schema fetch errors */
           }
-
-          return { suggestions };
-        }
-      }
-
-      // 6. 兜底: 一般 JS 位置 (不在引号里) -> 提供全局函数 / BSON 构造器 / db / 代码片段
-      if (!isInsideQuotes(textUntilPosition)) {
-        for (const m of globalFunctions) {
-          suggestions.push({
-            label: m.label,
-            kind: m.kind,
-            insertText: m.insertText,
-            insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-            detail: m.detail,
-            documentation: { value: m.documentation },
-            range,
-          });
-        }
-        suggestions.push({
-          label: "db",
-          kind: monaco.languages.CompletionItemKind.Variable,
-          insertText: "db",
-          detail: "当前数据库",
-          documentation: { value: "MongoDB 数据库句柄, db.<集合>.<方法>()" },
-          range,
-        });
-        // 代码片段: 全量列出, ${COLL} 用当前 tab 的集合名 (没有就 collection 占位)
-        const coll = opts.currentCollection?.() || "";
-        for (const snip of MONGO_SNIPPETS) {
-          const body = renderSnippet(snip.body, coll);
-          suggestions.push(snippetToItem(snip, body, range));
         }
       }
 
       return { suggestions };
-    },
-  };
+    }
+
+    // 5. 字段名提示：光标在 {} 或 "" 内部
+    const collName = extractCollectionName(textUntilPosition);
+    if (collName && opts.getFieldNames) {
+      const inBraces = isInsideBraces(textUntilPosition);
+      const inQuotes = isInsideQuotes(textUntilPosition);
+
+      if (inBraces || inQuotes) {
+        try {
+          const fields = await opts.getFieldNames(collName);
+
+          // 如果在引号内，调整 range 覆盖引号内的文本
+          let fieldRange = range;
+          if (inQuotes) {
+            // 找到引号起始位置
+            const lineUpToCursor = lineText.substring(0, position.column - 1);
+            const lastQuote = Math.max(
+              lineUpToCursor.lastIndexOf('"'),
+              lineUpToCursor.lastIndexOf("'"),
+            );
+            if (lastQuote >= 0) {
+              fieldRange = {
+                startLineNumber: position.lineNumber,
+                startColumn: lastQuote + 2, // after the quote
+                endLineNumber: position.lineNumber,
+                endColumn: position.column,
+              };
+            }
+          }
+
+          for (const f of fields) {
+            suggestions.push({
+              label: f.name,
+              kind: monaco.languages.CompletionItemKind.Field,
+              insertText: f.name,
+              detail: f.collection,
+              documentation: { value: `Field \`${f.name}\` (${f.types})` },
+              range: fieldRange,
+            });
+          }
+
+          // 在 {} 内也提供 $ 操作符（低优先级）
+          if (inBraces && !inQuotes) {
+            for (const m of queryOperators) {
+              suggestions.push({
+                label: m.label,
+                kind: m.kind,
+                insertText: m.insertText,
+                insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+                detail: m.detail,
+                documentation: { value: m.documentation },
+                range,
+                sortText: "zz" + m.label,
+              });
+            }
+          }
+        } catch {
+          /* ignore schema fetch errors */
+        }
+
+        return { suggestions };
+      }
+    }
+
+    // 6. 兜底: 一般 JS 位置 (不在引号里) -> 提供全局函数 / BSON 构造器 / db / 代码片段
+    if (!isInsideQuotes(textUntilPosition)) {
+      for (const m of globalFunctions) {
+        suggestions.push({
+          label: m.label,
+          kind: m.kind,
+          insertText: m.insertText,
+          insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          detail: m.detail,
+          documentation: { value: m.documentation },
+          range,
+        });
+      }
+      suggestions.push({
+        label: "db",
+        kind: monaco.languages.CompletionItemKind.Variable,
+        insertText: "db",
+        detail: "当前数据库",
+        documentation: { value: "MongoDB 数据库句柄, db.<集合>.<方法>()" },
+        range,
+      });
+      // 代码片段: 全量列出, ${COLL} 用当前 tab 的集合名 (没有就 collection 占位)
+      const coll = opts.currentCollection?.() || "";
+      for (const snip of MONGO_SNIPPETS) {
+        const body = renderSnippet(snip.body, coll);
+        suggestions.push(snippetToItem(snip, body, range));
+      }
+    }
+
+    return { suggestions };
+  }
 
   // 同时挂到 javascript 和 mongosh 两个 language id
-  monaco.languages.registerCompletionItemProvider("javascript", provider);
-  monaco.languages.registerCompletionItemProvider("mongosh", provider);
+  _disposables.push(
+    monaco.languages.registerCompletionItemProvider("javascript", provider),
+    monaco.languages.registerCompletionItemProvider("mongosh", provider),
+  );
 }

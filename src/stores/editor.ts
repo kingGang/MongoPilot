@@ -10,6 +10,7 @@ import {
   collectScriptOps,
   extractDbStatements,
   extractLoadPaths,
+  extractPureHelpers,
   needsPreEvaluation,
   preEvaluateStatement,
   scriptOpToStatement,
@@ -437,22 +438,32 @@ export const useEditorStore = defineStore("editor", () => {
       return;
     }
 
-    // read-then-write 脚本: 把整段交给 script mode (preEval 单语句拿不到 var 里的真实 db 读数据)
-    if (needsPreEvaluation(tab.content) && hasDbReadInVar(tab.content)) {
-      await executeScript(tab, tab.content);
+    // read-then-write 脚本: 把整段交给 script mode (preEval 单语句拿不到 var 里的真实 db 读数据).
+    // 关键: 仅在用户跑"整段"或选区本身就含 var=db.xxx 的读绑定时才升级到 script mode;
+    // 如果用户明确选中了一条自包含的 db.xxx 语句 (例如调试时只想跑 `db.user.find({})`),
+    // 不能因为整段脚本里别处有 read-then-write 模式就把它当脚本跑.
+    const explicitSelection = queryText !== undefined;
+    const escalateToScript = explicitSelection
+      ? hasDbReadInVar(text) // 选区里自己有 var=db.xxx 才升级
+      : hasDbReadInVar(tab.content); // 跑整段时按整段判断
+    if (needsPreEvaluation(tab.content) && escalateToScript) {
+      await executeScript(tab, explicitSelection ? text : tab.content);
       return;
     }
 
     // 选中的不是直接以 db. 开头 (例如选了 "helper 函数 + 一条查询" 整段):
     //   - 里面有 db.xxx 语句  -> 抽出最后一条当作要跑的查询, 走预求值
-    //   - 完全没有 db 语句、又有 helper/load -> 才是真正的脚本模式 (收集写操作)
+    //   - 完全没有 db 语句、又有 helper/load -> 走脚本模式, 但**只跑选区**:
+    //     拼 "tab.content 里的纯 helper (函数 + 字面量 var)" + "选区" 成迷你脚本.
+    //     这样脚本里其它 print() / db read / 控制流不会被跑掉.
     let runText = text;
     if (!stripped.startsWith("db.") && !stripped.startsWith("use ")) {
       const dbStmts = extractDbStatements(text);
       if (dbStmts.length > 0) {
         runText = dbStmts[dbStmts.length - 1];
       } else if (needsPreEvaluation(tab.content)) {
-        await executeScript(tab, text);
+        const miniScript = `${extractPureHelpers(tab.content)}\n${text}`;
+        await executeScript(tab, text, miniScript);
         return;
       }
     }
@@ -484,10 +495,15 @@ export const useEditorStore = defineStore("editor", () => {
   }
 
   /**
-   * 脚本模式执行: 整段命令式脚本在 webview JS 引擎里跑一遍 ——
+   * 脚本模式执行: 命令式脚本在 webview JS 引擎里跑一遍 ——
    * db 读操作真发后端拿数据, 写操作收集后批量执行, print() 输出捕获展示。
+   *
+   * @param execCode 实际丢给 collectScriptOps 跑的代码; 不传则用 tab.content 整段.
+   *                 用户选了非 db.* 行 (例如 `print(...)`) 跑时, executeQuery 会传
+   *                 "纯 helper + 选区" 的迷你脚本进来, 避免把整段脚本里其它 print /
+   *                 控制流也跑掉, 让用户看到一堆不期望的输出。
    */
-  async function executeScript(tab: EditorTab, text: string) {
+  async function executeScript(tab: EditorTab, text: string, execCode?: string) {
     const rt = spawnResultTab(tab, "find", text);
     if (!rt) return;
     const start = Date.now();
@@ -498,7 +514,8 @@ export const useEditorStore = defineStore("editor", () => {
         const res = await queryApi.runQuery(tab.connectionId, tab.database, statement, 0, 1000);
         return { documents: res.documents, count: res.count };
       };
-      const { ops, output, error } = await collectScriptOps(tab.content, loadedHelpers, runRead);
+      const codeToRun = execCode ?? tab.content;
+      const { ops, output, error } = await collectScriptOps(codeToRun, loadedHelpers, runRead);
       if (rt.aborted) return;
 
       if (error) {
