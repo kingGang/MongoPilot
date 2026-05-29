@@ -506,6 +506,20 @@ export const useEditorStore = defineStore("editor", () => {
   async function executeScript(tab: EditorTab, text: string, execCode?: string) {
     const rt = spawnResultTab(tab, "find", text);
     if (!rt) return;
+    // 只读连接早拦: 脚本模式会在 webview 里跑用户的 for 循环 / load() 进来的 helper,
+    // 里面常含 insert/update/delete (例如 batchGenDolls 这种造数脚本) -> 即使后端
+    // run_script_ops 会拒绝, 前端在 collectScriptOps 里跑循环 + 串行 await read 也
+    // 可能让用户以为"一直转圈". 直接在入口拒绝, 给明确提示。
+    try {
+      const connStore = useConnectionStore();
+      if (connStore.isReadOnly(tab.connectionId)) {
+        rt.error = "只读连接: 不允许执行脚本 (脚本可能包含 insert/update/delete 等写操作)";
+        rt.loading = false;
+        return;
+      }
+    } catch {
+      /* store not ready, 放行让后续逻辑处理 */
+    }
     const start = Date.now();
     try {
       const loadedHelpers = await readLoadedHelpers(tab.content, new Set(), 0);
