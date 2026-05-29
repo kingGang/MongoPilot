@@ -808,7 +808,24 @@ return { ops: __ops__, output: __out__, error: __err__ };
     const error = result?.error != null ? String(result.error) : null;
     return { ops, output, error };
   } catch (e) {
-    return { ops: [], output: [], error: String(e) };
+    // 编译/运行失败时, 单独把 user code (含 loaded helpers) 拿出来再编译一次:
+    // 这样报错行号就是 user code 自身的真实行号, 而不是被嵌进 body 后被 TYPE_STUBS / db
+    // proxy 定义堆出来的相对位置, 用户能直接定位到自己脚本里的语法问题 (例如字符串内嵌
+    // 双引号未转义).
+    let detail = String(e);
+    try {
+      const AsyncFn = Object.getPrototypeOf(async function () {}).constructor as new (
+        ...args: string[]
+      ) => unknown;
+      // 单独编译 user code (含 awaitifyDbCalls 处理过的版本); 不带任何 wrapping
+      new AsyncFn(code);
+      // user code 单独编译通过 -> 是 MongoPilot 包装层的 bug
+      detail = `${String(e)} (MongoPilot 内部错误, 用户脚本本身可编译; 请把脚本贴给开发者)`;
+    } catch (innerE) {
+      // user code 单独编译就报错 -> 是用户脚本本身的语法问题
+      detail = `用户脚本语法错: ${String(innerE)} (检查字符串内嵌引号是否成对、转义是否正确; 长字符串建议用 \` 模板字符串包)`;
+    }
+    return { ops: [], output: [], error: detail };
   }
 }
 
