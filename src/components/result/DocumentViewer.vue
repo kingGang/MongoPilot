@@ -16,6 +16,8 @@ const props = defineProps<{
   initialIndex: number;
   /** 集合名 —— 传入后 Edit in new tab 会拼成 `db.<coll>.updateOne(...)` */
   collection?: string;
+  /** 只读连接 —— 隐藏 "Edit in new tab" 按钮 (避免引导用户开一个注定被后端拒的脚本) */
+  readOnly?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -341,7 +343,7 @@ function editInTab() {
               <template #icon><n-icon><ReloadIcon /></n-icon></template>
               Reload
             </n-button>
-            <n-button size="small" quaternary @click="editInTab">
+            <n-button v-if="!readOnly" size="small" quaternary @click="editInTab">
               <template #icon><n-icon><EditIcon /></n-icon></template>
               Edit in new tab
             </n-button>

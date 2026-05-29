@@ -119,6 +119,9 @@ pub async fn drop_database(
     connection_id: String,
     database: String,
 ) -> Result<(), AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许删除数据库".into()));
+    }
     let client = mgr.get_client(&connection_id).await?;
     client.database(&database).drop().await.map_err(AppError::Mongo)?;
     Ok(())

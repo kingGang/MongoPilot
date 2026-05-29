@@ -253,6 +253,10 @@ function parseCsvLine(line: string): string[] {
 
 // ---- 执行导入 ----
 async function handleExecute() {
+  if (connStore.isReadOnly(selectedConnId.value)) {
+    importError.value = "只读连接: 不允许导入数据";
+    return;
+  }
   if (!filePath.value || !selectedColl.value) return;
   importing.value = true;
   importError.value = "";
@@ -290,8 +294,13 @@ function handleClose() {
   emit("update:show", false);
 }
 
+const targetIsReadOnly = computed(() => connStore.isReadOnly(selectedConnId.value));
+
 const canExecute = computed(() =>
-  filePath.value.length > 0 && selectedColl.value.length > 0 && !importing.value,
+  filePath.value.length > 0
+  && selectedColl.value.length > 0
+  && !importing.value
+  && !targetIsReadOnly.value,
 );
 </script>
 
@@ -383,6 +392,11 @@ const canExecute = computed(() =>
         </div>
       </div>
 
+      <!-- 只读连接横幅 -->
+      <div v-if="targetIsReadOnly" class="import-status status-error">
+        只读连接, 禁用导入
+      </div>
+
       <!-- 预览 -->
       <div v-if="previewData" class="preview-section">
         <div class="preview-header">Imported JSON Preview (前 {{ previewData.length }} 条)</div>
@@ -401,6 +415,7 @@ const canExecute = computed(() =>
               size="small"
               :disabled="!canExecute"
               :loading="importing"
+              :title="targetIsReadOnly ? '只读连接, 禁用导入' : ''"
               @click="handleExecute"
             >
               <template #icon><n-icon :size="14"><ImportIcon /></n-icon></template>

@@ -9,6 +9,7 @@ import ExplainView from "./ExplainView.vue";
 import ExportDialog from "./ExportDialog.vue";
 import type { ResultTab } from "@/types/database";
 import * as docApi from "@/api/document";
+import { useConnectionStore } from "@/stores/connection";
 
 const props = defineProps<{
   resultTab: ResultTab | null;
@@ -16,6 +17,10 @@ const props = defineProps<{
   database: string;
   collection: string;
 }>();
+
+const connStore = useConnectionStore();
+/** 当前连接是否只读 —— 用于隐藏 插入/删除 按钮 + 关闭单元格编辑 */
+const isReadOnly = computed(() => connStore.isReadOnly(props.connectionId));
 
 const emit = defineEmits<{
   refresh: [];
@@ -184,6 +189,7 @@ const insertDocText = ref("{\n  \n}");
 const inserting = ref(false);
 
 function openInsertDialog() {
+  if (isReadOnly.value) { message.warning("只读连接: 不允许插入文档"); return; }
   if (!props.collection) { message.warning("请先选择集合"); return; }
   insertDocText.value = "{\n  \n}";
   showInsertDialog.value = true;
@@ -221,6 +227,10 @@ function formatIdForDisplay(id: unknown): string {
 }
 
 function handleDeleteSelected() {
+  if (isReadOnly.value) {
+    message.warning("只读连接: 不允许删除文档");
+    return;
+  }
   if (!result.value) {
     message.warning("没有可删除的结果");
     return;
@@ -339,6 +349,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
       :execution-time-ms="result.executionTimeMs"
       :collection="collection"
       :loading="loading"
+      :read-only="isReadOnly"
       @update:page-size="handlePageSizeChange"
       @update:current-page="handlePageChange"
       @update:view-mode="viewMode = $event"
@@ -426,6 +437,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
           :connection-id="connectionId"
           :database="database"
           :collection="collection"
+          :read-only="isReadOnly"
           :doc-key-fn="docSelectionKey"
           :selected-keys="selectedKeys"
           :dirty-fields="dirtyFields"
@@ -445,6 +457,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
           :connection-id="connectionId"
           :database="database"
           :collection="collection"
+          :read-only="isReadOnly"
           :doc-key-fn="docSelectionKey"
           :selected-keys="selectedKeys"
           :dirty-fields="dirtyFields"

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, computed, onMounted } from "vue";
 import {
   NDataTable, NButton, NSpace, NRadioGroup, NRadio, NInputNumber, NCard, NTag,
   useMessage,
@@ -7,10 +7,13 @@ import {
 import type { DataTableColumns } from "naive-ui";
 import * as serverApi from "@/api/server";
 import type { ProfileEntry } from "@/types/server";
+import { useConnectionStore } from "@/stores/connection";
 
 const props = defineProps<{ connectionId: string; database: string }>();
 
 const message = useMessage();
+const connStore = useConnectionStore();
+const isReadOnly = computed(() => connStore.isReadOnly(props.connectionId));
 const entries = ref<ProfileEntry[]>([]);
 const profilerLevel = ref(0);
 const slowMs = ref(100);
@@ -43,6 +46,10 @@ async function loadData() {
 }
 
 async function handleSetLevel() {
+  if (isReadOnly.value) {
+    message.warning("只读连接: 不允许修改 Profiler 配置");
+    return;
+  }
   try {
     await serverApi.setProfilerLevel(props.connectionId, props.database, profilerLevel.value, slowMs.value);
     message.success("Profiler 级别已更新");
@@ -73,7 +80,13 @@ const columns: DataTableColumns = [
         <span>慢查询阈值：</span>
         <n-input-number v-model:value="slowMs" :min="0" :max="60000" size="small" style="width: 100px" />
         <span>ms</span>
-        <n-button size="small" type="primary" @click="handleSetLevel">应用</n-button>
+        <n-button
+          size="small"
+          type="primary"
+          :disabled="isReadOnly"
+          :title="isReadOnly ? '只读连接, 禁用修改' : ''"
+          @click="handleSetLevel"
+        >应用</n-button>
       </n-space>
     </n-card>
 

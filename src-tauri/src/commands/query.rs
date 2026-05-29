@@ -37,15 +37,10 @@ pub async fn run_query(
     pool: State<'_, DbPool>,
     request: RunQueryRequest,
 ) -> Result<QueryResult, AppError> {
-    // 只读检查：拦截写操作
+    // 只读检查：拦截写操作 (shell 语法层 + aggregate 写入阶段)
     if mgr.is_read_only(&request.connection_id).await {
-        let q = request.query_text.trim();
-        let write_ops = ["insertOne(", "insertMany(", "updateOne(", "updateMany(",
-            "deleteOne(", "deleteMany(", "replaceOne(", "dropUser(", "createUser(", "drop("];
-        for op in &write_ops {
-            if q.contains(op) {
-                return Err(AppError::InvalidInput("只读连接：不允许执行写操作".into()));
-            }
+        if has_write_op(request.query_text.trim()) {
+            return Err(AppError::InvalidInput("只读连接：不允许执行写操作".into()));
         }
     }
 
@@ -230,4 +225,101 @@ pub async fn list_all_query_history(
 #[tauri::command]
 pub async fn clear_all_query_history(pool: State<'_, DbPool>) -> Result<(), AppError> {
     history_repo::clear_all_history(&pool).await
+}
+
+/// 判断 shell 查询是否含写操作 —— 用于只读连接的拦截.
+///
+/// 覆盖三类:
+///   1) executor 已支持的集合方法 (insertOne/Many, updateOne/Many, deleteOne/Many, replaceOne)
+///   2) 数据库级写命令 (createUser/dropUser, drop = db.coll.drop / db.dropDatabase 等)
+///   3) aggregate 写入阶段 ($out, $merge) —— 这一类绕过 (1) 的方法名黑名单
+///
+/// 另外, 把 executor 当前还没分发但 mongosh 用户常用的写法也提前 deny:
+///   findAndModify / findOneAndUpdate / findOneAndReplace / findOneAndDelete /
+///   bulkWrite / createIndex / dropIndex / createCollection / renameCollection /
+///   grantRoles / revokeRoles / createRole / dropRole / dropDatabase / mapReduce
+/// —— 即使现在跑会因 "不支持的操作" 退出, 也直接给只读语义更明确的报错.
+fn has_write_op(q: &str) -> bool {
+    const METHOD_PREFIXES: &[&str] = &[
+        // 已实现的集合写
+        "insertOne(", "insertMany(", "updateOne(", "updateMany(",
+        "deleteOne(", "deleteMany(", "replaceOne(",
+        // 集合 / DB 级写
+        "drop(", "dropDatabase(", "createCollection(", "renameCollection(",
+        "createIndex(", "dropIndex(", "createIndexes(", "dropIndexes(", "reIndex(",
+        // 用户 / 角色
+        "createUser(", "dropUser(", "updateUser(",
+        "createRole(", "dropRole(", "updateRole(",
+        "grantRolesToUser(", "revokeRolesFromUser(",
+        "grantRolesToRole(", "revokeRolesFromRole(",
+        "grantPrivilegesToRole(", "revokePrivilegesFromRole(",
+        // 这些 mongosh 调用即使 executor 不分发, 在只读语义下也直接 deny
+        "findAndModify(", "findOneAndUpdate(", "findOneAndReplace(", "findOneAndDelete(",
+        "bulkWrite(", "mapReduce(",
+    ];
+    for m in METHOD_PREFIXES {
+        if q.contains(m) {
+            return true;
+        }
+    }
+    // aggregate 写入阶段: $out / $merge.
+    // 必须排除 $mergeObjects (是 read 端聚合表达式) —— 通过 "$ident 后必须紧跟非字母"
+    // 来区分 ($merge -> 写, $mergeObjects -> 读).
+    contains_pipeline_stage(q, "$out") || contains_pipeline_stage(q, "$merge")
+}
+
+/// 检查 `q` 是否包含一个 pipeline stage 名 `stage`. 要求:
+///   - 命中的 stage 后续字符不是 ASCII 字母 (否则会把 `$mergeObjects` 误判成 `$merge`)
+///   - 不区分 stage 前面的字符 (常见前导是 `{`, `,`, ` ` 或 `"`)
+fn contains_pipeline_stage(q: &str, stage: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = q[start..].find(stage) {
+        let abs = start + pos;
+        let after = q[abs + stage.len()..].chars().next();
+        match after {
+            Some(c) if c.is_ascii_alphabetic() => {
+                start = abs + 1; // $mergeObjects 之类, 继续往后找
+                continue;
+            }
+            _ => return true,
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_write_op;
+
+    #[test]
+    fn detects_basic_collection_writes() {
+        assert!(has_write_op("db.users.insertOne({name:'a'})"));
+        assert!(has_write_op("db.users.deleteMany({})"));
+        assert!(has_write_op("db.users.replaceOne({_id:1},{x:2})"));
+    }
+
+    #[test]
+    fn detects_aggregate_out_and_merge_stages() {
+        assert!(has_write_op(r#"db.users.aggregate([{ $out: "snapshot" }])"#));
+        assert!(has_write_op(r#"db.users.aggregate([{$merge:{into:"snap"}}])"#));
+    }
+
+    #[test]
+    fn does_not_flag_merge_objects_or_other_read_stages() {
+        // $mergeObjects 是读端表达式, 不应误伤
+        assert!(!has_write_op(r#"db.users.aggregate([{$group:{_id:"$g", merged:{$mergeObjects:"$$ROOT"}}}])"#));
+        assert!(!has_write_op("db.users.find({})"));
+        assert!(!has_write_op("db.users.countDocuments({})"));
+        assert!(!has_write_op("show dbs"));
+    }
+
+    #[test]
+    fn detects_user_and_index_admin_writes() {
+        assert!(has_write_op(r#"db.createUser({user:"u",pwd:"p",roles:[]})"#));
+        assert!(has_write_op(r#"db.dropUser("u")"#));
+        assert!(has_write_op(r#"db.users.createIndex({k:1})"#));
+        assert!(has_write_op(r#"db.users.dropIndex("k_1")"#));
+        assert!(has_write_op(r#"db.users.findAndModify({query:{},update:{$set:{x:1}}})"#));
+        assert!(has_write_op(r#"db.users.bulkWrite([{updateOne:{filter:{},update:{}}}])"#));
+    }
 }

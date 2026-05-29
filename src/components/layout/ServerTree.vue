@@ -778,9 +778,49 @@ async function handleIndexCreated() {
   await loadIndexes(connId, database, collection);
 }
 
+/** ServerTree 中所有写动作 key, 用于只读连接拦截 */
+const WRITE_ACTIONS = new Set<string>([
+  "create-coll", "drop-db", "drop-coll",
+  "add-index", "add-index-from-idx",
+  "rebuild-indexes", "drop-indexes",
+  "update-index", "drop-this-index",
+  "drop-user",
+]);
+
+/** 从 nodeKey 提取 connId, 覆盖 conn:/db:/coll:/indexes:/idx:/users:/user:/role:/dbusers: 所有格式 */
+function extractConnId(nodeKey: string): string {
+  if (nodeKey.startsWith("conn:")) return nodeKey.slice(5);
+  if (nodeKey.startsWith("db:")) return parseDbKey(nodeKey).connId;
+  if (nodeKey.startsWith("coll:")) return parseCollKey(nodeKey).connId;
+  if (nodeKey.startsWith("indexes:")) return parseIndexesKey(nodeKey).connId;
+  if (nodeKey.startsWith("idx:")) return parseIdxKey(nodeKey).connId;
+  if (nodeKey.startsWith("users:")) return nodeKey.slice(6);
+  // user:/role:/dbusers: 都是 "<prefix>:<connId>:..." 形式
+  for (const prefix of ["user:", "role:", "dbusers:"]) {
+    if (nodeKey.startsWith(prefix)) {
+      const rest = nodeKey.slice(prefix.length);
+      const idx = rest.indexOf(":");
+      return idx >= 0 ? rest.slice(0, idx) : rest;
+    }
+  }
+  return "";
+}
+
 async function handleCtxSelect(action: string) {
   showCtxMenu.value = false;
   const nodeKey = ctxNodeKey.value;
+
+  // 只读连接: 所有写动作 + 添加用户系列 (含 add-user-*, add-dbuser-*) 一律拦截
+  const isWriteAction = WRITE_ACTIONS.has(action)
+    || action.startsWith("add-user-")
+    || action.startsWith("add-dbuser-");
+  if (isWriteAction) {
+    const connId = extractConnId(nodeKey);
+    if (connId && connStore.isReadOnly(connId)) {
+      message.warning("只读连接: 不允许执行该操作");
+      return;
+    }
+  }
 
   if (action === "connect" && ctxConnConfig.value) {
     emit("connectServer", ctxConnConfig.value);

@@ -70,6 +70,12 @@ export const useConnectionStore = defineStore("connection", () => {
     return activeIds.value.has(id);
   }
 
+  /** 该连接是否只读 (写操作应在后端被拦截; 前端用它隐藏编辑按钮/灰化交互) */
+  function isReadOnly(id: string): boolean {
+    if (!id) return false;
+    return connections.value.find((c) => c.id === id)?.readOnly === true;
+  }
+
   return {
     connections,
     activeIds,
@@ -83,5 +89,6 @@ export const useConnectionStore = defineStore("connection", () => {
     connect,
     disconnectConn,
     isActive,
+    isReadOnly,
   };
 });

@@ -95,6 +95,9 @@ pub async fn create_user(
     database: String,
     request: CreateUserRequest,
 ) -> Result<(), AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许创建用户".into()));
+    }
     let client = mgr.get_client(&connection_id).await?;
     let db = client.database(&database);
 
@@ -122,6 +125,9 @@ pub async fn drop_user(
     database: String,
     username: String,
 ) -> Result<(), AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许删除用户".into()));
+    }
     let client = mgr.get_client(&connection_id).await?;
     let db = client.database(&database);
 
@@ -158,6 +164,9 @@ pub async fn set_profiler_level(
     level: i32,
     slow_ms: Option<i64>,
 ) -> Result<(), AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许修改 Profiler 配置".into()));
+    }
     let client = mgr.get_client(&connection_id).await?;
     let db = client.database(&database);
 

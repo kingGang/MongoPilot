@@ -20,6 +20,8 @@ const props = defineProps<{
   connectionId?: string;
   database?: string;
   collection?: string;
+  /** 只读连接 —— 禁止内联编辑 / 打开 ValueDetail */
+  readOnly?: boolean;
   docKeyFn?: (doc: Record<string, unknown>) => string | null;
   selectedKeys?: Set<string>;
   /** 已编辑字段集合, 元素格式: `${docKey}::${field}` —— 用来给单元格画 dirty 标识 */
@@ -159,8 +161,9 @@ function isCellDirty(row: RowItem): boolean {
   return props.dirtyFields.has(`${k}::${row.key}`);
 }
 
-/** 只对顶层字段开放编辑: docIndex 跟得上, 非根行, 非 _id (改 _id 危险, 不允许) */
+/** 只对顶层字段开放编辑: docIndex 跟得上, 非根行, 非 _id (改 _id 危险, 不允许); 只读连接一律不可编辑 */
 function isEditableLeaf(row: RowItem): boolean {
+  if (props.readOnly) return false;
   return row.docIndex >= 0 && !row.isDocRoot && row.key !== "_id";
 }
 
@@ -189,12 +192,14 @@ function cancelInlineEdit() {
 /** 双击入口: 简单类型走格子内联; null / 复合类型弹 ValueDetail */
 function onValueDblclick(row: RowItem, e: MouseEvent) {
   e.stopPropagation();
+  if (props.readOnly) { message.warning("只读连接: 不允许修改文档"); return; }
   if (!isEditableLeaf(row)) return;
   if (canInlineEdit(row.type)) startInlineEdit(row);
   else openValueEditor(row, e);
 }
 
 function startInlineEdit(row: RowItem) {
+  if (props.readOnly) { message.warning("只读连接: 不允许修改文档"); return; }
   if (!props.connectionId || !props.database || !props.collection) {
     message.warning("缺少存储上下文, 无法编辑");
     return;
@@ -296,6 +301,7 @@ function onDetailSaved() {
 /** 打开 Type-and-Value 编辑器. 调用前应已确认 isEditableLeaf 通过. */
 function openValueEditor(row: RowItem, e: MouseEvent) {
   e.stopPropagation();
+  if (props.readOnly) { message.warning("只读连接: 不允许修改文档"); return; }
   if (!isEditableLeaf(row)) return;
   const doc = props.documents[row.docIndex];
   if (!doc) return;
@@ -334,15 +340,19 @@ const ctxMenuOptions = computed<CtxItem[]>(() => {
   if (r.isDocRoot) {
     items.push({ label: "查看文档", key: "view-doc" });
     items.push({ type: "divider", key: "d-stmt" });
+    // 只读连接: 写操作模板会被后端拒, 干脆只暴露 find
+    const genChildren = props.readOnly
+      ? [{ label: "find — 按 _id 查询", key: "gen-find" }]
+      : [
+          { label: "find — 按 _id 查询", key: "gen-find" },
+          { label: "updateOne — $set 该文档", key: "gen-update" },
+          { label: "insertOne — 复制该文档", key: "gen-insert" },
+          { label: "deleteOne — 按 _id 删除", key: "gen-delete" },
+        ];
     items.push({
       label: "生成语句到新标签页",
       key: "gen",
-      children: [
-        { label: "find — 按 _id 查询", key: "gen-find" },
-        { label: "updateOne — $set 该文档", key: "gen-update" },
-        { label: "insertOne — 复制该文档", key: "gen-insert" },
-        { label: "deleteOne — 按 _id 删除", key: "gen-delete" },
-      ],
+      children: genChildren,
     });
   }
   return items;
@@ -641,6 +651,7 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
       :connection-id="connectionId"
       :database="database"
       :collection="collection"
+      :read-only="readOnly"
       :document-id="detailDocId"
       :document="detailDoc"
       @saved="onDetailSaved"
@@ -650,6 +661,7 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
       :documents="documents"
       :initial-index="docViewerIndex"
       :collection="collection"
+      :read-only="readOnly"
       @edit-in-tab="forwardEditInTab"
     />
     <n-dropdown

@@ -33,6 +33,8 @@ const props = defineProps<{
   executionTimeMs: number;
   collection?: string;
   loading?: boolean;
+  /** 当前连接是否只读 —— true 时插入/删除按钮置灰并改 tooltip 文案 */
+  readOnly?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -123,11 +125,16 @@ function goLast() { emit("update:currentPage", totalPages.value); }
       <!-- 文档操作按钮 -->
       <n-tooltip trigger="hover" :delay="500">
         <template #trigger>
-          <n-button size="tiny" quaternary @click="emit('insertDoc')">
+          <n-button
+            size="tiny"
+            quaternary
+            :disabled="readOnly"
+            @click="emit('insertDoc')"
+          >
             <template #icon><n-icon :size="14"><AddIcon /></n-icon></template>
           </n-button>
         </template>
-        插入文档
+        {{ readOnly ? "只读连接, 禁用插入" : "插入文档" }}
       </n-tooltip>
       <n-tooltip trigger="hover" :delay="500">
         <template #trigger>
@@ -158,13 +165,15 @@ function goLast() { emit("update:currentPage", totalPages.value); }
           <n-button
             size="tiny"
             quaternary
-            :disabled="(selectedCount ?? 0) === 0"
+            :disabled="readOnly || (selectedCount ?? 0) === 0"
             @click="emit('deleteSelected')"
           >
             <template #icon><n-icon :size="14"><DeleteIcon /></n-icon></template>
           </n-button>
         </template>
-        {{ (selectedCount ?? 0) === 0 ? "先勾选要删除的文档" : `删除 ${selectedCount} 条` }}
+        <template v-if="readOnly">只读连接, 禁用删除</template>
+        <template v-else-if="(selectedCount ?? 0) === 0">先勾选要删除的文档</template>
+        <template v-else>删除 {{ selectedCount }} 条</template>
       </n-tooltip>
 
       <div class="toolbar-divider" />

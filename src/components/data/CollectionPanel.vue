@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, computed } from "vue";
 import {
   NButton, NSpace, NInput, NModal, NCard, NDescriptions, NDescriptionsItem,
   useMessage, useDialog,
 } from "naive-ui";
 import * as collApi from "@/api/collectionMgmt";
 import { useDatabaseStore } from "@/stores/database";
+import { useConnectionStore } from "@/stores/connection";
 import type { CollectionStats } from "@/types/document";
 
 const props = defineProps<{
@@ -16,6 +17,8 @@ const props = defineProps<{
 const message = useMessage();
 const dialog = useDialog();
 const dbStore = useDatabaseStore();
+const connStore = useConnectionStore();
+const isReadOnly = computed(() => connStore.isReadOnly(props.connectionId));
 
 const showCreate = ref(false);
 const newCollName = ref("");
@@ -24,6 +27,10 @@ const stats = ref<CollectionStats | null>(null);
 const statsCollName = ref("");
 
 async function handleCreate() {
+  if (isReadOnly.value) {
+    message.warning("只读连接: 不允许创建集合");
+    return;
+  }
   if (!newCollName.value.trim()) return;
   try {
     await collApi.createCollection(props.connectionId, props.database, newCollName.value);
@@ -37,6 +44,10 @@ async function handleCreate() {
 }
 
 async function handleDrop(collName: string) {
+  if (isReadOnly.value) {
+    message.warning("只读连接: 不允许删除集合");
+    return;
+  }
   dialog.warning({
     title: "确认删除",
     content: `确定要删除集合 "${collName}" 吗？此操作不可恢复。`,
@@ -74,7 +85,13 @@ function formatSize(bytes: number): string {
 <template>
   <div class="collection-panel">
     <n-space vertical>
-      <n-button size="small" type="primary" @click="showCreate = true">
+      <n-button
+        size="small"
+        type="primary"
+        :disabled="isReadOnly"
+        :title="isReadOnly ? '只读连接, 禁用创建集合' : ''"
+        @click="showCreate = true"
+      >
         新建集合
       </n-button>
 
@@ -86,7 +103,14 @@ function formatSize(bytes: number): string {
         <span class="coll-name">{{ coll.name }}</span>
         <n-space size="small">
           <n-button size="tiny" quaternary @click="handleStats(coll.name)">统计</n-button>
-          <n-button size="tiny" quaternary type="error" @click="handleDrop(coll.name)">删除</n-button>
+          <n-button
+            size="tiny"
+            quaternary
+            type="error"
+            :disabled="isReadOnly"
+            :title="isReadOnly ? '只读连接, 禁用删除' : ''"
+            @click="handleDrop(coll.name)"
+          >删除</n-button>
         </n-space>
       </div>
     </n-space>

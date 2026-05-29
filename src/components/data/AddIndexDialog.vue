@@ -12,6 +12,7 @@ import {
 import * as collApi from "@/api/collectionMgmt";
 import * as aiApi from "@/api/ai";
 import type { IndexInfo } from "@/types/document";
+import { useConnectionStore } from "@/stores/connection";
 
 const props = defineProps<{
   show: boolean;
@@ -21,6 +22,9 @@ const props = defineProps<{
   /** 编辑模式: 提供已存在的索引信息, 提交时会先 dropIndex 再 createIndex */
   editingIndex?: IndexInfo | null;
 }>();
+
+const connStore = useConnectionStore();
+const isReadOnly = computed(() => connStore.isReadOnly(props.connectionId));
 
 const emit = defineEmits<{
   "update:show": [value: boolean];
@@ -200,6 +204,10 @@ const previewCommand = computed(() => {
 });
 
 async function handleRun() {
+  if (isReadOnly.value) {
+    message.warning("只读连接: 不允许创建/修改索引");
+    return;
+  }
   const keys = buildKeys();
   if (Object.keys(keys).length === 0) {
     message.warning("请至少勾选一个字段");
@@ -350,7 +358,8 @@ function handleCancel() {
             type="primary"
             size="small"
             :loading="submitting"
-            :disabled="checkedCount === 0"
+            :disabled="checkedCount === 0 || isReadOnly"
+            :title="isReadOnly ? '只读连接, 禁用提交' : ''"
             @click="handleRun"
           >
             <template #icon><n-icon :size="14"><RunIcon /></n-icon></template>

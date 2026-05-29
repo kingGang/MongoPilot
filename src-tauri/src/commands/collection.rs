@@ -55,6 +55,9 @@ pub async fn create_collection(
     database: String,
     collection_name: String,
 ) -> Result<(), AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许创建集合".into()));
+    }
     let client = mgr.get_client(&connection_id).await?;
     let db = client.database(&database);
     db.create_collection(&collection_name)
@@ -70,6 +73,9 @@ pub async fn drop_collection(
     database: String,
     collection_name: String,
 ) -> Result<(), AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许删除集合".into()));
+    }
     let client = mgr.get_client(&connection_id).await?;
     let coll = client
         .database(&database)
@@ -150,6 +156,9 @@ pub async fn create_index(
     keys: serde_json::Value,
     options: Option<CreateIndexOptions>,
 ) -> Result<String, AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许创建索引".into()));
+    }
     let client = mgr.get_client(&connection_id).await?;
     let coll = client
         .database(&database)
@@ -191,6 +200,9 @@ pub async fn drop_index(
     collection_name: String,
     index_name: String,
 ) -> Result<(), AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许删除索引".into()));
+    }
     let client = mgr.get_client(&connection_id).await?;
     let coll = client
         .database(&database)

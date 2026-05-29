@@ -13,6 +13,8 @@ const props = defineProps<{
   connectionId?: string;
   database?: string;
   collection?: string;
+  /** 只读连接 —— Save 按钮置灰, 不允许写库 */
+  readOnly?: boolean;
   documentId?: string;
   document?: Record<string, unknown>;
 }>();
@@ -178,6 +180,10 @@ function buildBsonValue(text: string, type: string): unknown {
 }
 
 async function handleSave() {
+  if (props.readOnly) {
+    validationError.value = "只读连接: 不允许保存";
+    return;
+  }
   const error = validateValue(editText.value, typeName.value);
   if (error) {
     validationError.value = error;
@@ -428,7 +434,14 @@ const lineCount = computed(() => editText.value.split("\n").length);
             View generated Script...
           </n-button>
           <n-space>
-            <n-button size="small" type="primary" :loading="saving" :disabled="!!validationError" @click="handleSave">
+            <n-button
+              size="small"
+              type="primary"
+              :loading="saving"
+              :disabled="!!validationError || readOnly"
+              :title="readOnly ? '只读连接, 禁用保存' : ''"
+              @click="handleSave"
+            >
               Save (Ctrl+s)
             </n-button>
             <n-button size="small" @click="emit('update:show', false)">Cancel</n-button>

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, computed, onMounted } from "vue";
 import {
   NDataTable, NButton, NModal, NCard, NForm, NFormItem, NInput, NSwitch,
   NInputNumber, NSpace, useMessage, useDialog,
@@ -7,6 +7,7 @@ import {
 import type { DataTableColumns } from "naive-ui";
 import * as collApi from "@/api/collectionMgmt";
 import type { IndexInfo, CreateIndexOptions } from "@/types/document";
+import { useConnectionStore } from "@/stores/connection";
 
 const props = defineProps<{
   connectionId: string;
@@ -16,6 +17,8 @@ const props = defineProps<{
 
 const message = useMessage();
 const dialog = useDialog();
+const connStore = useConnectionStore();
+const isReadOnly = computed(() => connStore.isReadOnly(props.connectionId));
 const indexes = ref<IndexInfo[]>([]);
 const showCreate = ref(false);
 const newKeyField = ref("");
@@ -45,6 +48,10 @@ function removeKey(index: number) {
 }
 
 async function handleCreate() {
+  if (isReadOnly.value) {
+    message.warning("只读连接: 不允许创建索引");
+    return;
+  }
   if (newKeys.value.length === 0) {
     message.warning("请至少添加一个索引字段");
     return;
@@ -67,6 +74,10 @@ async function handleCreate() {
 }
 
 async function handleDrop(indexName: string) {
+  if (isReadOnly.value) {
+    message.warning("只读连接: 不允许删除索引");
+    return;
+  }
   if (indexName === "_id_") {
     message.warning("不能删除 _id 索引");
     return;
@@ -106,7 +117,13 @@ const columns: DataTableColumns = [
 <template>
   <div class="index-panel">
     <n-space vertical>
-      <n-button size="small" type="primary" @click="showCreate = true">新建索引</n-button>
+      <n-button
+        size="small"
+        type="primary"
+        :disabled="isReadOnly"
+        :title="isReadOnly ? '只读连接, 禁用创建索引' : ''"
+        @click="showCreate = true"
+      >新建索引</n-button>
 
       <n-data-table :columns="columns" :data="indexes" :row-key="(row: any) => row.name" size="small" />
     </n-space>

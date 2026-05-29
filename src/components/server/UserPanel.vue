@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, computed, onMounted } from "vue";
 import {
   NDataTable, NButton, NModal, NCard, NForm, NFormItem, NInput, NSpace,
   NSelect, useMessage, useDialog,
@@ -7,11 +7,14 @@ import {
 import type { DataTableColumns } from "naive-ui";
 import * as serverApi from "@/api/server";
 import type { UserInfo } from "@/types/server";
+import { useConnectionStore } from "@/stores/connection";
 
 const props = defineProps<{ connectionId: string; database: string }>();
 
 const message = useMessage();
 const dialog = useDialog();
+const connStore = useConnectionStore();
+const isReadOnly = computed(() => connStore.isReadOnly(props.connectionId));
 const users = ref<UserInfo[]>([]);
 const showCreate = ref(false);
 const newUser = ref({ username: "", password: "", role: "read", roleDb: "" });
@@ -36,6 +39,10 @@ const roleOptions = [
 ];
 
 async function handleCreate() {
+  if (isReadOnly.value) {
+    message.warning("只读连接: 不允许创建用户");
+    return;
+  }
   if (!newUser.value.username || !newUser.value.password) return;
   try {
     await serverApi.createUser(props.connectionId, props.database, {
@@ -53,6 +60,10 @@ async function handleCreate() {
 }
 
 async function handleDrop(username: string) {
+  if (isReadOnly.value) {
+    message.warning("只读连接: 不允许删除用户");
+    return;
+  }
   dialog.warning({
     title: "确认删除",
     content: `确定要删除用户 "${username}" 吗？`,
@@ -87,7 +98,13 @@ const columns: DataTableColumns = [
 <template>
   <div class="user-panel">
     <n-space vertical>
-      <n-button size="small" type="primary" @click="showCreate = true">新建用户</n-button>
+      <n-button
+        size="small"
+        type="primary"
+        :disabled="isReadOnly"
+        :title="isReadOnly ? '只读连接, 禁用新建用户' : ''"
+        @click="showCreate = true"
+      >新建用户</n-button>
       <n-data-table :columns="columns" :data="users" :row-key="(row: any) => row.user" size="small" />
     </n-space>
 

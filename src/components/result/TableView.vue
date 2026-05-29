@@ -14,6 +14,8 @@ const props = defineProps<{
   collection: string;
   documents: Record<string, unknown>[];
   rowOffset?: number;
+  /** 只读连接 —— 禁止任何 startEdit / openDetail */
+  readOnly?: boolean;
   docKeyFn?: (doc: Record<string, unknown>) => string | null;
   selectedKeys?: Set<string>;
   /** 已编辑字段集合, 元素格式: `${docKey}::${field}` —— 给单元格画 dirty 标识 */
@@ -93,6 +95,8 @@ function openDetail(field: string, val: unknown, doc?: Record<string, unknown>) 
 const editingOriginal = ref<string>("");
 
 function canEdit(rowIdx: number): boolean {
+  // 只读连接一律不可编辑
+  if (props.readOnly) return false;
   // 没有集合名（命令结果）不可编辑
   if (!props.collection) return false;
   // 没有 _id 的文档不可编辑
@@ -102,6 +106,10 @@ function canEdit(rowIdx: number): boolean {
 }
 
 function startEdit(rowIdx: number, key: string, val: unknown, type: string) {
+  if (props.readOnly) {
+    message.warning("只读连接: 不允许修改文档");
+    return;
+  }
   if (!canEdit(rowIdx)) {
     message.warning("该结果不可编辑");
     return;
@@ -292,8 +300,11 @@ watch(
         const val = row[key];
         const rowIdx = (row as Record<string, unknown>).__rowKey as number;
 
-        // null / undefined: 双击打开 Type and Value 编辑器, 用户可改类型 + 填值
+        // null / undefined: 只读连接下纯展示, 否则双击打开 Type and Value 编辑器
         if (val === null || val === undefined) {
+          if (props.readOnly) {
+            return h("span", { style: "color:#999;font-style:italic" }, "null");
+          }
           return h("span", {
             style: "color:#999;font-style:italic;cursor:pointer",
             title: "双击修改类型和值",
@@ -374,9 +385,13 @@ watch(
             ? `{${Object.keys(val as object).length} fields}`
             : `[${(val as unknown[]).length}]`;
           return h("span", {
-            style: "color:#61afef;cursor:pointer",
+            style: props.readOnly ? "color:#61afef" : "color:#61afef;cursor:pointer",
             title: objectPreview(val),
-            onClick: (e: MouseEvent) => { e.stopPropagation(); openDetail(key, val, row); },
+            onClick: (e: MouseEvent) => {
+              e.stopPropagation();
+              if (props.readOnly) { message.warning("只读连接: 不允许修改文档"); return; }
+              openDetail(key, val, row);
+            },
           }, label);
         }
 
@@ -518,6 +533,7 @@ async function handleCtxSelect(action: string) {
       :connection-id="connectionId"
       :database="database"
       :collection="collection"
+      :read-only="readOnly"
       :document-id="detailDocId"
       :document="detailDoc"
       @saved="onDetailSaved"
@@ -527,6 +543,7 @@ async function handleCtxSelect(action: string) {
       :documents="documents"
       :initial-index="docViewerIndex"
       :collection="collection"
+      :read-only="readOnly"
       @edit-in-tab="forwardEditInTab"
     />
     <n-dropdown
