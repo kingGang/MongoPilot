@@ -251,49 +251,49 @@ interface Captured {
 export function extractPureHelpers(content: string): string {
   const lines = content.split("\n");
   const out: string[] = [];
-  let inFn = false;
-  let fnBuf: string[] = [];
-  let fnDepth = 0;
-
-  for (const line of lines) {
-    if (inFn) {
-      fnBuf.push(line);
-      fnDepth += bracketDelta(line);
-      if (fnDepth <= 0) {
-        out.push(fnBuf.join("\n"));
-        fnBuf = [];
-        inFn = false;
-      }
-      continue;
-    }
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
     const trimmed = line.trim();
     // function 声明 (可能跨行) - 整段保留
     if (/^(?:async\s+)?function\s+[\w$]/.test(trimmed)) {
-      inFn = true;
-      fnBuf = [line];
-      fnDepth = bracketDelta(line);
-      if (fnDepth <= 0) {
-        out.push(fnBuf.join("\n"));
-        fnBuf = [];
-        inFn = false;
+      const fnBuf = [line];
+      let fnDepth = bracketDelta(line);
+      while (fnDepth > 0 && i + 1 < lines.length) {
+        i++;
+        fnBuf.push(lines[i]);
+        fnDepth += bracketDelta(lines[i]);
       }
+      out.push(fnBuf.join("\n"));
+      i++;
       continue;
     }
-    // var/let/const X = ... - 看 RHS 有没有 db.
+    // var/let/const X = ... - 看 RHS 有没有 db; 跨多行 (例如 `var p = { ... }`)
+    // 要收集到 bracket 净深度归 0, 否则只截第一行会留下未闭合的 `{`/`[`/`(`, 整段拼
+    // miniScript 时会引入语法错.
     const declMatch = trimmed.match(/^(?:var|let|const)\s+([\w$]+)\b/);
     if (declMatch) {
-      if (/\bdb\s*[.[]/.test(line)) {
-        // RHS 引用了 db, 只保留声明, 让 selection 引用时是 undefined
+      const declBuf = [line];
+      let depth = bracketDelta(line);
+      while (depth > 0 && i + 1 < lines.length) {
+        i++;
+        declBuf.push(lines[i]);
+        depth += bracketDelta(lines[i]);
+      }
+      const declFull = declBuf.join("\n");
+      if (/\bdb\s*[.[]/.test(declFull)) {
+        // RHS 引用了 db, 整段丢, 只保留声明, 让 selection 引用时是 undefined
         out.push(`var ${declMatch[1]};`);
       } else {
-        // 字面量 / 调 helper 函数等纯计算, 整行保留
-        out.push(line);
+        // 字面量 / 调 helper 函数等纯计算, 整段保留
+        out.push(declFull);
       }
+      i++;
       continue;
     }
     // 其它一律丢
+    i++;
   }
-  if (inFn && fnBuf.length > 0) out.push(fnBuf.join("\n"));
   return out.join("\n");
 }
 

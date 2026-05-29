@@ -462,8 +462,17 @@ export const useEditorStore = defineStore("editor", () => {
       if (dbStmts.length > 0) {
         runText = dbStmts[dbStmts.length - 1];
       } else if (needsPreEvaluation(tab.content)) {
-        const miniScript = `${extractPureHelpers(tab.content)}\n${text}`;
-        await executeScript(tab, text, miniScript);
+        // 用户跑整段时, text 已经包含整个脚本 -> 不需要拼 miniScript (拼 helper + 选区
+        // 是为了 "选了非 db.* 行只跑选区" 场景). 整段直接走 executeScript 用默认
+        // codeToRun = tab.content, 避免 extractPureHelpers 把跨多行 var 截一行
+        // 引入 "var X={" 不闭合的语法错.
+        const isWholeContent = text.trim() === tab.content.trim();
+        if (isWholeContent) {
+          await executeScript(tab, text);
+        } else {
+          const miniScript = `${extractPureHelpers(tab.content)}\n${text}`;
+          await executeScript(tab, text, miniScript);
+        }
         return;
       }
     }
