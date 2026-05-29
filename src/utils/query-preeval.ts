@@ -1,3 +1,5 @@
+import { Parser } from "acorn";
+
 /**
  * 查询预求值 (pre-evaluation)
  *
@@ -808,22 +810,61 @@ return { ops: __ops__, output: __out__, error: __err__ };
     const error = result?.error != null ? String(result.error) : null;
     return { ops, output, error };
   } catch (e) {
-    // 编译/运行失败时, 单独把 user code (含 loaded helpers) 拿出来再编译一次:
-    // 这样报错行号就是 user code 自身的真实行号, 而不是被嵌进 body 后被 TYPE_STUBS / db
-    // proxy 定义堆出来的相对位置, 用户能直接定位到自己脚本里的语法问题 (例如字符串内嵌
-    // 双引号未转义).
+    // 编译/运行失败时, 用 acorn (纯 JS parser) 重新解析 fullContent, 精确定位行列号.
+    // V8 的 new AsyncFunction 编译错时不在 message 里带位置, acorn 的 SyntaxError 带
+    // err.loc.{line,column}, 能直接告诉用户出错在 user code 的哪一行哪一列.
     let detail = String(e);
     try {
-      const AsyncFn = Object.getPrototypeOf(async function () {}).constructor as new (
-        ...args: string[]
-      ) => unknown;
-      // 单独编译 user code (含 awaitifyDbCalls 处理过的版本); 不带任何 wrapping
-      new AsyncFn(code);
-      // user code 单独编译通过 -> 是 MongoPilot 包装层的 bug
+      // 先尝试解析原始 fullContent (用户编辑器里的内容, 不是 awaitifyDbCalls 处理后)
+      // allowAwaitOutsideFunction 让顶层 await 不报错 (mongosh 风格脚本里常见)
+      Parser.parse(fullContent, {
+        ecmaVersion: "latest",
+        sourceType: "script",
+        allowAwaitOutsideFunction: true,
+        allowReturnOutsideFunction: true,
+      });
+      // fullContent 本身合法; 再试试 loadedHelpers (load() 进来的)
+      if (loadedHelpers) {
+        Parser.parse(loadedHelpers, {
+          ecmaVersion: "latest",
+          sourceType: "script",
+          allowAwaitOutsideFunction: true,
+          allowReturnOutsideFunction: true,
+        });
+      }
+      // 两部分都合法 -> 是 MongoPilot 包装层 (awaitifyDbCalls / body 拼接) 的 bug
       detail = `${String(e)} (MongoPilot 内部错误, 用户脚本本身可编译; 请把脚本贴给开发者)`;
-    } catch (innerE) {
-      // user code 单独编译就报错 -> 是用户脚本本身的语法问题
-      detail = `用户脚本语法错: ${String(innerE)} (检查字符串内嵌引号是否成对、转义是否正确; 长字符串建议用 \` 模板字符串包)`;
+    } catch (acornE) {
+      const ae = acornE as Error & { loc?: { line: number; column: number }; pos?: number };
+      const loc = ae.loc;
+      if (loc) {
+        // 抠出错附近 ±40 字符上下文
+        const source = fullContent; // 先按 fullContent 计算; helpers 出错少见
+        const lines = source.split("\n");
+        const errLine = lines[loc.line - 1] ?? "";
+        const ctxStart = Math.max(0, loc.column - 30);
+        const ctxEnd = Math.min(errLine.length, loc.column + 30);
+        const ctx = errLine.slice(ctxStart, ctxEnd);
+        const marker = " ".repeat(loc.column - ctxStart) + "^";
+        detail =
+          `用户脚本语法错 @ 第${loc.line}行第${loc.column}列: ${ae.message}\n` +
+          `  ${ctx}\n  ${marker}\n` +
+          `(检查字符串内嵌引号是否成对、转义是否正确; 长字符串建议用 \` 模板字符串包)`;
+      } else {
+        detail = `用户脚本语法错: ${ae.message}`;
+      }
+    }
+    // 同时把 webview 实际拿到的 user code (awaitifyDbCalls 处理后) 复制到剪贴板,
+    // 方便用户直接粘贴给开发者诊断 (可能跟硬盘上的脚本文件不一致 — Monaco 是 in-memory).
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(
+          `===== fullContent (Monaco editor 内容) =====\n${fullContent}\n\n===== loadedHelpers (load() 引入) =====\n${loadedHelpers}\n\n===== awaitifyDbCalls 处理后 =====\n${code}`,
+        );
+        detail += "\n(脚本完整内容已复制到剪贴板, 可粘贴给开发者诊断)";
+      }
+    } catch {
+      /* 剪贴板权限可能被拒绝, 静默忽略 */
     }
     return { ops: [], output: [], error: detail };
   }
