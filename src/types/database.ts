@@ -61,6 +61,15 @@ export interface ResultTab {
   aborted: boolean;
   /** kind === "console" 时: print()/printjson() 累积的输出行 */
   consoleLines?: string[];
+  /** 脚本模式下当前在跑的 run_script_ops UUID, 用于 `script:progress` 事件按 ID 匹配 */
+  currentScriptRunId?: string | null;
+  /** 脚本模式下的写操作进度 (run_script_ops 串行执行时由 `script:progress` 事件填). */
+  scriptProgress?: {
+    done: number;
+    total: number;
+    ok: number;
+    failed: number;
+  };
 }
 
 /** 特殊执行路径: 设置后, Run 不走通用 run_query 执行器, 改走对应后端命令. */

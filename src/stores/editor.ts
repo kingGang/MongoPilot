@@ -557,14 +557,22 @@ export const useEditorStore = defineStore("editor", () => {
       } | null = null;
       if (ops.length > 0) {
         const statements = ops.map(scriptOpToStatement);
+        // 生成 runId 让后端 emit `script:progress` 事件能匹配回当前 result tab
+        const runId = crypto.randomUUID();
+        rt.currentScriptRunId = runId;
+        rt.scriptProgress = { done: 0, total: statements.length, ok: 0, failed: 0 };
         summary = await invoke("run_script_ops", {
           request: {
             connectionId: tab.connectionId,
             database: tab.database,
             statements,
+            runId,
           },
         });
         if (rt.aborted) return;
+        // 跑完清空进度条
+        rt.currentScriptRunId = null;
+        rt.scriptProgress = undefined;
       }
 
       // print() 输出单独进 Console 结果页
@@ -750,6 +758,23 @@ export const useEditorStore = defineStore("editor", () => {
     rt.loading = false;
     rt.error = "已取消";
   }
+
+  // 监听后端脚本写操作进度事件, 按 runId 找到对应 result tab 更新进度条
+  listen<{ runId: string; done: number; total: number; ok: number; failed: number }>(
+    "script:progress",
+    (e) => {
+      const { runId, done, total, ok, failed } = e.payload;
+      for (const t of tabs.value) {
+        const rt = t.resultTabs.find((r) => r.currentScriptRunId === runId);
+        if (rt) {
+          rt.scriptProgress = { done, total, ok, failed };
+          return;
+        }
+      }
+    },
+  ).catch(() => {
+    /* 非 Tauri 环境静默 */
+  });
 
   // 监听后端异步计数事件, 在所有 tab 的所有 result tab 中按 queryId 定位.
   listen<{ queryId: string; totalCount: number }>("query:count-ready", (e) => {

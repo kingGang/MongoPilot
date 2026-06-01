@@ -116,6 +116,19 @@ pub struct RunScriptOpsRequest {
     pub database: String,
     /// 前端脚本模式收集到的写操作, 每条已渲染成 `db.coll.method(JSON...)`
     pub statements: Vec<String>,
+    /// 前端生成的 UUID, 用于按 runId 匹配 `script:progress` 事件 (可选)
+    pub run_id: Option<String>,
+}
+
+/// `script:progress` 事件: 每跑完一条写操作 emit 一次, 前端实时显示进度
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScriptProgressPayload {
+    run_id: String,
+    done: usize,
+    total: usize,
+    ok: usize,
+    failed: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,8 +143,11 @@ pub struct ScriptRunSummary {
 
 /// 脚本模式: 前端把整段命令式脚本在 webview 里跑一遍, 收集到的所有写操作
 /// (每条已渲染成 `db.coll.method(JSON...)`) 通过这里顺序执行.
+///
+/// 每跑完一条 emit `script:progress` 事件 (done/total/ok/failed) 给前端做实时进度反馈.
 #[tauri::command]
 pub async fn run_script_ops(
+    app: AppHandle,
     mgr: State<'_, ConnectionManager>,
     pool: State<'_, DbPool>,
     request: RunScriptOpsRequest,
@@ -149,7 +165,7 @@ pub async fn run_script_ops(
     let mut failed = 0usize;
     let mut first_error: Option<String> = None;
 
-    for stmt in &request.statements {
+    for (idx, stmt) in request.statements.iter().enumerate() {
         match executor::execute_shell_query(&client, &request.database, stmt, None).await {
             Ok(_) => ok += 1,
             Err(e) => {
@@ -158,6 +174,19 @@ pub async fn run_script_ops(
                     first_error = Some(e.to_string());
                 }
             }
+        }
+        // 每条执行完 emit 进度事件; 没传 run_id 时跳过 (向后兼容)
+        if let Some(run_id) = request.run_id.as_deref() {
+            let _ = app.emit(
+                "script:progress",
+                ScriptProgressPayload {
+                    run_id: run_id.to_string(),
+                    done: idx + 1,
+                    total,
+                    ok,
+                    failed,
+                },
+            );
         }
     }
 

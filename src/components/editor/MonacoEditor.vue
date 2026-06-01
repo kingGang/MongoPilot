@@ -132,10 +132,19 @@ async function getFieldNames(collection: string): Promise<FieldCompletionInfo[]>
   }
 }
 
-// 关闭 Monaco 内置 JS 语法检查（与 MongoDB Shell 语法不兼容）
+// 关闭 Monaco 内置 JS/TS 语法检查（与 mongosh 语法不兼容, 例如顶层 db.xxx /
+// load() / use 都不是合法 JS, trailing comma in arg list 在某些 lib 配置下也被
+// 标 hint）. noSuggestionDiagnostics 关掉 "可能是 trailing comma" 这类 hint 级
+// 飘红 (image 里 `})` 下面那个红波浪线就来自这里).
 monaco.languages.typescript.javascriptDefaults.setDiagnosticsOptions({
   noSemanticValidation: true,
   noSyntaxValidation: true,
+  noSuggestionDiagnostics: true,
+});
+monaco.languages.typescript.typescriptDefaults.setDiagnosticsOptions({
+  noSemanticValidation: true,
+  noSyntaxValidation: true,
+  noSuggestionDiagnostics: true,
 });
 
 // 注册自定义 mongosh 语言 (Monarch tokenizer + brackets config) 和配套主题

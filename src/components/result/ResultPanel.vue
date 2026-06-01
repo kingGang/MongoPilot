@@ -36,6 +36,7 @@ const result = computed(() => props.resultTab?.result ?? null);
 const explainResult = computed(() => props.resultTab?.explainResult ?? null);
 const isConsole = computed(() => props.resultTab?.kind === "console");
 const consoleLines = computed(() => props.resultTab?.consoleLines ?? []);
+const scriptProgress = computed(() => props.resultTab?.scriptProgress ?? null);
 const error = computed(() => props.resultTab?.error ?? null);
 const loading = computed(() => props.resultTab?.loading ?? false);
 const queryText = computed(() => props.resultTab?.queryText ?? "");
@@ -412,6 +413,20 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
     <div class="result-body">
       <div v-if="loading" class="result-loading">
         <div class="loading-spinner" />
+        <div v-if="scriptProgress" class="script-progress">
+          <div class="progress-text">
+            正在执行写操作 {{ scriptProgress.done }} / {{ scriptProgress.total }}
+            <span class="progress-stat">
+              (✓ {{ scriptProgress.ok }} <span v-if="scriptProgress.failed > 0">/ ✗ {{ scriptProgress.failed }}</span>)
+            </span>
+          </div>
+          <div class="progress-bar">
+            <div
+              class="progress-bar-fill"
+              :style="{ width: `${Math.round((scriptProgress.done / scriptProgress.total) * 100)}%` }"
+            />
+          </div>
+        </div>
       </div>
       <div v-else-if="error" class="result-error">
         <n-alert type="error" title="查询错误">{{ error }}</n-alert>
@@ -512,8 +527,13 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
 .result-body { flex: 1; min-height: 0; overflow: hidden; position: relative; }
 .result-content { height: 100%; overflow: hidden; display: flex; flex-direction: column; }
 .result-content > * { flex: 1; min-height: 0; }
-.result-loading { display: flex; align-items: center; justify-content: center; height: 100%; }
+.result-loading { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 16px; }
 .loading-spinner { width: 24px; height: 24px; border: 3px solid #e8e8e8; border-top-color: #3875d7; border-radius: 50%; animation: spin 0.6s linear infinite; }
+.script-progress { width: 320px; max-width: 80%; }
+.progress-text { font-size: 13px; color: #555; text-align: center; margin-bottom: 8px; }
+.progress-stat { color: #888; margin-left: 4px; }
+.progress-bar { height: 6px; background: #e8e8e8; border-radius: 3px; overflow: hidden; }
+.progress-bar-fill { height: 100%; background: #3875d7; transition: width 0.15s ease-out; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .result-error { padding: 16px; overflow: auto; }
 .result-empty { display: flex; align-items: center; justify-content: center; height: 100%; }
