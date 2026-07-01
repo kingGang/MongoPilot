@@ -189,13 +189,17 @@ function cancelInlineEdit() {
   editingKey.value = null;
 }
 
-/** 双击入口: 简单类型走格子内联; null / 复合类型弹 ValueDetail */
+/** 双击入口: 简单类型走格子内联; null / 复合类型弹 ValueDetail
+ *  只读连接下, 简单类型 (canInlineEdit) 才拒绝; 复合类型 (Document/Array/Regex/Binary/Null) 允许开 ValueDetail 查看. */
 function onValueDblclick(row: RowItem, e: MouseEvent) {
   e.stopPropagation();
-  if (props.readOnly) { message.warning("只读连接: 不允许修改文档"); return; }
-  if (!isEditableLeaf(row)) return;
-  if (canInlineEdit(row.type)) startInlineEdit(row);
-  else openValueEditor(row, e);
+  if (row.docIndex < 0 || row.isDocRoot || row.key === "_id") return;
+  if (canInlineEdit(row.type)) {
+    if (props.readOnly) { message.warning("只读连接: 不允许修改文档"); return; }
+    startInlineEdit(row);
+  } else {
+    openValueEditor(row, e);
+  }
 }
 
 function startInlineEdit(row: RowItem) {
@@ -298,11 +302,10 @@ function onDetailSaved() {
   emit("updated");
 }
 
-/** 打开 Type-and-Value 编辑器. 调用前应已确认 isEditableLeaf 通过. */
+/** 打开 Type-and-Value 编辑器 (只读模式下 ValueDetail 会自动隐藏 Save 键, 相当于查看器) */
 function openValueEditor(row: RowItem, e: MouseEvent) {
   e.stopPropagation();
-  if (props.readOnly) { message.warning("只读连接: 不允许修改文档"); return; }
-  if (!isEditableLeaf(row)) return;
+  if (row.docIndex < 0 || row.isDocRoot || row.key === "_id") return;
   const doc = props.documents[row.docIndex];
   if (!doc) return;
   detailField.value = row.key;
@@ -592,7 +595,7 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
                 <template #trigger>
                   <span
                     class="clickable-value"
-                    :title="isEditableLeaf(row) ? '双击修改类型和值' : ''"
+                    :title="readOnly ? '双击查看' : '双击修改类型和值'"
                     @dblclick.stop="openValueEditor(row, $event)"
                     v-html="hl(row.displayValue)"
                   />

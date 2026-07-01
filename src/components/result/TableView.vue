@@ -378,18 +378,18 @@ watch(
           ]);
         }
 
-        // 复杂类型: 用原生 title (浏览器气泡, 无 Vue 开销) 做 hover 预览, 点击进编辑对话框.
+        // 复杂类型: 用原生 title (浏览器气泡, 无 Vue 开销) 做 hover 预览, 点击进 ValueDetail.
         //   —— 之前每格挂一个 NTooltip 实例, 列宽拖动时每次 mousemove 都要重渲染, 卡顿主因.
+        //   只读连接下 ValueDetail 也能打开 (它内部按 readOnly 隐藏 Save), 仅供查看不写库.
         if (type === "Document" || type === "Array") {
           const label = type === "Document"
             ? `{${Object.keys(val as object).length} fields}`
             : `[${(val as unknown[]).length}]`;
           return h("span", {
-            style: props.readOnly ? "color:#61afef" : "color:#61afef;cursor:pointer",
+            style: "color:#61afef;cursor:pointer",
             title: objectPreview(val),
             onClick: (e: MouseEvent) => {
               e.stopPropagation();
-              if (props.readOnly) { message.warning("只读连接: 不允许修改文档"); return; }
               openDetail(key, val, row);
             },
           }, label);
