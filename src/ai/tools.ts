@@ -39,11 +39,14 @@ async function getSchemaCached(
 
 /** 精简 schema 摘要给模型 —— 只取字段名 + BSON 类型 + 出现率, 不塞样例值. */
 function formatSchemaBrief(schema: SchemaInfo, collection: string): string {
-  const lines = schema.fields.slice(0, 40).map(
-    (f) =>
-      `  ${f.name}: ${f.fieldTypes.map((t) => t.bsonType).join(" | ")} (${f.occurrencePercent}%)`,
-  );
-  const more = schema.fields.length > 40 ? `\n  ... (共 ${schema.fields.length} 个字段, 只展示前 40)` : "";
+  const lines = schema.fields
+    .slice(0, 40)
+    .map(
+      (f) =>
+        `  ${f.name}: ${f.fieldTypes.map((t) => t.bsonType).join(" | ")} (${f.occurrencePercent}%)`,
+    );
+  const more =
+    schema.fields.length > 40 ? `\n  ... (共 ${schema.fields.length} 个字段, 只展示前 40)` : "";
   return [`集合 ${collection} 的字段 (采样 ${schema.sampleCount} 条):`, ...lines].join("\n") + more;
 }
 
@@ -226,6 +229,43 @@ export const AGENT_TOOLS: ToolDef[] = [
         },
       },
       required: ["query"],
+    },
+  },
+  // ---- 记忆 (跨会话) ----
+  {
+    name: "remember_fact",
+    description:
+      "把一条**跨会话生效**的事实存进 SQLite —— 之后所有对话在同作用域下都能看到。" +
+      "用法: 用户告诉你某个隐藏约定 / 集合里某字段的特殊含义 / 需要长期记住的项目上下文,",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: {
+          type: "string",
+          description:
+            "作用域, 决定哪些对话能看到这条 fact。选项: 'global' | 'conn:<connectionId>' | " +
+            "'conn:<connectionId>:db:<database>' | 'conn:<connectionId>:db:<database>:coll:<collection>'。" +
+            "尽量选最细的作用域, 减少污染。不确定就用 global。",
+        },
+        key: {
+          type: "string",
+          description: "短 slug, 如 'users.phone.encrypted' 或 'orders.status.enum'。同 scope 下 key 唯一, 重存会覆盖。",
+        },
+        value: { type: "string", description: "简短一句话事实描述。" },
+      },
+      required: ["scope", "key", "value"],
+    },
+  },
+  {
+    name: "forget_fact",
+    description: "删除已记住的一条 fact。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: { type: "string", description: "同 remember_fact" },
+        key: { type: "string", description: "要删的 key" },
+      },
+      required: ["scope", "key"],
     },
   },
   // ---- 脚本库 ----
@@ -452,8 +492,7 @@ export async function executeTool(name: string, input: Record<string, unknown>):
       if (tab.content.trim()) {
         const newId = editorStore.createTab(tab.connectionId, tab.database, tab.collection);
         editorStore.setContent(newId, query);
-        targetTab =
-          editorStore.tabs.find((t) => t.id === newId) ?? tab;
+        targetTab = editorStore.tabs.find((t) => t.id === newId) ?? tab;
         openedNew = true;
       } else {
         editorStore.setContent(tab.id, query);

@@ -184,6 +184,10 @@ pub struct AgentMessage {
     /// role=="tool" 时, 对应的 tool_call id
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// role=="system" 时: 该段是否可被 Anthropic prompt caching 缓存 (稳定段填 true,
+    /// 每轮都在变的实时状态段填 false / 不填). 对非 Anthropic provider 无效.
+    #[serde(default)]
+    pub cacheable: Option<bool>,
 }
 
 /// 一轮模型返回: 文本回复 + (可选)一批工具调用. tool_calls 非空表示 agent 循环要继续.
@@ -244,12 +248,27 @@ async fn claude_turn(
 ) -> Result<AiTurn, AppError> {
     let client = http_client();
 
-    let system = messages
+    // system 段可能是多条 (分层 prompt: 稳定的工具指南 / 半稳定的 Rules / 实时状态).
+    // 分别转成 text block, cacheable=true 的段加 cache_control 让 Anthropic 缓存,
+    // 前两段 (工具指南 + Rules) 稳定不变 -> 大部分轮次都命中 cache -> 大幅省 token.
+    let system_blocks: Vec<serde_json::Value> = messages
         .iter()
         .filter(|m| m.role == "system")
-        .filter_map(|m| m.content.clone())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+        .filter_map(|m| {
+            let text = m.content.as_deref()?.to_string();
+            if text.is_empty() {
+                return None;
+            }
+            let mut block = serde_json::json!({ "type": "text", "text": text });
+            if m.cacheable.unwrap_or(false) {
+                block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            }
+            Some(block)
+        })
+        .collect();
+    let any_cached = system_blocks
+        .iter()
+        .any(|b| b.get("cache_control").is_some());
 
     // Claude 要求: assistant 的 tool_use 之后必须跟一个 user 消息, 里面是 tool_result 块.
     // 连续的 tool 消息要合并进同一个 user 消息.
@@ -313,8 +332,8 @@ async fn claude_turn(
         "max_tokens": 4096,
         "messages": claude_msgs,
     });
-    if !system.is_empty() {
-        body["system"] = serde_json::json!(system);
+    if !system_blocks.is_empty() {
+        body["system"] = serde_json::Value::Array(system_blocks);
     }
     if let Some(temp) = config.temperature {
         body["temperature"] = serde_json::json!(temp);
@@ -331,12 +350,16 @@ async fn claude_turn(
     }
 
     let resp = send_with_retry(|| {
-        client
+        let mut req = client
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", &config.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
+            .header("content-type", "application/json");
+        // 只在真正用到 cache_control 时带 beta header, 避免不必要的请求头噪声
+        if any_cached {
+            req = req.header("anthropic-beta", "prompt-caching-2024-07-31");
+        }
+        req.json(&body)
     })
     .await
     .map_err(|e| AppError::Connection(format!("Claude API 请求失败: {e}")))?;

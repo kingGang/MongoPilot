@@ -6,6 +6,9 @@ import type {
   AgentMessage,
   ToolDef,
   AiTurn,
+  StoredConversation,
+  StoredMessage,
+  StoredFact,
 } from "@/types/ai";
 
 export async function getAiSettings(): Promise<AiSettings | null> {
@@ -23,6 +26,68 @@ export async function getAiRules(scope: string): Promise<string> {
 
 export async function saveAiRules(scope: string, content: string): Promise<void> {
   return invoke("save_ai_rules", { scope, content });
+}
+
+// ---- 会话持久化 ----
+
+export async function listAiConversations(): Promise<StoredConversation[]> {
+  return invoke<StoredConversation[]>("list_ai_conversations");
+}
+
+export async function upsertAiConversation(req: {
+  id: string;
+  title: string;
+  connectionId?: string;
+  database?: string;
+  collection?: string;
+}): Promise<void> {
+  return invoke("upsert_ai_conversation", { req });
+}
+
+export async function updateAiConversationTitle(id: string, title: string): Promise<void> {
+  return invoke("update_ai_conversation_title", { id, title });
+}
+
+export async function touchAiConversation(id: string): Promise<void> {
+  return invoke("touch_ai_conversation", { id });
+}
+
+export async function deleteAiConversation(id: string): Promise<void> {
+  return invoke("delete_ai_conversation", { id });
+}
+
+export async function clearAiConversation(id: string): Promise<void> {
+  return invoke("clear_ai_conversation", { id });
+}
+
+export async function getAiMessages(conversationId: string): Promise<StoredMessage[]> {
+  return invoke<StoredMessage[]>("get_ai_messages", { conversationId });
+}
+
+export async function appendAiMessage(req: {
+  conversationId: string;
+  position: number;
+  payload: string;
+}): Promise<number> {
+  return invoke<number>("append_ai_message", { req });
+}
+
+// ---- Facts ----
+
+export async function listAiFacts(scopes: string[]): Promise<StoredFact[]> {
+  return invoke<StoredFact[]>("list_ai_facts", { scopes });
+}
+
+export async function rememberAiFact(req: {
+  scope: string;
+  key: string;
+  value: string;
+}): Promise<void> {
+  return invoke("remember_ai_fact", { req });
+}
+
+export async function forgetAiFact(scope: string, key: string): Promise<boolean> {
+  return invoke<boolean>("forget_ai_fact", { scope, key });
 }
 
 export async function aiChat(messages: ChatMessage[]): Promise<string> {

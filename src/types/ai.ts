@@ -30,6 +30,37 @@ export interface AgentMessage {
   toolCallId?: string;
   /** UI 用: 这一步耗时毫秒 (assistant=模型往返, tool=工具执行)。后端会忽略此字段。 */
   durationMs?: number;
+  /** role==="system" 时: 是否让 Anthropic prompt caching 缓存这段. 稳定段 true. */
+  cacheable?: boolean;
+}
+
+/** 后端持久化返回的会话元信息 */
+export interface StoredConversation {
+  id: string;
+  title: string;
+  connectionId?: string;
+  database?: string;
+  collection?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 后端持久化返回的一条消息 (payload 是 AgentMessage 的 JSON 字符串) */
+export interface StoredMessage {
+  id: number;
+  position: number;
+  payload: string;
+  createdAt: number;
+}
+
+/** AI facts (agent 主动记的一次性事实) */
+export interface StoredFact {
+  id: number;
+  scope: string;
+  key: string;
+  value: string;
+  createdAt: number;
+  updatedAt: number;
 }
 
 /** 传给模型的工具定义 */

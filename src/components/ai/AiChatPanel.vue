@@ -1,22 +1,64 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, watch, onMounted } from "vue";
-import { NInput, NButton, NIcon, NSpin } from "naive-ui";
+import { NInput, NButton, NIcon, NSpin, NDrawer, NDrawerContent, NEmpty, useDialog } from "naive-ui";
 import {
   Send as SendIcon,
   Settings as SettingsIcon,
   Trash as ClearIcon,
   Stop as StopIcon,
+  AddOutline as NewChatIcon,
+  TimeOutline as HistoryIcon,
 } from "@vicons/ionicons5";
 import { useAiStore } from "@/stores/ai";
 import type { AgentToolCall } from "@/types/ai";
 import AiSettings from "./AiSettings.vue";
 
 const aiStore = useAiStore();
+const dlg = useDialog();
 const inputText = ref("");
 const showSettings = ref(false);
+const showHistory = ref(false);
 const scrollRef = ref<HTMLDivElement>();
 
-onMounted(() => aiStore.loadSettings());
+onMounted(async () => {
+  await aiStore.loadSettings();
+  await aiStore.loadConversationList();
+});
+
+const conversationList = computed(() => aiStore.conversations);
+
+function newChat() {
+  aiStore.createConversation();
+  showHistory.value = false;
+}
+
+async function pickConversation(id: string) {
+  await aiStore.selectConversation(id);
+  showHistory.value = false;
+  await nextTick();
+  scrollToBottom();
+}
+
+function confirmDelete(id: string, title: string, e: MouseEvent) {
+  e.stopPropagation();
+  dlg.warning({
+    title: "删除会话",
+    content: `确认删除会话 "${title}"? 消息会一并从本地库里清掉。`,
+    positiveText: "删除",
+    negativeText: "取消",
+    onPositiveClick: () => aiStore.deleteConversation(id),
+  });
+}
+
+/** 时间戳 -> 相对时间 (刚刚 / X 分钟前 / X 小时前 / X 天前 / 日期) */
+function relTime(ts: number): string {
+  const diff = Date.now() - ts;
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  if (diff < 7 * 86_400_000) return `${Math.floor(diff / 86_400_000)} 天前`;
+  return new Date(ts).toLocaleDateString();
+}
 
 const messages = computed(() => aiStore.activeConversation?.messages ?? []);
 
@@ -46,6 +88,8 @@ const TOOL_LABELS: Record<string, string> = {
   write_query: "写入查询到编辑器",
   list_scripts: "扫描脚本库",
   get_script: "读取脚本",
+  remember_fact: "记住事实",
+  forget_fact: "忘掉事实",
 };
 function toolLabel(name: string): string {
   return TOOL_LABELS[name] || name;
@@ -72,6 +116,9 @@ function toolSummary(tc: AgentToolCall): string {
   if (tc.name === "switch_query_tab") return String(i.tabId ?? "");
   if (tc.name === "get_script") return String(i.ref ?? "");
   if (tc.name === "ask_user") return String(i.question ?? "");
+  if (tc.name === "remember_fact" || tc.name === "forget_fact") {
+    return `[${String(i.scope ?? "")}] ${String(i.key ?? "")}`;
+  }
   return "";
 }
 
@@ -119,9 +166,20 @@ function clearChat() {
 <template>
   <div class="ai-chat-panel">
     <div class="chat-header">
-      <span class="chat-title">AI 助手</span>
+      <span class="chat-title">
+        AI 助手
+        <span v-if="aiStore.activeConversation" class="chat-subtitle" :title="aiStore.activeConversation.title">
+          · {{ aiStore.activeConversation.title }}
+        </span>
+      </span>
       <div class="chat-header-actions">
-        <n-button size="tiny" quaternary title="清空对话" @click="clearChat">
+        <n-button size="tiny" quaternary title="新会话" @click="newChat">
+          <template #icon><n-icon :size="14"><NewChatIcon /></n-icon></template>
+        </n-button>
+        <n-button size="tiny" quaternary title="历史会话" @click="showHistory = true">
+          <template #icon><n-icon :size="14"><HistoryIcon /></n-icon></template>
+        </n-button>
+        <n-button size="tiny" quaternary title="清空当前会话" @click="clearChat">
           <template #icon><n-icon :size="14"><ClearIcon /></n-icon></template>
         </n-button>
         <n-button size="tiny" quaternary title="设置" @click="showSettings = true">
@@ -129,6 +187,39 @@ function clearChat() {
         </n-button>
       </div>
     </div>
+
+    <!-- 历史会话抽屉 -->
+    <n-drawer v-model:show="showHistory" :width="320" placement="right">
+      <n-drawer-content title="历史会话" closable>
+        <div v-if="conversationList.length === 0" class="history-empty">
+          <n-empty description="还没有历史会话" />
+        </div>
+        <div v-else class="history-list">
+          <div
+            v-for="c in conversationList"
+            :key="c.id"
+            class="history-item"
+            :class="{ active: c.id === aiStore.activeConversationId }"
+            :title="c.title"
+            @click="pickConversation(c.id)"
+          >
+            <div class="history-title">{{ c.title }}</div>
+            <div class="history-meta">
+              <span>{{ relTime(c.updatedAt) }}</span>
+              <n-button
+                size="tiny"
+                quaternary
+                type="error"
+                title="删除会话"
+                @click="confirmDelete(c.id, c.title, $event)"
+              >
+                <template #icon><n-icon :size="12"><ClearIcon /></n-icon></template>
+              </n-button>
+            </div>
+          </div>
+        </div>
+      </n-drawer-content>
+    </n-drawer>
 
     <div v-if="!aiStore.isConfigured && aiStore.settingsLoaded" class="chat-unconfigured">
       <p>请先配置 AI API Key</p>
@@ -332,4 +423,46 @@ function clearChat() {
   overflow: auto;
 }
 .chat-input { padding: 8px 12px; border-top: 1px solid var(--n-border-color); display: flex; gap: 8px; align-items: flex-end; }
+.chat-subtitle {
+  font-weight: normal;
+  color: #999;
+  font-size: 12px;
+  margin-left: 4px;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+  vertical-align: bottom;
+}
+.history-empty { padding: 40px 0; }
+.history-list { display: flex; flex-direction: column; gap: 4px; }
+.history-item {
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.history-item:hover { background: #f5f5f5; }
+.history-item.active {
+  background: #e3f2fd;
+  border-left: 3px solid #3875d7;
+  padding-left: 7px;
+}
+.history-title {
+  font-size: 13px;
+  color: #333;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 4px;
+}
+.history-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #999;
+}
 </style>

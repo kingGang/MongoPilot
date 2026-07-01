@@ -6,8 +6,17 @@ use crate::ai::prompt;
 use crate::ai::schema::{self, SchemaInfo};
 use crate::connection::manager::ConnectionManager;
 use crate::error::AppError;
+use crate::storage::ai_repo::{self, ConversationRow, FactRow, MessageRow};
 use crate::storage::database::DbPool;
 use crate::storage::settings_repo;
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -189,4 +198,134 @@ pub async fn suggest_indexes(
     ];
 
     client::chat_completion(&config, &messages).await
+}
+
+// ============================================================================
+// AI 会话持久化 (P1)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertConversationReq {
+    pub id: String,
+    pub title: String,
+    pub connection_id: Option<String>,
+    pub database: Option<String>,
+    pub collection: Option<String>,
+}
+
+#[tauri::command]
+pub async fn list_ai_conversations(
+    pool: State<'_, DbPool>,
+) -> Result<Vec<ConversationRow>, AppError> {
+    ai_repo::list_conversations(&pool).await
+}
+
+#[tauri::command]
+pub async fn upsert_ai_conversation(
+    pool: State<'_, DbPool>,
+    req: UpsertConversationReq,
+) -> Result<(), AppError> {
+    ai_repo::upsert_conversation(
+        &pool,
+        &req.id,
+        &req.title,
+        req.connection_id.as_deref(),
+        req.database.as_deref(),
+        req.collection.as_deref(),
+        now_ms(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn update_ai_conversation_title(
+    pool: State<'_, DbPool>,
+    id: String,
+    title: String,
+) -> Result<(), AppError> {
+    ai_repo::update_conversation_title(&pool, &id, &title, now_ms()).await
+}
+
+#[tauri::command]
+pub async fn touch_ai_conversation(pool: State<'_, DbPool>, id: String) -> Result<(), AppError> {
+    ai_repo::touch_conversation(&pool, &id, now_ms()).await
+}
+
+#[tauri::command]
+pub async fn delete_ai_conversation(pool: State<'_, DbPool>, id: String) -> Result<(), AppError> {
+    ai_repo::delete_conversation(&pool, &id).await
+}
+
+#[tauri::command]
+pub async fn clear_ai_conversation(pool: State<'_, DbPool>, id: String) -> Result<(), AppError> {
+    ai_repo::clear_conversation_messages(&pool, &id).await
+}
+
+#[tauri::command]
+pub async fn get_ai_messages(
+    pool: State<'_, DbPool>,
+    conversation_id: String,
+) -> Result<Vec<MessageRow>, AppError> {
+    ai_repo::get_messages(&pool, &conversation_id).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendMessageReq {
+    pub conversation_id: String,
+    pub position: i64,
+    /// AgentMessage 序列化后的 JSON 字符串
+    pub payload: String,
+}
+
+#[tauri::command]
+pub async fn append_ai_message(
+    pool: State<'_, DbPool>,
+    req: AppendMessageReq,
+) -> Result<i64, AppError> {
+    let ts = now_ms();
+    let id = ai_repo::append_message(&pool, &req.conversation_id, req.position, &req.payload, ts)
+        .await?;
+    // 顺手把会话的 updated_at 顶到最新
+    ai_repo::touch_conversation(&pool, &req.conversation_id, ts).await?;
+    Ok(id)
+}
+
+// ---- Facts (remember_fact 工具) ----
+
+#[tauri::command]
+pub async fn list_ai_facts(
+    pool: State<'_, DbPool>,
+    scopes: Vec<String>,
+) -> Result<Vec<FactRow>, AppError> {
+    ai_repo::list_facts(&pool, &scopes).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RememberFactReq {
+    pub scope: String,
+    pub key: String,
+    pub value: String,
+}
+
+#[tauri::command]
+pub async fn remember_ai_fact(
+    pool: State<'_, DbPool>,
+    req: RememberFactReq,
+) -> Result<(), AppError> {
+    if req.key.trim().is_empty() {
+        return Err(AppError::InvalidInput("fact key 不能为空".into()));
+    }
+    ai_repo::upsert_fact(&pool, &req.scope, &req.key, &req.value, now_ms()).await
+}
+
+#[tauri::command]
+pub async fn forget_ai_fact(
+    pool: State<'_, DbPool>,
+    scope: String,
+    key: String,
+) -> Result<bool, AppError> {
+    ai_repo::delete_fact(&pool, &scope, &key).await
 }

@@ -48,6 +48,11 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
         .execute(pool)
         .await
         .map_err(AppError::Database)?;
+    let migration_006 = include_str!("../../migrations/006_ai_persistence.sql");
+    sqlx::raw_sql(migration_006)
+        .execute(pool)
+        .await
+        .map_err(AppError::Database)?;
     Ok(())
 }
 
