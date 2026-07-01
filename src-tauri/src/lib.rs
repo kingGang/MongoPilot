@@ -70,6 +70,7 @@ pub fn run() {
             commands::connection::export_uri,
             commands::connection::active_connections,
             commands::database::list_databases,
+            commands::database::count_database_collections,
             commands::database::list_collections,
             commands::database::drop_database,
             commands::query::run_query,

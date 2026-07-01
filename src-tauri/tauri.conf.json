@@ -1,6 +1,6 @@
 {
   "productName": "MongoPilot",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "identifier": "com.mongopilot.app",
   "build": {
     "frontendDist": "../dist",

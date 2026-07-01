@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, h, onMounted, type VNodeChild } from "vue";
+import { ref, computed, h, onMounted, watch, type VNodeChild } from "vue";
 import { NTree, NIcon, NButton, NDropdown, NPopover, NEmpty, NTooltip, useMessage, useDialog } from "naive-ui";
 import {
   Add as AddIcon,
@@ -185,19 +185,23 @@ const treeData = computed<TreeNode[]>(() => {
             : buildCollectionNodes(conn.id, db.name);
           return {
             key: dbKey,
-            label: `${db.name} (${db.collectionCount})`,
+            // collectionCount = -1 表示后台还在补数, 先只显示 db 名, 不显示"(0)"误导用户
+            label: db.collectionCount >= 0 ? `${db.name} (${db.collectionCount})` : db.name,
             isLeaf: false,
             prefix: () => h(NIcon, { size: 15, color: "#e8a838" }, { default: () => h(DbIcon) }),
             children,
           };
         });
 
-        // 连接级 users 节点（全局用户列表）
+        // 连接级 users 节点（全局用户列表）—— 打开连接时会自动后台拉一次,
+        // usersLoaded 里没有说明拉取还没完成, 先不显示数字, 避免"(0)"误导
         const usersKey = `users:${conn.id}`;
         const cachedUsers = usersCache.value[conn.id] || [];
+        const usersHasLoaded = connUsersLoaded.value.has(conn.id);
+        const usersLabel = usersHasLoaded ? `users (${cachedUsers.length})` : "users";
         const usersNode: TreeNode = {
           key: usersKey,
-          label: `users (${cachedUsers.length})`,
+          label: usersLabel,
           isLeaf: false,
           prefix: () => h(NIcon, { size: 15, color: "#d03050" }, { default: () => h(UsersIcon) }),
           children: loadingKeys.value.has(usersKey) && cachedUsers.length === 0
@@ -220,6 +224,43 @@ const indexCache = ref<Record<string, { name: string; size: number }[]>>({});
 
 // 用户缓存 (key: "connId" 全局用户, "connId:dbName" 库级用户)
 const usersCache = ref<Record<string, UserInfo[]>>({});
+// 记录哪些连接已经"完成过一次全局用户列表拉取" —— 用于树 label 区分
+//   "还没拉过" (显示 users) vs "拉过了 = 空" (显示 users (0)).
+// 权限不足失败也算完成, 免得反复重试.
+const connUsersLoaded = ref<Set<string>>(new Set());
+
+// 打开连接后自动后台拉一次全局用户列表 —— 让树上 users 节点 label 立刻显示真实数
+watch(
+  () => Array.from(connStore.activeIds),
+  (curr, prev) => {
+    const prevSet = new Set(prev ?? []);
+    for (const connId of curr) {
+      if (prevSet.has(connId)) continue;
+      if (connUsersLoaded.value.has(connId)) continue;
+      listUsers(connId, "admin")
+        .then((users) => {
+          usersCache.value = { ...usersCache.value, [connId]: users };
+        })
+        .catch(() => {
+          /* 权限不足 / usersInfo 命令失败 -> 静默 */
+        })
+        .finally(() => {
+          const next = new Set(connUsersLoaded.value);
+          next.add(connId);
+          connUsersLoaded.value = next;
+        });
+    }
+    // 断开连接 -> 清理 loaded 标记, 下次重连会重新拉
+    for (const connId of prevSet) {
+      if (!curr.includes(connId) && connUsersLoaded.value.has(connId)) {
+        const next = new Set(connUsersLoaded.value);
+        next.delete(connId);
+        connUsersLoaded.value = next;
+      }
+    }
+  },
+  { immediate: true },
+);
 
 function buildUserNodes(connectionId: string, _database: string, cacheKey: string): TreeNode[] {
   const cached = usersCache.value[cacheKey] || [];
@@ -361,6 +402,10 @@ async function handleExpandUpdate(keys: string[]) {
       } catch { /* ignore */ }
       loadingKeys.value.delete(key);
       loadingKeys.value = new Set(loadingKeys.value);
+      // 手动展开也算完成拉取, label 从 "users" 切到 "users (N)"
+      const next = new Set(connUsersLoaded.value);
+      next.add(connId);
+      connUsersLoaded.value = next;
     }
     // 展开库级 users 节点 → 加载该库用户列表
     if (key.startsWith("dbusers:")) {
@@ -1210,6 +1255,9 @@ async function handleCtxSelect(action: string) {
     try {
       const users = await listUsers(connId, "admin");
       usersCache.value = { ...usersCache.value, [connId]: users };
+      const next = new Set(connUsersLoaded.value);
+      next.add(connId);
+      connUsersLoaded.value = next;
       message.success("已刷新用户列表");
     } catch (e) { message.error(`刷新失败: ${e}`); }
   }
