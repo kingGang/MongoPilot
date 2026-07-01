@@ -1,8 +1,60 @@
 <script setup lang="ts">
-import { NTabs, NTabPane } from "naive-ui";
+import { ref, computed } from "vue";
+import { NTabs, NTabPane, NDropdown } from "naive-ui";
 import { useEditorStore } from "@/stores/editor";
 
 const store = useEditorStore();
+
+const ctxMenuShow = ref(false);
+const ctxMenuX = ref(0);
+const ctxMenuY = ref(0);
+const ctxTargetId = ref<string>("");
+
+const ctxOptions = computed(() => {
+  const idx = store.tabs.findIndex((t) => t.id === ctxTargetId.value);
+  const total = store.tabs.length;
+  const hasLeft = idx > 0;
+  const hasRight = idx >= 0 && idx < total - 1;
+  const hasOthers = total > 1;
+  return [
+    { label: "关闭当前", key: "close" },
+    { label: "关闭左侧", key: "closeLeft", disabled: !hasLeft },
+    { label: "关闭右侧", key: "closeRight", disabled: !hasRight },
+    { type: "divider" as const, key: "d1" },
+    { label: "关闭其他", key: "closeOthers", disabled: !hasOthers },
+    { label: "全部关闭", key: "closeAll" },
+  ];
+});
+
+function onCtxMenu(e: MouseEvent, id: string) {
+  e.preventDefault();
+  ctxTargetId.value = id;
+  ctxMenuX.value = e.clientX;
+  ctxMenuY.value = e.clientY;
+  ctxMenuShow.value = true;
+}
+
+function onCtxSelect(key: string) {
+  ctxMenuShow.value = false;
+  const id = ctxTargetId.value;
+  switch (key) {
+    case "close":
+      store.closeTab(id);
+      break;
+    case "closeLeft":
+      store.closeLeftOfTab(id);
+      break;
+    case "closeRight":
+      store.closeRightOfTab(id);
+      break;
+    case "closeOthers":
+      store.closeOtherTabs(id);
+      break;
+    case "closeAll":
+      store.closeAllTabs();
+      break;
+  }
+}
 </script>
 
 <template>
@@ -14,10 +66,26 @@ const store = useEditorStore();
       @update:value="store.activeTabId = $event"
       @close="store.closeTab($event as string)"
     >
-      <n-tab-pane v-for="tab in store.tabs" :key="tab.id" :name="tab.id" :tab="tab.title">
+      <n-tab-pane v-for="tab in store.tabs" :key="tab.id" :name="tab.id">
+        <template #tab>
+          <span class="editor-tab-label" @contextmenu="onCtxMenu($event, tab.id)">
+            {{ tab.title }}
+          </span>
+        </template>
         <slot :tab="tab" />
       </n-tab-pane>
     </n-tabs>
+
+    <n-dropdown
+      trigger="manual"
+      placement="bottom-start"
+      :show="ctxMenuShow"
+      :options="ctxOptions"
+      :x="ctxMenuX"
+      :y="ctxMenuY"
+      @select="onCtxSelect"
+      @clickoutside="ctxMenuShow = false"
+    />
   </div>
   <div v-else class="empty-editor">
     <p>双击集合名称打开查询标签页</p>
@@ -58,6 +126,10 @@ const store = useEditorStore();
   height: 100%;
   padding: 0;
   overflow: hidden;
+}
+.editor-tab-label {
+  display: inline-block;
+  user-select: none;
 }
 .empty-editor {
   display: flex;

@@ -217,6 +217,42 @@ export const useEditorStore = defineStore("editor", () => {
     }
   }
 
+  function closeOtherTabs(id: string) {
+    const keep = tabs.value.find((t) => t.id === id);
+    if (!keep) return;
+    for (const t of tabs.value) {
+      if (t.id !== id) rejectEdit(t.id);
+    }
+    tabs.value = [keep];
+    activeTabId.value = id;
+  }
+
+  function closeLeftOfTab(id: string) {
+    const idx = tabs.value.findIndex((t) => t.id === id);
+    if (idx <= 0) return;
+    for (let i = 0; i < idx; i++) rejectEdit(tabs.value[i].id);
+    tabs.value.splice(0, idx);
+    if (activeTabId.value && !tabs.value.some((t) => t.id === activeTabId.value)) {
+      activeTabId.value = id;
+    }
+  }
+
+  function closeRightOfTab(id: string) {
+    const idx = tabs.value.findIndex((t) => t.id === id);
+    if (idx < 0 || idx === tabs.value.length - 1) return;
+    for (let i = idx + 1; i < tabs.value.length; i++) rejectEdit(tabs.value[i].id);
+    tabs.value.splice(idx + 1);
+    if (activeTabId.value && !tabs.value.some((t) => t.id === activeTabId.value)) {
+      activeTabId.value = id;
+    }
+  }
+
+  function closeAllTabs() {
+    for (const t of tabs.value) rejectEdit(t.id);
+    tabs.value = [];
+    activeTabId.value = null;
+  }
+
   function setContent(id: string, content: string) {
     const tab = tabs.value.find((t) => t.id === id);
     if (tab) tab.content = content;
@@ -824,6 +860,10 @@ export const useEditorStore = defineStore("editor", () => {
     getSelection,
     createTab,
     closeTab,
+    closeOtherTabs,
+    closeLeftOfTab,
+    closeRightOfTab,
+    closeAllTabs,
     setContent,
     executeQuery,
     executeAll,
