@@ -44,6 +44,8 @@ import { useAiStore } from "@/stores/ai";
 import { createDefaultConnection } from "@/types/connection";
 import type { ConnectionConfig } from "@/types/connection";
 import type { EditorTab } from "@/types/database";
+import { checkForUpdates, type UpdateInfo } from "@/api/updater";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
 
 const connStore = useConnectionStore();
 const editorStore = useEditorStore();
@@ -381,6 +383,60 @@ function handleRunQuery() {
   runTrigger.value++;
 }
 
+// ---- 自动更新: 启动时静默检查一次, 有新版本弹提示 ----
+const updateInfo = ref<UpdateInfo | null>(null);
+const showUpdateModal = ref(false);
+const checkingUpdate = ref(false);
+const downloadingUpdate = ref(false);
+
+/** 短版 markdown → 纯文本 (只处理换行/#/* 之类, 不引全套 markdown parser) */
+function shortenNotes(notes: string, maxLines = 15): string {
+  const lines = notes.split(/\r?\n/).slice(0, maxLines);
+  return lines.join("\n") + (notes.split(/\r?\n/).length > maxLines ? "\n..." : "");
+}
+
+async function doCheckUpdate(opts: { silent: boolean }) {
+  if (checkingUpdate.value) return;
+  checkingUpdate.value = true;
+  try {
+    const info = await checkForUpdates();
+    updateInfo.value = info;
+    if (info.hasUpdate) {
+      showUpdateModal.value = true;
+    } else if (!opts.silent) {
+      msg.success(`当前已是最新版本 v${info.currentVersion}`);
+    }
+  } catch (e) {
+    if (!opts.silent) msg.error(`检查更新失败: ${e}`);
+  } finally {
+    checkingUpdate.value = false;
+  }
+}
+
+async function handleDownloadUpdate() {
+  if (!updateInfo.value) return;
+  const url = updateInfo.value.assetUrl || updateInfo.value.releaseUrl;
+  downloadingUpdate.value = true;
+  try {
+    await openUrl(url);
+    msg.info("已在浏览器打开下载, 下载完成后运行安装包即可覆盖升级");
+    showUpdateModal.value = false;
+  } catch (e) {
+    msg.error(`打开下载失败: ${e}`);
+  } finally {
+    downloadingUpdate.value = false;
+  }
+}
+
+async function handleViewReleasePage() {
+  if (!updateInfo.value?.releaseUrl) return;
+  try {
+    await openUrl(updateInfo.value.releaseUrl);
+  } catch (e) {
+    msg.error(`打开发布页失败: ${e}`);
+  }
+}
+
 /** F5 默认是浏览器刷新整页 (在 webview 里会丢掉所有 tab / 结果), 拦下来改成执行当前编辑器选中或当前语句 */
 function onWindowKeyDown(e: KeyboardEvent) {
   if (e.key === "F5" && !e.ctrlKey && !e.shiftKey && !e.altKey) {
@@ -388,7 +444,13 @@ function onWindowKeyDown(e: KeyboardEvent) {
     if (editorStore.activeTab) handleRunQuery();
   }
 }
-onMounted(() => window.addEventListener("keydown", onWindowKeyDown));
+onMounted(() => {
+  window.addEventListener("keydown", onWindowKeyDown);
+  // 启动 3 秒后静默检查一次更新 —— 避开首屏 IPC 高峰, 不打扰用户
+  setTimeout(() => {
+    doCheckUpdate({ silent: true });
+  }, 3000);
+});
 onBeforeUnmount(() => window.removeEventListener("keydown", onWindowKeyDown));
 
 /** MonacoEditor emit run → 携带正确的语句文本 → 执行 */
@@ -563,6 +625,17 @@ function handleMenuAction(key: string) {
       break;
     case "file.export":
       handleExport();
+      break;
+    case "help.check-update":
+      doCheckUpdate({ silent: false });
+      break;
+    case "help.docs":
+      openUrl("https://github.com/kingGang/MongoPilot").catch(() => {
+        /* ignore */
+      });
+      break;
+    case "help.about":
+      msg.info(`MongoPilot v${updateInfo.value?.currentVersion ?? "?"}`);
       break;
   }
 }
@@ -844,6 +917,49 @@ function handleMenuAction(key: string) {
       <ProfilerPanel v-if="showProfiler && activeTab" :connection-id="activeTab.connectionId" :database="activeTab.database" />
       <div v-else style="color:#999;text-align:center;padding:24px">请先连接到 MongoDB 服务器</div>
     </n-modal>
+
+    <!-- 自动更新提示 -->
+    <n-modal v-model:show="showUpdateModal">
+      <n-card
+        v-if="updateInfo"
+        style="width: 560px; max-height: 80vh"
+        :title="`🎉 有新版本 v${updateInfo.latestVersion} 可用`"
+        closable
+        @close="showUpdateModal = false"
+      >
+        <div style="color: #666; font-size: 12px; margin-bottom: 10px">
+          当前版本: v{{ updateInfo.currentVersion }} · 发布时间:
+          {{ updateInfo.publishedAt ? new Date(updateInfo.publishedAt).toLocaleString() : "未知" }}
+          <span v-if="updateInfo.assetName">
+            · 安装包:
+            <strong>{{ updateInfo.assetName }}</strong>
+            <span v-if="updateInfo.assetSize">
+              ({{ (updateInfo.assetSize / 1024 / 1024).toFixed(1) }} MB)
+            </span>
+          </span>
+        </div>
+        <div v-if="updateInfo.notes" class="update-notes">
+          <div style="font-weight: 600; margin-bottom: 6px">更新日志:</div>
+          <pre>{{ shortenNotes(updateInfo.notes) }}</pre>
+        </div>
+        <div v-else style="color: #999; font-size: 13px">该版本无更新日志</div>
+        <template #action>
+          <div style="display: flex; justify-content: flex-end; gap: 8px">
+            <n-button size="small" @click="showUpdateModal = false">稍后</n-button>
+            <n-button size="small" @click="handleViewReleasePage">查看详情</n-button>
+            <n-button
+              size="small"
+              type="primary"
+              :loading="downloadingUpdate"
+              :disabled="!updateInfo.assetUrl && !updateInfo.releaseUrl"
+              @click="handleDownloadUpdate"
+            >
+              {{ updateInfo.assetUrl ? "下载安装包" : "打开发布页" }}
+            </n-button>
+          </div>
+        </template>
+      </n-card>
+    </n-modal>
   </n-message-provider>
 </template>
 
@@ -923,5 +1039,22 @@ function handleMenuAction(key: string) {
   border-radius: 4px;
   padding: 4px 6px;
   background: #fafafa;
+}
+.update-notes {
+  max-height: 320px;
+  overflow: auto;
+  background: #fafafa;
+  border: 1px solid #eee;
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.update-notes pre {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  color: #333;
 }
 </style>

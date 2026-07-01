@@ -69,26 +69,28 @@ const currentConnName = computed(() => {
   return connStore.connections.find((c) => c.id === id)?.name || id;
 });
 
+// 打开设置 —— **强制**从 DB 拉最新 rules, 不看内存 cache. 避免"cache 里空但 DB 有"
+// 导致 draft 被误显示为空, 用户以为规范丢了再点保存就把 DB 真的写空.
 onMounted(async () => {
   await aiStore.loadSettings();
   if (aiStore.settings) Object.assign(settings.value, aiStore.settings);
-  await aiStore.loadGlobalRules();
+  await aiStore.loadGlobalRules(true);
   globalRulesDraft.value = aiStore.globalRules;
   if (currentConnId.value) {
-    await aiStore.loadConnRules(currentConnId.value);
+    await aiStore.loadConnRules(currentConnId.value, true);
     connRulesDraft.value = aiStore.connRulesCache[currentConnId.value] || "";
   }
 });
 
-// 弹窗每次打开都重刷一次 draft, 避免上次没保存的修改污染
+// 弹窗每次打开都重刷一次 draft (强制从 DB 拉), 避免上次没保存的修改污染 / stale cache
 watch(
   () => props.show,
   async (v) => {
     if (!v) return;
-    await aiStore.loadGlobalRules();
+    await aiStore.loadGlobalRules(true);
     globalRulesDraft.value = aiStore.globalRules;
     if (currentConnId.value) {
-      await aiStore.loadConnRules(currentConnId.value);
+      await aiStore.loadConnRules(currentConnId.value, true);
       connRulesDraft.value = aiStore.connRulesCache[currentConnId.value] || "";
     } else {
       connRulesDraft.value = "";
@@ -195,6 +197,11 @@ const connRulesPlaceholder = [
           <n-alert type="info" :show-icon="false" style="margin: 4px 0 12px">
             这段文本会拼进每轮 AI 对话的 system prompt。写你的偏好、命名约定、集合特殊字段等 ——
             AI 每次任务都会遵守, 免得每次都重新说一遍。
+            <br />
+            <span style="color: #666; font-size: 12px">
+              连接级规范:
+              <strong>只要这个连接是打开的, 就会生效</strong> (不依赖编辑器焦点)。
+            </span>
           </n-alert>
           <n-tabs v-model:value="rulesTab" type="segment" style="margin-bottom: 10px">
             <n-tab-pane name="global" tab="全局" />

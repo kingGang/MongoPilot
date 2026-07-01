@@ -405,12 +405,27 @@ async fn openai_turn(
 ) -> Result<AiTurn, AppError> {
     let client = http_client();
 
+    // 把所有 system 段合并成**一条** system message —— 第三方 OpenAI 兼容 provider
+    // (中转 / 自建 gateway / MiniMax / 通义 / 智谱 之类) 常见坑: 只处理第一条 system,
+    // 或对多条 system 顺序不稳. 合并成一条最保险, 保证 rules 一定塞到模型嘴里.
+    let system_text = messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
     let mut oai_msgs: Vec<serde_json::Value> = Vec::new();
+    if !system_text.is_empty() {
+        oai_msgs.push(serde_json::json!({
+            "role": "system", "content": system_text,
+        }));
+    }
     for m in messages {
         match m.role.as_str() {
-            "system" => oai_msgs.push(serde_json::json!({
-                "role": "system", "content": m.content.clone().unwrap_or_default(),
-            })),
+            // system 已经合并 push 过了
+            "system" => {}
             "user" => oai_msgs.push(serde_json::json!({
                 "role": "user", "content": m.content.clone().unwrap_or_default(),
             })),

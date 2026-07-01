@@ -249,7 +249,8 @@ export const AGENT_TOOLS: ToolDef[] = [
         },
         key: {
           type: "string",
-          description: "短 slug, 如 'users.phone.encrypted' 或 'orders.status.enum'。同 scope 下 key 唯一, 重存会覆盖。",
+          description:
+            "短 slug, 如 'users.phone.encrypted' 或 'orders.status.enum'。同 scope 下 key 唯一, 重存会覆盖。",
         },
         value: { type: "string", description: "简短一句话事实描述。" },
       },
@@ -266,6 +267,42 @@ export const AGENT_TOOLS: ToolDef[] = [
         key: { type: "string", description: "要删的 key" },
       },
       required: ["scope", "key"],
+    },
+  },
+  // ---- 规范提议 (AI 自动收集用户规范) ----
+  {
+    name: "propose_rule",
+    description:
+      "从对话里识别出应该跨会话遵守的规范/偏好 (字段编码方式/命名约定/危险操作要不要确认/性能约束等) " +
+      "时, 主动调用此工具向用户提议保存。用户会看到一个确认弹窗决定是否接受。" +
+      "跟 remember_fact 的区别: rule 是**强约束** (每轮 system prompt 都会带上, AI 必须严格遵守), " +
+      "fact 是**知识性事实** (帮 AI 理解上下文, 但不强要求遵守)。" +
+      "**规则内容要具体到能落地** —— 如果涉及字段编码, 直接把 helper 代码 (如编码/解码函数) 写进 content, " +
+      "而不是只说'这个字段是加密的'。规则表述越具体, AI 下次执行时越不容易出错。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: {
+          type: "string",
+          enum: ["global", "connection"],
+          description:
+            "作用域: global=所有连接生效; connection=当前连接生效。默认选 connection —— 只有明显跨所有连接的通用偏好才用 global。",
+        },
+        content: {
+          type: "string",
+          description:
+            "规则的完整内容 (markdown 或纯文本)。**尽量具体、可执行**。示例:\n" +
+            "'- app_server.player.phone 是 base64 存储\\n" +
+            '  编码 helper: `const encPhone = s => Buffer.from(s).toString("base64");`\\n' +
+            '  解码 helper: `const decPhone = s => Buffer.from(s, "base64").toString("utf-8");`\\n' +
+            "  查询时先定义 helper, 再用 encPhone(原文) 构造 filter'",
+        },
+        reason: {
+          type: "string",
+          description: "为什么建议保存这条 (一句话, 向用户解释)",
+        },
+      },
+      required: ["scope", "content", "reason"],
     },
   },
   // ---- 脚本库 ----

@@ -28,7 +28,27 @@ const emit = defineEmits<{
   editInTab: [payload: { doc: Record<string, unknown>; queryText: string }];
 }>();
 
-const viewMode = ref<"tree" | "table" | "json">("tree");
+type ViewMode = "tree" | "table" | "json";
+/** localStorage key: 记住用户上次选的视图, 下次 ResultPanel mount 时用它作默认.
+ *  新用户 / 没历史 → 默认 table (点击表头能排序, 比 tree 直观). */
+const VIEW_MODE_STORAGE_KEY = "mongopilot.resultPanel.viewMode";
+function loadDefaultView(): ViewMode {
+  try {
+    const v = localStorage.getItem(VIEW_MODE_STORAGE_KEY);
+    if (v === "tree" || v === "table" || v === "json") return v;
+  } catch {
+    /* localStorage 不可用 (隐私模式?) 静默 */
+  }
+  return "table";
+}
+const viewMode = ref<ViewMode>(loadDefaultView());
+watch(viewMode, (v) => {
+  try {
+    localStorage.setItem(VIEW_MODE_STORAGE_KEY, v);
+  } catch {
+    /* ignore */
+  }
+});
 const renderError = ref<string | null>(null);
 
 // 从 resultTab 派生所有字段

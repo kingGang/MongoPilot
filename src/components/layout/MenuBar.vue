@@ -67,6 +67,7 @@ const menuOptions: MenuOption[] = [
     label: "Help",
     key: "help",
     children: [
+      { label: "检查更新", key: "help.check-update" },
       { label: "Documentation", key: "help.docs" },
       { label: "About MongoPilot", key: "help.about" },
     ],

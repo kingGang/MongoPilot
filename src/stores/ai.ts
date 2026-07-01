@@ -56,7 +56,8 @@ function findRecentEditorError(): { query: string; error: string; tabTitle: stri
  *  - volatile: 实时状态 (激活连接/tab/选区) + 最近错误 —— 每轮都在变, 不能缓存 */
 function buildSystemPromptLayers(input: {
   globalRules: string;
-  connRules: string;
+  /** 所有当前活跃连接的规范 (label = 连接名, content = 规范文本). 空 content 会被过滤. */
+  connRules: { name: string; content: string }[];
   facts: StoredFact[];
 }): { stable: string; rules: string; volatile: string } {
   const editorStore = useEditorStore();
@@ -103,22 +104,60 @@ function buildSystemPromptLayers(input: {
     "- **remember_fact 使用时机**: 用户告知了应该跨会话生效的非常识性事实 (集合特殊字段含义 / 隐藏约定 / 数据坑),",
     "  或者一次任务里挖出来的关键知识值得留档 —— 就存下来。反之: 转瞬即逝的对话状态不要存, 存了会污染。",
     "  用简短 key (如 'users.phone.encrypted') + 一句 value。写规则性的偏好请让用户去 AI 设置 → 规范里写, 别用 remember_fact。",
+    "- **用户规范优先**: 如果 system prompt 里有【用户规范】段, 那里的每一条你都必须在**每次**写查询、",
+    "  写入编辑器或 propose_editor_edit 之前先检查一遍。特别是字段编码规则 (base64/加密/哈希/hashed) ——",
+    "  必须先把用户输入按规范编码/解码, 再构造工具入参。不要偷懒直接用原文。",
+    "- **mongosh 是 Node.js 环境**, 常用编码/哈希直接用内置模块, **禁止编造不存在的 API** (如 `Base64.encode`,",
+    "  `crypto.encode`, `Hash.md5` 都不存在). 正确写法:",
+    "  - base64 编码: `Buffer.from('原文').toString('base64')`",
+    "  - base64 解码: `Buffer.from('MTIzNA==','base64').toString('utf-8')`",
+    "  - md5 / sha256: `require('crypto').createHash('sha256').update('原文').digest('hex')`",
+    "- **涉及编码/加密/哈希字段的查询**, write_query 里必须给**完整可运行**的多语句脚本 ——",
+    "  先定义 helper (如 `const enc = s => Buffer.from(s).toString('base64');`), 再用 helper 构造 filter,",
+    "  最后 db.xxx.find({字段: enc(原文)}). 不要写单行伪代码, 不要用 `$expr` + 不存在的函数名占位.",
+    "- **propose_rule 使用时机**: 用户对话里说出'某字段是 XX 编码/加密的' / '某集合命名要用 YY 风格' /",
+    "  '在这个环境不能做 ZZ' —— 这类跨会话应该被 AI 遵守的规则性偏好, 你要主动调 propose_rule 向用户提议",
+    "  保存为规范。规则内容尽量具体 (如果涉及编码, 直接把 helper 定义写进 content), 让下次查询能直接照用.",
+    "  scope 默认选 'connection' —— 只有明显跨所有连接的通用偏好才用 'global'.",
     "",
     "回复用中文, 简洁。完成任务后简短说明你做了什么。",
   ].join("\n");
 
   // ---- Layer 2: rules + facts (半稳定, 修改后新的 cache 建立) ----
   const rulesLines: string[] = [];
-  if (input.globalRules.trim()) {
-    rulesLines.push("用户全局规范 (Rules) —— 每个任务都要遵守:", input.globalRules.trim());
-  }
-  if (input.connRules.trim()) {
-    if (rulesLines.length) rulesLines.push("");
-    rulesLines.push("当前连接的规范 —— 覆盖全局:", input.connRules.trim());
+  const hasAnyRules = input.globalRules.trim() || input.connRules.some((r) => r.content.trim());
+  if (hasAnyRules) {
+    rulesLines.push(
+      "=================================================================",
+      "【用户规范 · 必须严格遵守 (违反视为任务失败)】",
+      "=================================================================",
+      "这些是用户在 [AI 设置 → 规范] 里手写并明确要求 AI 遵守的规则.",
+      "写查询前先检查每条规范是否涉及: 字段编码 (base64/加密/哈希) /",
+      "命名约定 / 类型 / 危险操作要不要确认. 如果涉及, **写查询/工具调用前必须先处理**",
+      "(比如: 用户输入是原文, 而规范说该字段是 base64 存的 -> 你要先把用户输入 base64 编码,",
+      "再用编码后的值构造 write_query 或 propose_editor_edit).",
+      "",
+    );
+    if (input.globalRules.trim()) {
+      rulesLines.push("--- 全局规范 (所有连接生效) ---", input.globalRules.trim(), "");
+    }
+    const connWithRules = input.connRules.filter((r) => r.content.trim());
+    if (connWithRules.length) {
+      rulesLines.push("--- 已连接服务器的规范 (覆盖全局) ---");
+      for (const r of connWithRules) {
+        rulesLines.push(`【服务器: ${r.name}】`, r.content.trim(), "");
+      }
+    }
+    rulesLines.push(
+      "=================================================================",
+      "以上规范优先级 > 你的默认习惯. 如果任一步骤发现自己没遵守 -> 立刻改.",
+      "如果规范本身有歧义 / 跟用户当前指令冲突 -> 用 ask_user 反问, 不要自作主张.",
+      "=================================================================",
+    );
   }
   if (input.facts.length) {
     if (rulesLines.length) rulesLines.push("");
-    rulesLines.push("已记住的事实 (由 remember_fact 累积, 按作用域):");
+    rulesLines.push("【已记住的事实 (remember_fact 积累, 也须遵守)】");
     for (const f of input.facts) {
       rulesLines.push(`- [${f.scope}] ${f.key}: ${f.value}`);
     }
@@ -178,8 +217,11 @@ export const useAiStore = defineStore("ai", () => {
   /** 已加载过的连接级 rules 的 connId 集合 */
   const connRulesLoaded = ref<Set<string>>(new Set());
 
-  async function loadGlobalRules() {
-    if (globalRulesLoaded.value) return;
+  /** 拉 global rules; force=true 时忽略"已加载"缓存, 强制重新问 DB.
+   *  规则数据量小 (一段文本), 从 DB 读几 ms —— 每次 runAgent / 打开 AiSettings 都刷一遍最保险,
+   *  避免"cache 里是空 但 DB 有内容"或反过来的 stale 状态. */
+  async function loadGlobalRules(force = false) {
+    if (!force && globalRulesLoaded.value) return;
     try {
       globalRules.value = await aiApi.getAiRules("global");
     } catch {
@@ -194,8 +236,9 @@ export const useAiStore = defineStore("ai", () => {
     globalRulesLoaded.value = true;
   }
 
-  async function loadConnRules(connId: string) {
-    if (!connId || connRulesLoaded.value.has(connId)) return;
+  async function loadConnRules(connId: string, force = false) {
+    if (!connId) return;
+    if (!force && connRulesLoaded.value.has(connId)) return;
     try {
       connRulesCache.value = {
         ...connRulesCache.value,
@@ -217,6 +260,22 @@ export const useAiStore = defineStore("ai", () => {
     next.add(connId);
     connRulesLoaded.value = next;
   }
+
+  /** 会话头部展示用: 描述当前 agent 会拉哪些规范/事实进 system prompt.
+   *  跟 runAgent 用的判定完全一致 —— 用户看到的和 AI 实际收到的严格对齐. */
+  const effectiveRulesSummary = computed(() => {
+    const connStoreInst = useConnectionStore();
+    const activeConns = connStoreInst.connections.filter((c) => connStoreInst.isActive(c.id));
+    const items: string[] = [];
+    if (globalRules.value.trim()) items.push("全局");
+    for (const c of activeConns) {
+      if ((connRulesCache.value[c.id] || "").trim()) items.push(c.name);
+    }
+    // facts: 当前作用域可见的
+    let factCount = 0;
+    for (const s of currentFactScopes()) factCount += (factsCache.value[s] || []).length;
+    return { rules: items, factCount };
+  });
 
   // ---- Conversations (持久化到 SQLite: ai_conversations + ai_messages) ----
   const conversations = ref<AiConversation[]>([]);
@@ -364,6 +423,7 @@ export const useAiStore = defineStore("ai", () => {
 
   async function clearConversation(id?: string) {
     if (pendingQuestion.value) answerQuestion("(用户清空了对话, 取消本次询问)");
+    if (pendingRuleProposal.value) declineRuleProposal();
     const convId = id ?? activeConversationId.value;
     if (!convId) return;
     const conv = conversations.value.find((c) => c.id === convId);
@@ -483,6 +543,95 @@ export const useAiStore = defineStore("ai", () => {
     resolve(answer);
   }
 
+  // ---- 规则提议 (propose_rule 工具) ----
+  /** agent 提议的一条待用户确认的规范 */
+  const pendingRuleProposal = ref<{
+    scope: "global" | "connection";
+    content: string;
+    reason: string;
+    /** 当前活跃连接的名字, 弹窗里展示"保存到 [XX]" 用 */
+    connName: string;
+    /** 当前活跃连接 id, 保存时用 (为空则只能存 global) */
+    connId: string;
+  } | null>(null);
+  let ruleResolver: ((decision: { saved: boolean; savedTo?: string }) => void) | null = null;
+
+  /** agent 调 propose_rule 时调用: 展示提议, 返回 promise, 用户确认/拒绝后 resolve */
+  function proposeRule(input: {
+    scope: "global" | "connection";
+    content: string;
+    reason: string;
+  }): Promise<{ saved: boolean; savedTo?: string }> {
+    if (ruleResolver) ruleResolver({ saved: false });
+    const connStoreInst = useConnectionStore();
+    const editorStore = useEditorStore();
+    const currentConnId = editorStore.activeTab?.connectionId || "";
+    const currentConnName =
+      connStoreInst.connections.find((c) => c.id === currentConnId)?.name || "";
+    pendingRuleProposal.value = {
+      scope: input.scope,
+      content: input.content,
+      reason: input.reason,
+      connName: currentConnName,
+      connId: currentConnId,
+    };
+    return new Promise((resolve) => {
+      ruleResolver = resolve;
+    });
+  }
+
+  /** 用户在弹窗里点了保存 —— finalScope: "global" | "conn:<id>"; finalContent 允许编辑 */
+  async function acceptRuleProposal(finalScope: string, finalContent: string) {
+    if (!ruleResolver) return;
+    const text = finalContent.trim();
+    if (!text) {
+      // 空内容视为取消
+      declineRuleProposal();
+      return;
+    }
+    let savedTo = "";
+    try {
+      if (finalScope === "global") {
+        const merged = globalRules.value.trim() ? `${globalRules.value.trim()}\n${text}` : text;
+        await saveGlobalRules(merged);
+        savedTo = "global";
+      } else if (finalScope.startsWith("conn:")) {
+        const cid = finalScope.slice(5);
+        const existing = (connRulesCache.value[cid] || "").trim();
+        const merged = existing ? `${existing}\n${text}` : text;
+        await saveConnRules(cid, merged);
+        const cname = useConnectionStore().connections.find((c) => c.id === cid)?.name || cid;
+        savedTo = `conn:${cname}`;
+      } else {
+        declineRuleProposal();
+        return;
+      }
+    } catch {
+      declineRuleProposal();
+      return;
+    }
+    const resolve = ruleResolver;
+    ruleResolver = null;
+    pendingRuleProposal.value = null;
+    resolve({ saved: true, savedTo });
+  }
+
+  /** 用户在弹窗里点了取消 */
+  function declineRuleProposal() {
+    if (!ruleResolver) return;
+    const resolve = ruleResolver;
+    ruleResolver = null;
+    pendingRuleProposal.value = null;
+    resolve({ saved: false });
+  }
+
+  // ---- Debug: 上次发给 AI 的请求快照 (用来验证 rules 有没有真进 system prompt) ----
+  const lastAgentRequest = ref<{
+    ts: number;
+    systemMsgs: AgentMessage[];
+    convMsgs: AgentMessage[];
+  } | null>(null);
+
   // ---- Agent ----
   const loading = ref(false);
   /** agent 循环最多跑几轮 (一轮 = 一次模型往返 + 工具执行); 纯粹是防失控/防烧 token 的安全上限 */
@@ -498,6 +647,8 @@ export const useAiStore = defineStore("ai", () => {
     abortRequested.value = true;
     // 若正卡在 ask_user 等用户回答 → 先放它过去, 循环才能走到检查点停下
     if (pendingQuestion.value) answerQuestion("(用户停止了对话)");
+    // 若正卡在等用户确认规则提议 → 视为拒绝, 让循环继续
+    if (pendingRuleProposal.value) declineRuleProposal();
     // 若正卡在等模型请求 → 解开 barrier, runAgent 立刻从 race 中醒来
     releaseAbortBarrier?.();
   }
@@ -530,27 +681,37 @@ export const useAiStore = defineStore("ai", () => {
     loading.value = true;
     abortRequested.value = false;
 
-    // 首次进入 agent 循环前先把 rules + facts 拉齐 (拉过就跳过, 不阻塞)
-    await loadGlobalRules();
-    const currConnId = useEditorStore().activeTab?.connectionId || "";
-    if (currConnId) await loadConnRules(currConnId);
+    // 进入 agent 循环前**强制**从 DB 重新拉一遍 rules + facts —— 不依赖内存 cache,
+    // 避免"cache 里是 stale 内容 / 空但 DB 有 / 反过来"这类看不见的时序坑.
+    // 规范生效范围: 只要连接是**打开的** 就把它的规范拉进来.
+    await loadGlobalRules(true);
+    const connStoreInst = useConnectionStore();
+    const activeConnList = connStoreInst.connections.filter((c) => connStoreInst.isActive(c.id));
+    for (const c of activeConnList) await loadConnRules(c.id, true);
     const scopes = currentFactScopes();
     await refreshFacts(scopes);
 
     try {
       for (let step = 0; step < MAX_AGENT_STEPS; step++) {
         if (abortRequested.value) break;
-        const connId = useEditorStore().activeTab?.connectionId || "";
         // 每轮实时拿最新的 facts (agent 可能刚 remember 了一条, 下一轮要能看到)
         const currentScopes = currentFactScopes();
         const relevantFacts: StoredFact[] = [];
         for (const s of currentScopes) {
           for (const f of factsCache.value[s] || []) relevantFacts.push(f);
         }
+        // 每轮重新枚举活跃连接的规范 (用户中途开/关连接都要即时反映)
+        const activeConnsNow = connStoreInst.connections.filter((c) =>
+          connStoreInst.isActive(c.id),
+        );
+        const connRulesList = activeConnsNow.map((c) => ({
+          name: c.name,
+          content: connRulesCache.value[c.id] || "",
+        }));
 
         const layers = buildSystemPromptLayers({
           globalRules: globalRules.value,
-          connRules: (connId && connRulesCache.value[connId]) || "",
+          connRules: connRulesList,
           facts: relevantFacts,
         });
 
@@ -559,9 +720,16 @@ export const useAiStore = defineStore("ai", () => {
         const systemMsgs: AgentMessage[] = [
           { role: "system", content: layers.stable, cacheable: true },
         ];
-        if (layers.rules) systemMsgs.push({ role: "system", content: layers.rules, cacheable: true });
+        if (layers.rules)
+          systemMsgs.push({ role: "system", content: layers.rules, cacheable: true });
         systemMsgs.push({ role: "system", content: layers.volatile });
 
+        // 记录本次真实发出去的 system + 消息, 让"上次请求"面板能拿到 —— 用于调试规范/上下文
+        lastAgentRequest.value = {
+          ts: Date.now(),
+          systemMsgs: JSON.parse(JSON.stringify(systemMsgs)),
+          convMsgs: JSON.parse(JSON.stringify(conv.messages)),
+        };
         // 模型请求 与 "用户点停止" 赛跑
         const t0 = performance.now();
         const turnPromise = aiApi.aiAgentTurn([...systemMsgs, ...conv.messages], AGENT_TOOLS);
@@ -605,6 +773,21 @@ export const useAiStore = defineStore("ai", () => {
                 result = `已记住 [${scope}] ${key} = ${value}. 之后同作用域的对话都能看到.`;
               } catch (e) {
                 result = `记录失败: ${e}`;
+              }
+            }
+          } else if (call.name === "propose_rule") {
+            const scope = call.input.scope === "global" ? "global" : "connection";
+            const content = String(call.input.content || "").trim();
+            const reason = String(call.input.reason || "").trim();
+            if (!content) {
+              result = "失败: propose_rule 需要非空 content";
+            } else {
+              const decision = await proposeRule({ scope, content, reason });
+              if (decision.saved) {
+                result = `用户已接受并保存到 [${decision.savedTo}]. 之后所有对话都会带上这条规范, 你后续任务里要严格遵守.`;
+              } else {
+                result =
+                  "用户拒绝保存这条规范 (或本次跳过). 你可以尊重用户意愿, 继续原任务, 不要反复提议同一条.";
               }
             }
           } else if (call.name === "forget_fact") {
@@ -667,6 +850,7 @@ export const useAiStore = defineStore("ai", () => {
     saveGlobalRules,
     loadConnRules,
     saveConnRules,
+    effectiveRulesSummary,
     // conversations
     conversations,
     activeConversationId,
@@ -690,9 +874,14 @@ export const useAiStore = defineStore("ai", () => {
     loading,
     runAgent,
     stopAgent,
+    lastAgentRequest,
     // ask_user
     pendingQuestion,
     answerQuestion,
+    // propose_rule
+    pendingRuleProposal,
+    acceptRuleProposal,
+    declineRuleProposal,
   };
 });
 

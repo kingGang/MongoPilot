@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, watch, onMounted } from "vue";
-import { NInput, NButton, NIcon, NSpin, NDrawer, NDrawerContent, NEmpty, useDialog } from "naive-ui";
+import { NInput, NButton, NIcon, NSpin, NDrawer, NDrawerContent, NEmpty, NModal, NCard, useDialog } from "naive-ui";
 import {
   Send as SendIcon,
   Settings as SettingsIcon,
@@ -8,12 +8,15 @@ import {
   Stop as StopIcon,
   AddOutline as NewChatIcon,
   TimeOutline as HistoryIcon,
+  BugOutline as DebugIcon,
 } from "@vicons/ionicons5";
 import { useAiStore } from "@/stores/ai";
+import { useConnectionStore } from "@/stores/connection";
 import type { AgentToolCall } from "@/types/ai";
 import AiSettings from "./AiSettings.vue";
 
 const aiStore = useAiStore();
+const connStore = useConnectionStore();
 const dlg = useDialog();
 const inputText = ref("");
 const showSettings = ref(false);
@@ -23,7 +26,27 @@ const scrollRef = ref<HTMLDivElement>();
 onMounted(async () => {
   await aiStore.loadSettings();
   await aiStore.loadConversationList();
+  // 主动把当前活跃连接的规范拉进来 —— 让"已加载"提示条一进面板就是准的,
+  // 而不是等到用户第一次发消息 runAgent 触发才加载.
+  await aiStore.loadGlobalRules();
+  for (const c of connStore.connections) {
+    if (connStore.isActive(c.id)) await aiStore.loadConnRules(c.id);
+  }
 });
+
+// 当用户随后再连上新服务器时, 也把它的规范拉进来
+watch(
+  () => [...connStore.activeIds],
+  async (ids) => {
+    for (const id of ids) await aiStore.loadConnRules(id);
+  },
+);
+
+const effectiveRules = computed(() => aiStore.effectiveRulesSummary);
+
+// 上次请求快照 —— 用来看规范/facts 实际有没有塞进 system prompt
+const showLastRequest = ref(false);
+const lastReq = computed(() => aiStore.lastAgentRequest);
 
 const conversationList = computed(() => aiStore.conversations);
 
@@ -90,6 +113,7 @@ const TOOL_LABELS: Record<string, string> = {
   get_script: "读取脚本",
   remember_fact: "记住事实",
   forget_fact: "忘掉事实",
+  propose_rule: "提议保存规范",
 };
 function toolLabel(name: string): string {
   return TOOL_LABELS[name] || name;
@@ -119,12 +143,43 @@ function toolSummary(tc: AgentToolCall): string {
   if (tc.name === "remember_fact" || tc.name === "forget_fact") {
     return `[${String(i.scope ?? "")}] ${String(i.key ?? "")}`;
   }
+  if (tc.name === "propose_rule") {
+    const scope = String(i.scope ?? "connection");
+    const content = String(i.content ?? "");
+    return `[${scope}] ${content.slice(0, 60)}${content.length > 60 ? "..." : ""}`;
+  }
   return "";
 }
 
 /** 用户点了 ask_user 的某个选项 */
 function pickOption(option: string) {
   aiStore.answerQuestion(option);
+}
+
+// ---- propose_rule 弹卡状态 ----
+const ruleDraftContent = ref("");
+const ruleDraftScope = ref<"global" | "connection">("connection");
+// pending 变化时把 AI 建议同步到 draft
+watch(
+  () => aiStore.pendingRuleProposal,
+  (p) => {
+    if (p) {
+      ruleDraftContent.value = p.content;
+      ruleDraftScope.value = p.connId ? p.scope : "global";
+    } else {
+      ruleDraftContent.value = "";
+    }
+  },
+  { immediate: true },
+);
+function acceptRule() {
+  const p = aiStore.pendingRuleProposal;
+  if (!p) return;
+  const finalScope = ruleDraftScope.value === "global" ? "global" : `conn:${p.connId}`;
+  aiStore.acceptRuleProposal(finalScope, ruleDraftContent.value);
+}
+function declineRule() {
+  aiStore.declineRuleProposal();
 }
 
 async function send() {
@@ -166,25 +221,52 @@ function clearChat() {
 <template>
   <div class="ai-chat-panel">
     <div class="chat-header">
-      <span class="chat-title">
-        AI 助手
-        <span v-if="aiStore.activeConversation" class="chat-subtitle" :title="aiStore.activeConversation.title">
+      <div class="chat-header-row">
+        <span class="chat-title">AI 助手</span>
+        <div class="chat-header-actions">
+          <n-button size="tiny" quaternary title="新会话" @click="newChat">
+            <template #icon><n-icon :size="14"><NewChatIcon /></n-icon></template>
+          </n-button>
+          <n-button size="tiny" quaternary title="历史会话" @click="showHistory = true">
+            <template #icon><n-icon :size="14"><HistoryIcon /></n-icon></template>
+          </n-button>
+          <n-button size="tiny" quaternary title="清空当前会话" @click="clearChat">
+            <template #icon><n-icon :size="14"><ClearIcon /></n-icon></template>
+          </n-button>
+          <n-button
+            size="tiny"
+            quaternary
+            title="查看上次请求 (调试)"
+            :disabled="!lastReq"
+            @click="showLastRequest = true"
+          >
+            <template #icon><n-icon :size="14"><DebugIcon /></n-icon></template>
+          </n-button>
+          <n-button size="tiny" quaternary title="设置" @click="showSettings = true">
+            <template #icon><n-icon :size="14"><SettingsIcon /></n-icon></template>
+          </n-button>
+        </div>
+      </div>
+      <div
+        v-if="aiStore.activeConversation || effectiveRules.rules.length || effectiveRules.factCount > 0"
+        class="chat-header-sub"
+      >
+        <span
+          v-if="aiStore.activeConversation"
+          class="chat-subtitle"
+          :title="aiStore.activeConversation.title"
+        >
           · {{ aiStore.activeConversation.title }}
         </span>
-      </span>
-      <div class="chat-header-actions">
-        <n-button size="tiny" quaternary title="新会话" @click="newChat">
-          <template #icon><n-icon :size="14"><NewChatIcon /></n-icon></template>
-        </n-button>
-        <n-button size="tiny" quaternary title="历史会话" @click="showHistory = true">
-          <template #icon><n-icon :size="14"><HistoryIcon /></n-icon></template>
-        </n-button>
-        <n-button size="tiny" quaternary title="清空当前会话" @click="clearChat">
-          <template #icon><n-icon :size="14"><ClearIcon /></n-icon></template>
-        </n-button>
-        <n-button size="tiny" quaternary title="设置" @click="showSettings = true">
-          <template #icon><n-icon :size="14"><SettingsIcon /></n-icon></template>
-        </n-button>
+        <span
+          v-if="effectiveRules.rules.length || effectiveRules.factCount > 0"
+          class="rules-badge"
+          :title="`每轮对话都会带上: ${effectiveRules.rules.map((r) => `规范[${r}]`).join(', ')}${effectiveRules.factCount ? (effectiveRules.rules.length ? ' · ' : '') + effectiveRules.factCount + ' 条 fact' : ''}`"
+        >
+          📎 {{ effectiveRules.rules.length ? "规范·" + effectiveRules.rules.join("/") : "" }}{{
+            effectiveRules.rules.length && effectiveRules.factCount ? " · " : ""
+          }}{{ effectiveRules.factCount ? effectiveRules.factCount + " facts" : "" }}
+        </span>
       </div>
     </div>
 
@@ -280,6 +362,42 @@ function clearChat() {
         <div class="ask-hint">选一个，或在下方直接输入你的答案</div>
       </div>
 
+      <!-- propose_rule: AI 提议保存一条规范, 等用户确认 -->
+      <div v-if="aiStore.pendingRuleProposal" class="rule-card">
+        <div class="rule-title">📌 AI 提议保存规范</div>
+        <div v-if="aiStore.pendingRuleProposal.reason" class="rule-reason">
+          {{ aiStore.pendingRuleProposal.reason }}
+        </div>
+        <div class="rule-scope-row">
+          <label class="rule-scope-label">保存到:</label>
+          <label class="rule-radio">
+            <input
+              v-model="ruleDraftScope"
+              type="radio"
+              value="connection"
+              :disabled="!aiStore.pendingRuleProposal.connId"
+            />
+            当前连接 ({{ aiStore.pendingRuleProposal.connName || "无" }})
+          </label>
+          <label class="rule-radio">
+            <input v-model="ruleDraftScope" type="radio" value="global" />
+            全局
+          </label>
+        </div>
+        <n-input
+          v-model:value="ruleDraftContent"
+          type="textarea"
+          :rows="6"
+          placeholder="规则内容, 可编辑"
+          style="font-size: 12px"
+        />
+        <div class="rule-actions">
+          <n-button size="small" @click="declineRule">忽略</n-button>
+          <n-button size="small" type="primary" @click="acceptRule">保存并生效</n-button>
+        </div>
+        <div class="rule-hint">保存后会立即拼进下一轮 system prompt, 无需重启。</div>
+      </div>
+
       <div v-if="aiStore.loading && !aiStore.pendingQuestion" class="message assistant">
         <n-spin size="small" />
       </div>
@@ -318,13 +436,76 @@ function clearChat() {
     </div>
 
     <AiSettings v-model:show="showSettings" />
+
+    <!-- 上次请求快照 (调试用) -->
+    <n-modal v-model:show="showLastRequest">
+      <n-card
+        style="width: 720px; max-height: 80vh; overflow: auto"
+        title="上次发给 AI 的请求"
+        closable
+        @close="showLastRequest = false"
+      >
+        <div v-if="!lastReq" style="color: #999">还没发过请求</div>
+        <div v-else>
+          <div style="color: #666; font-size: 12px; margin-bottom: 12px">
+            时间: {{ new Date(lastReq.ts).toLocaleString() }} ·
+            system blocks: {{ lastReq.systemMsgs.length }} · history: {{ lastReq.convMsgs.length }}
+          </div>
+          <div style="margin-bottom: 12px">
+            <div style="font-weight: 600; margin-bottom: 4px">System Prompt 分层 (发给 AI 的原样):</div>
+            <div
+              v-for="(m, i) in lastReq.systemMsgs"
+              :key="i"
+              style="margin-bottom: 8px; border: 1px solid #eee; border-radius: 6px; padding: 8px"
+            >
+              <div style="font-size: 12px; color: #888; margin-bottom: 4px">
+                #{{ i }} · {{ m.cacheable ? "cached" : "uncached" }} · {{ (m.content || "").length }} 字符
+              </div>
+              <pre style="white-space: pre-wrap; word-break: break-word; font-size: 12px; margin: 0; max-height: 240px; overflow: auto">{{ m.content }}</pre>
+            </div>
+          </div>
+          <details>
+            <summary style="cursor: pointer; color: #666">对话历史 ({{ lastReq.convMsgs.length }} 条)</summary>
+            <pre style="white-space: pre-wrap; word-break: break-word; font-size: 11px; max-height: 300px; overflow: auto; background: #fafafa; padding: 8px">{{ JSON.stringify(lastReq.convMsgs, null, 2) }}</pre>
+          </details>
+        </div>
+      </n-card>
+    </n-modal>
   </div>
 </template>
 
 <style scoped>
 .ai-chat-panel { height: 100%; display: flex; flex-direction: column; }
-.chat-header { padding: 8px 12px; border-bottom: 1px solid var(--n-border-color); display: flex; justify-content: space-between; align-items: center; }
-.chat-header-actions { display: flex; gap: 2px; }
+.chat-header {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--n-border-color);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.chat-header-row { display: flex; justify-content: space-between; align-items: center; }
+.chat-header-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+.chat-header-actions { display: flex; gap: 2px; align-items: center; flex-shrink: 0; }
+.rules-badge {
+  font-size: 11px;
+  color: #2b6cb0;
+  background: #edf5fb;
+  border: 1px solid #cfe3fb;
+  padding: 2px 6px;
+  border-radius: 10px;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: default;
+  flex-shrink: 0;
+}
 .chat-title { font-weight: 600; font-size: 14px; }
 .chat-unconfigured { padding: 24px; text-align: center; color: #999; }
 .chat-messages { flex: 1; overflow-y: auto; padding: 12px; }
@@ -404,6 +585,57 @@ function clearChat() {
   font-size: 11px;
   color: #c2680f;
 }
+/* propose_rule 提议卡片 */
+.rule-card {
+  background: #f0f9ff;
+  border: 1px solid #7dd3fc;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rule-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #0369a1;
+}
+.rule-reason {
+  font-size: 12px;
+  color: #475569;
+  line-height: 1.5;
+}
+.rule-scope-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: #334155;
+}
+.rule-scope-label { font-weight: 500; }
+.rule-radio {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.rule-radio input { cursor: pointer; }
+.rule-radio input:disabled + span,
+.rule-radio input:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.rule-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.rule-hint {
+  font-size: 11px;
+  color: #64748b;
+}
 /* 工具结果折叠块 */
 .tool-result {
   background: #fafafa;
@@ -424,16 +656,13 @@ function clearChat() {
 }
 .chat-input { padding: 8px 12px; border-top: 1px solid var(--n-border-color); display: flex; gap: 8px; align-items: flex-end; }
 .chat-subtitle {
-  font-weight: normal;
   color: #999;
   font-size: 12px;
-  margin-left: 4px;
-  max-width: 180px;
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  display: inline-block;
-  vertical-align: bottom;
 }
 .history-empty { padding: 40px 0; }
 .history-list { display: flex; flex-direction: column; gap: 4px; }

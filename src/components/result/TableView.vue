@@ -248,6 +248,58 @@ function defaultWidth(key: string): number {
   return key === "_id" ? 240 : 160;
 }
 
+/** 排序键提取: 把一个 BSON 值转成可比较的原始类型 (number | string).
+ *  返回 null/undefined 时代表 "空值", sortKey 里用一个足够大的哨兵值让它排最后. */
+function toSortable(val: unknown): number | string | null {
+  if (val === null || val === undefined) return null;
+  if (typeof val === "number") return val;
+  if (typeof val === "boolean") return val ? 1 : 0;
+  if (typeof val === "string") return val;
+  if (typeof val === "object") {
+    const obj = val as Record<string, unknown>;
+    // ObjectId: 前 8 字符是十六进制时间戳, 可代表创建时间
+    if (obj.$oid && typeof obj.$oid === "string") return obj.$oid;
+    // Date
+    if (obj.$date) {
+      const d = obj.$date;
+      if (typeof d === "string") return new Date(d).getTime();
+      if (typeof d === "object" && d && typeof (d as Record<string, unknown>).$numberLong === "string") {
+        return Number((d as Record<string, unknown>).$numberLong);
+      }
+    }
+    if (typeof obj.$numberLong === "string") return Number(obj.$numberLong);
+    if (typeof obj.$numberInt === "string") return Number(obj.$numberInt);
+    if (typeof obj.$numberDecimal === "string") return Number(obj.$numberDecimal);
+    if (obj.$timestamp && typeof obj.$timestamp === "object") {
+      const t = (obj.$timestamp as Record<string, unknown>).t;
+      if (typeof t === "number") return t;
+    }
+    // 复杂对象/数组 -> 拿序列化后的字符串比较 (稳定但不一定语义正确, 至少有确定顺序)
+    try {
+      return JSON.stringify(val);
+    } catch {
+      return String(val);
+    }
+  }
+  return String(val);
+}
+
+/** NDataTable 的 sorter: 空值恒排最后, 其它按类型比较 (数值 vs 字符串).
+ *  两侧类型不一样时统一 fallback 为字符串比较, 保证有序. */
+function makeColSorter(key: string) {
+  return (rowA: Record<string, unknown>, rowB: Record<string, unknown>): number => {
+    const a = toSortable(rowA[key]);
+    const b = toSortable(rowB[key]);
+    if (a === null && b === null) return 0;
+    if (a === null) return 1;
+    if (b === null) return -1;
+    if (typeof a === "number" && typeof b === "number") return a - b;
+    if (typeof a === "string" && typeof b === "string") return a.localeCompare(b);
+    // 类型不同 → 字符串化再比
+    return String(a).localeCompare(String(b));
+  };
+}
+
 /** 拖动结束时把当前各列的实际宽度记进 colWidthMap (NaiveUI 在拖动时 mutate column.width) */
 function snapshotColWidths() {
   for (const col of columns.value) {
@@ -292,6 +344,8 @@ watch(
       key,
       width: colWidthMap.value[key] ?? defaultWidth(key),
       resizable: true,
+      // 三态点击排序 (无 → asc → desc → 无). NDataTable 内置支持, 只要传 sorter 即可.
+      sorter: makeColSorter(key),
       ellipsis: { tooltip: false },
       // 单元格 td 上加 dirty class (NDataTable render 时调用, 读 props.dirtyFields 走 Vue 响应式)
       cellProps: (row: Record<string, unknown>) =>
