@@ -42,6 +42,31 @@ pub async fn save_ai_settings(
     settings_repo::set_setting(&pool, "ai.config", &json).await
 }
 
+/// AI 规范 (Rules) —— 用户手写的一段 markdown/纯文本, 会被拼进每轮 system prompt.
+/// scope = "global" 或 "conn:<connectionId>" (连接级), 复用 app_settings 表 (key = "ai.rules.<scope>").
+fn rules_key(scope: &str) -> String {
+    format!("ai.rules.{}", scope)
+}
+
+#[tauri::command]
+pub async fn get_ai_rules(
+    pool: State<'_, DbPool>,
+    scope: String,
+) -> Result<String, AppError> {
+    Ok(settings_repo::get_setting(&pool, &rules_key(&scope))
+        .await?
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+pub async fn save_ai_rules(
+    pool: State<'_, DbPool>,
+    scope: String,
+    content: String,
+) -> Result<(), AppError> {
+    settings_repo::set_setting(&pool, &rules_key(&scope), &content).await
+}
+
 async fn load_ai_config(pool: &DbPool) -> Result<AiConfig, AppError> {
     let json = settings_repo::get_setting(pool, "ai.config")
         .await?

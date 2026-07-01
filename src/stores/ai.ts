@@ -17,15 +17,38 @@ export interface AiConversation {
   createdAt: number;
 }
 
-/** 每轮 runAgent 迭代都重新构建的 system prompt —— 带**实时**的应用状态 */
-function buildSystemPrompt(): string {
+/** 从所有 tabs 里挑一条"最近的错误结果", 用来喂给 AI 做失败反馈闭环.
+ *  仅取最近 5 分钟内产生的, 避免把陈年错误当参考。*/
+function findRecentEditorError(): { query: string; error: string; tabTitle: string } | null {
+  const editorStore = useEditorStore();
+  const cutoff = Date.now() - 5 * 60 * 1000;
+  let best: { rt: (typeof editorStore.tabs)[number]["resultTabs"][number]; tabTitle: string } | null =
+    null;
+  for (const t of editorStore.tabs) {
+    for (const rt of t.resultTabs) {
+      if (!rt.error || rt.aborted) continue;
+      if (rt.createdAt < cutoff) continue;
+      if (!best || rt.createdAt > best.rt.createdAt) best = { rt, tabTitle: t.title };
+    }
+  }
+  if (!best) return null;
+  return {
+    query: (best.rt.queryText || "").slice(0, 400),
+    error: (best.rt.error || "").slice(0, 400),
+    tabTitle: best.tabTitle,
+  };
+}
+
+/** 每轮 runAgent 迭代都重新构建的 system prompt —— 带**实时**的应用状态 + 用户 Rules + 最近错误 */
+function buildSystemPrompt(rules: { globalRules: string; connRules: string }): string {
   const editorStore = useEditorStore();
   const connStore = useConnectionStore();
   const tab = editorStore.activeTab;
   const activeConns = connStore.connections.filter((c) => connStore.isActive(c.id));
   const hasSelection = tab ? !!editorStore.getSelection(tab.id) : false;
+  const recentErr = findRecentEditorError();
 
-  return [
+  const lines: string[] = [
     "你是 MongoPilot 内置的 AI 助手 —— 一个能操作整个应用的 agent。MongoPilot 是 MongoDB 桌面客户端。",
     "",
     "你能调用的工具 (按类别):",
@@ -46,6 +69,9 @@ function buildSystemPrompt(): string {
     "  有多个连接不知道连哪个、要做写操作或危险操作前 —— 都先 ask_user。",
     "- **你不能直接执行任何查询或写操作。** 要让用户跑一条查询时, 用 write_query 把查询",
     "  **直接写进编辑器的代码框** —— 然后由用户自己点 Run 执行。不要把查询语句只丢在聊天里。",
+    "- write_query 内部会做**语法校验**: 语法错会被打回, 你收到错误信息后**必须自己改正重发**, 不要照原样再发一次。",
+    "- write_query 成功写入后, 返回文本里会附带**当前集合的字段结构** (如果已绑定 collection)。",
+    "  下一轮基于用户反馈修改时, 参考这个字段列表, 别乱猜字段名。",
     "- get_schema 只在「用户明确要分析结构」或「你确实拿不准字段、又问不出来」时才用 ——",
     "  不要每次写查询前都习惯性分析一遍, 那样又慢又费 token。",
     "  换库先 set_active_context, 库所在连接没打开先 open_connection。",
@@ -54,6 +80,24 @@ function buildSystemPrompt(): string {
     '- 用户说"分析选中的代码/这段"时, 用 get_editor_selection 拿到选区再分析。',
     "- 写脚本前可以 list_scripts 看脚本库里有什么参考, get_script 读具体内容。",
     "- 编辑器内容是 mongosh 脚本语法 (db.coll.find(...), 支持 ObjectId()/ISODate() 等)。",
+  ];
+
+  if (rules.globalRules.trim()) {
+    lines.push(
+      "",
+      "用户全局规范 (Rules) —— 每个任务都要遵守:",
+      rules.globalRules.trim(),
+    );
+  }
+  if (rules.connRules.trim()) {
+    lines.push(
+      "",
+      "当前连接的规范 —— 覆盖全局:",
+      rules.connRules.trim(),
+    );
+  }
+
+  lines.push(
     "",
     "当前实时状态:",
     `- 已连接的服务器: ${activeConns.length > 0 ? activeConns.map((c) => c.name).join(", ") : "(无)"}`,
@@ -63,9 +107,21 @@ function buildSystemPrompt(): string {
         : "(没有打开的标签页)"
     }`,
     `- 用户当前${hasSelection ? "**有**" : "没有"}在编辑器里选中代码`,
-    "",
-    "回复用中文, 简洁。完成任务后简短说明你做了什么。",
-  ].join("\n");
+  );
+
+  if (recentErr) {
+    lines.push(
+      "",
+      "**最近一次查询执行报错** (5 分钟内, 供你自我修正参考):",
+      `- 出错标签页: ${recentErr.tabTitle}`,
+      `- 查询语句: ${recentErr.query}`,
+      `- 错误信息: ${recentErr.error}`,
+      "如果用户接下来让你 '改一下' / '修下' 之类, 直接基于这条错误改, 不要反问已知信息。",
+    );
+  }
+
+  lines.push("", "回复用中文, 简洁。完成任务后简短说明你做了什么。");
+  return lines.join("\n");
 }
 
 export const useAiStore = defineStore("ai", () => {
@@ -85,6 +141,55 @@ export const useAiStore = defineStore("ai", () => {
   }
 
   const isConfigured = computed(() => !!settings.value?.apiKey);
+
+  // ---- Rules (用户规范) ----
+  // 全局规范 + 每个连接单独一份, 拼进 system prompt 让 AI 遵守用户偏好, 免得每次都重新说.
+  const globalRules = ref<string>("");
+  const connRulesCache = ref<Record<string, string>>({});
+  /** 全局 rules 已加载过 —— 避免重复请求 */
+  const globalRulesLoaded = ref(false);
+  /** 已加载过的连接级 rules 的 connId 集合 */
+  const connRulesLoaded = ref<Set<string>>(new Set());
+
+  async function loadGlobalRules() {
+    if (globalRulesLoaded.value) return;
+    try {
+      globalRules.value = await aiApi.getAiRules("global");
+    } catch {
+      /* 数据库暂不可用 -> 静默 */
+    }
+    globalRulesLoaded.value = true;
+  }
+
+  async function saveGlobalRules(content: string) {
+    await aiApi.saveAiRules("global", content);
+    globalRules.value = content;
+    globalRulesLoaded.value = true;
+  }
+
+  async function loadConnRules(connId: string) {
+    if (!connId || connRulesLoaded.value.has(connId)) return;
+    try {
+      connRulesCache.value = {
+        ...connRulesCache.value,
+        [connId]: await aiApi.getAiRules(`conn:${connId}`),
+      };
+    } catch {
+      /* ignore */
+    }
+    const next = new Set(connRulesLoaded.value);
+    next.add(connId);
+    connRulesLoaded.value = next;
+  }
+
+  async function saveConnRules(connId: string, content: string) {
+    if (!connId) return;
+    await aiApi.saveAiRules(`conn:${connId}`, content);
+    connRulesCache.value = { ...connRulesCache.value, [connId]: content };
+    const next = new Set(connRulesLoaded.value);
+    next.add(connId);
+    connRulesLoaded.value = next;
+  }
 
   // ---- Conversations ----
   const conversations = ref<AiConversation[]>([]);
@@ -221,10 +326,22 @@ export const useAiStore = defineStore("ai", () => {
     loading.value = true;
     abortRequested.value = false;
 
+    // 首次进入 agent 循环前先把 rules 拉齐 (拉过就跳过, 不阻塞)
+    await loadGlobalRules();
+    const currConnId = useEditorStore().activeTab?.connectionId || "";
+    if (currConnId) await loadConnRules(currConnId);
+
     try {
       for (let step = 0; step < MAX_AGENT_STEPS; step++) {
         if (abortRequested.value) break;
-        const systemMsg: AgentMessage = { role: "system", content: buildSystemPrompt() };
+        const connId = useEditorStore().activeTab?.connectionId || "";
+        const systemMsg: AgentMessage = {
+          role: "system",
+          content: buildSystemPrompt({
+            globalRules: globalRules.value,
+            connRules: (connId && connRulesCache.value[connId]) || "",
+          }),
+        };
 
         // 模型请求 与 "用户点停止" 赛跑 —— 点了停止立刻停转圈, 不必干等请求超时
         const t0 = performance.now();
@@ -301,6 +418,13 @@ export const useAiStore = defineStore("ai", () => {
     isConfigured,
     loadSettings,
     updateSettings,
+    // rules
+    globalRules,
+    connRulesCache,
+    loadGlobalRules,
+    saveGlobalRules,
+    loadConnRules,
+    saveConnRules,
     // conversations
     conversations,
     activeConversationId,

@@ -104,6 +104,8 @@ pub fn run() {
             commands::user::get_profiler_data,
             commands::ai::get_ai_settings,
             commands::ai::save_ai_settings,
+            commands::ai::get_ai_rules,
+            commands::ai::save_ai_rules,
             commands::ai::ai_chat,
             commands::ai::ai_agent_turn,
             commands::ai::nl2query,

@@ -16,6 +16,15 @@ export async function saveAiSettings(settings: AiSettings): Promise<void> {
   return invoke("save_ai_settings", { settings });
 }
 
+/** AI 规范 (Rules): scope = "global" 或 "conn:<connectionId>" */
+export async function getAiRules(scope: string): Promise<string> {
+  return invoke<string>("get_ai_rules", { scope });
+}
+
+export async function saveAiRules(scope: string, content: string): Promise<void> {
+  return invoke("save_ai_rules", { scope, content });
+}
+
 export async function aiChat(messages: ChatMessage[]): Promise<string> {
   return invoke<string>("ai_chat", { messages });
 }

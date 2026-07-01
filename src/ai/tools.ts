@@ -8,12 +8,63 @@
  * 这样 agent 在一轮里先 open_query_tab / switch_query_tab, 后续工具能看到最新状态.
  */
 import { invoke } from "@tauri-apps/api/core";
+import { Parser } from "acorn";
 import * as aiApi from "@/api/ai";
 import { useEditorStore } from "@/stores/editor";
 import { useConnectionStore } from "@/stores/connection";
 import { useDatabaseStore } from "@/stores/database";
 import { useScriptStore } from "@/stores/script";
-import type { ToolDef } from "@/types/ai";
+import type { SchemaInfo, ToolDef } from "@/types/ai";
+
+/** write_query 内的 schema 缓存 —— 5 分钟 TTL. 避免同一集合每次都拉一遍浪费 RTT. */
+const schemaCache = new Map<string, { data: SchemaInfo; at: number }>();
+const SCHEMA_TTL_MS = 5 * 60 * 1000;
+
+async function getSchemaCached(
+  connectionId: string,
+  database: string,
+  collection: string,
+): Promise<SchemaInfo | null> {
+  const key = `${connectionId}:${database}:${collection}`;
+  const hit = schemaCache.get(key);
+  if (hit && Date.now() - hit.at < SCHEMA_TTL_MS) return hit.data;
+  try {
+    const data = await aiApi.analyzeSchema(connectionId, database, collection, 100);
+    schemaCache.set(key, { data, at: Date.now() });
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+/** 精简 schema 摘要给模型 —— 只取字段名 + BSON 类型 + 出现率, 不塞样例值. */
+function formatSchemaBrief(schema: SchemaInfo, collection: string): string {
+  const lines = schema.fields.slice(0, 40).map(
+    (f) =>
+      `  ${f.name}: ${f.fieldTypes.map((t) => t.bsonType).join(" | ")} (${f.occurrencePercent}%)`,
+  );
+  const more = schema.fields.length > 40 ? `\n  ... (共 ${schema.fields.length} 个字段, 只展示前 40)` : "";
+  return [`集合 ${collection} 的字段 (采样 ${schema.sampleCount} 条):`, ...lines].join("\n") + more;
+}
+
+/** 用 acorn 校验语法, 通过返回 null, 失败返回带行列号的中文错误信息. */
+function lintQuerySyntax(query: string): string | null {
+  try {
+    Parser.parse(query, {
+      ecmaVersion: "latest",
+      sourceType: "script",
+      allowAwaitOutsideFunction: true,
+      allowReturnOutsideFunction: true,
+    });
+    return null;
+  } catch (e: unknown) {
+    const err = e as { message?: string; loc?: { line?: number; column?: number } };
+    const line = err.loc?.line ?? "?";
+    const col = err.loc?.column ?? "?";
+    const msg = err.message?.replace(/\s*\(\d+:\d+\)$/, "") ?? String(e);
+    return `语法错 @ 第${line}行第${col}列: ${msg}`;
+  }
+}
 
 /** 传给模型的工具定义 */
 export const AGENT_TOOLS: ToolDef[] = [
@@ -386,14 +437,44 @@ export async function executeTool(name: string, input: Record<string, unknown>):
       if (!query) return "失败: query 为空。";
       const tab = editorStore.activeTab;
       if (!tab) return "失败: 没有打开的编辑器标签页, 先用 open_query_tab。";
+
+      // 语法校验: acorn parse 一遍, 挡掉低级语法错 —— 让模型收到错误后自己改正重发,
+      // 不用用户跑一次报错才发现. mongosh 里 ObjectId(...) 等对 acorn 而言只是普通 identifier
+      // 调用, parse 不会报, 所以不需要 stub.
+      const syntaxErr = lintQuerySyntax(query);
+      if (syntaxErr) {
+        return `失败 (未写入编辑器): ${syntaxErr}\n\n原语句:\n${query}\n\n请修正语法后重新调用 write_query, 不要原样重发。`;
+      }
+
+      // 写入编辑器: 当前 tab 空就写在这, 已有内容就另开一个不覆盖用户的东西
+      let targetTab = tab;
+      let openedNew = false;
       if (tab.content.trim()) {
-        // 当前标签页已有内容 → 另开一个, 不覆盖用户的东西
         const newId = editorStore.createTab(tab.connectionId, tab.database, tab.collection);
         editorStore.setContent(newId, query);
-        return "当前标签页已有内容, 已新开一个标签页写入查询。请用户点 Run 执行 (执行与否由用户决定)。";
+        targetTab =
+          editorStore.tabs.find((t) => t.id === newId) ?? tab;
+        openedNew = true;
+      } else {
+        editorStore.setContent(tab.id, query);
       }
-      editorStore.setContent(tab.id, query);
-      return "已把查询写进当前编辑器标签页。请用户确认后点 Run 执行 (执行与否由用户决定)。";
+
+      // Auto-schema: 已绑定 collection 时, 顺手把字段摘要附回给模型 —— 供下一轮
+      // 用户反馈"改一下"时基于真实字段修正, 不用再习惯性 get_schema.
+      let schemaHint = "";
+      if (targetTab.connectionId && targetTab.database && targetTab.collection) {
+        const schema = await getSchemaCached(
+          targetTab.connectionId,
+          targetTab.database,
+          targetTab.collection,
+        );
+        if (schema) schemaHint = `\n\n${formatSchemaBrief(schema, targetTab.collection)}`;
+      }
+
+      const prefix = openedNew
+        ? "当前标签页已有内容, 已新开一个标签页写入查询"
+        : "已把查询写进当前编辑器标签页";
+      return `${prefix}。请用户确认后点 Run 执行 (执行与否由用户决定)。${schemaHint}`;
     }
 
     // ---- 脚本库 ----
