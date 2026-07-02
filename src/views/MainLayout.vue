@@ -919,46 +919,50 @@ function handleMenuAction(key: string) {
     </n-modal>
 
     <!-- 自动更新提示 -->
-    <n-modal v-model:show="showUpdateModal">
-      <n-card
-        v-if="updateInfo"
-        style="width: 560px; max-height: 80vh"
-        :title="`🎉 有新版本 v${updateInfo.latestVersion} 可用`"
-        closable
-        @close="showUpdateModal = false"
-      >
-        <div style="color: #666; font-size: 12px; margin-bottom: 10px">
+    <n-modal
+      v-model:show="showUpdateModal"
+      preset="card"
+      :title="updateInfo ? `🎉 有新版本 v${updateInfo.latestVersion} 可用` : '检查更新'"
+      style="width: 560px; max-height: 80vh"
+      :bordered="false"
+      :mask-closable="false"
+      closable
+      @close="showUpdateModal = false"
+    >
+      <template v-if="updateInfo">
+        <div style="color: #666; font-size: 12px; margin-bottom: 10px; line-height: 1.7">
           当前版本: v{{ updateInfo.currentVersion }} · 发布时间:
           {{ updateInfo.publishedAt ? new Date(updateInfo.publishedAt).toLocaleString() : "未知" }}
-          <span v-if="updateInfo.assetName">
-            · 安装包:
-            <strong>{{ updateInfo.assetName }}</strong>
+          <template v-if="updateInfo.assetName">
+            <br />
+            安装包: <strong>{{ updateInfo.assetName }}</strong>
             <span v-if="updateInfo.assetSize">
               ({{ (updateInfo.assetSize / 1024 / 1024).toFixed(1) }} MB)
             </span>
-          </span>
+          </template>
         </div>
         <div v-if="updateInfo.notes" class="update-notes">
           <div style="font-weight: 600; margin-bottom: 6px">更新日志:</div>
           <pre>{{ shortenNotes(updateInfo.notes) }}</pre>
         </div>
         <div v-else style="color: #999; font-size: 13px">该版本无更新日志</div>
-        <template #action>
-          <div style="display: flex; justify-content: flex-end; gap: 8px">
-            <n-button size="small" @click="showUpdateModal = false">稍后</n-button>
-            <n-button size="small" @click="handleViewReleasePage">查看详情</n-button>
-            <n-button
-              size="small"
-              type="primary"
-              :loading="downloadingUpdate"
-              :disabled="!updateInfo.assetUrl && !updateInfo.releaseUrl"
-              @click="handleDownloadUpdate"
-            >
-              {{ updateInfo.assetUrl ? "下载安装包" : "打开发布页" }}
-            </n-button>
-          </div>
-        </template>
-      </n-card>
+      </template>
+      <template #action>
+        <div style="display: flex; justify-content: flex-end; gap: 8px">
+          <n-button size="small" @click="showUpdateModal = false">稍后</n-button>
+          <n-button size="small" @click="handleViewReleasePage">查看详情</n-button>
+          <n-button
+            v-if="updateInfo"
+            size="small"
+            type="primary"
+            :loading="downloadingUpdate"
+            :disabled="!updateInfo.assetUrl && !updateInfo.releaseUrl"
+            @click="handleDownloadUpdate"
+          >
+            {{ updateInfo.assetUrl ? "下载安装包" : "打开发布页" }}
+          </n-button>
+        </div>
+      </template>
     </n-modal>
   </n-message-provider>
 </template>
