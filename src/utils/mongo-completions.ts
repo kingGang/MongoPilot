@@ -914,38 +914,43 @@ function isDbContext(textBefore: string): boolean {
   return /db\s*\.\s*$/.test(textBefore);
 }
 
-/** 从查询文本中提取集合名 */
+const NON_COLLECTION_DB_METHODS = new Set([
+  "getCollection",
+  "getCollectionNames",
+  "createCollection",
+  "dropDatabase",
+  "stats",
+  "runCommand",
+  "adminCommand",
+  "getMongo",
+  "getName",
+  "currentOp",
+  "serverStatus",
+  "version",
+]);
+
+/** 从查询文本中提取集合名。
+ *  text 是「文档开头 → 光标」整段, 编辑器里往往有多条语句;
+ *  必须取光标前最近 (最后) 一次 db.xxx 引用, 否则永远命中第一条语句的集合. */
 function extractCollectionName(text: string): string | null {
+  let best: { index: number; name: string } | null = null;
+  const consider = (re: RegExp, excludeDbMethods = false) => {
+    for (const m of text.matchAll(re)) {
+      const name = m[1];
+      if (excludeDbMethods && NON_COLLECTION_DB_METHODS.has(name)) continue;
+      const index = m.index ?? -1;
+      if (!best || index >= best.index) best = { index, name };
+    }
+  };
   // db.getCollection("name")
-  const gcMatch = text.match(/db\s*\.\s*getCollection\s*\(\s*["']([^"']+)["']\s*\)/);
-  if (gcMatch) return gcMatch[1];
+  consider(/db\s*\.\s*getCollection\s*\(\s*["']([^"']+)["']\s*\)/g);
   // db.collName.method(
-  const dotMatch = text.match(
-    /db\s*\.\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\.\s*(?:find|findOne|aggregate|countDocuments|distinct|insertOne|insertMany|updateOne|updateMany|deleteOne|deleteMany|findOneAndUpdate|findOneAndReplace|findOneAndDelete|bulkWrite|replaceOne)\s*\(/,
+  consider(
+    /db\s*\.\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\.\s*(?:find|findOne|aggregate|countDocuments|distinct|insertOne|insertMany|updateOne|updateMany|deleteOne|deleteMany|findOneAndUpdate|findOneAndReplace|findOneAndDelete|bulkWrite|replaceOne)\s*\(/g,
   );
-  if (dotMatch) return dotMatch[1];
   // 简单匹配 db.xxx.
-  const simpleMatch = text.match(/db\s*\.\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\./);
-  if (
-    simpleMatch &&
-    ![
-      "getCollection",
-      "getCollectionNames",
-      "createCollection",
-      "dropDatabase",
-      "stats",
-      "runCommand",
-      "adminCommand",
-      "getMongo",
-      "getName",
-      "currentOp",
-      "serverStatus",
-      "version",
-    ].includes(simpleMatch[1])
-  ) {
-    return simpleMatch[1];
-  }
-  return null;
+  consider(/db\s*\.\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\./g, true);
+  return best ? (best as { index: number; name: string }).name : null;
 }
 
 /** 检查光标是否在 {} 内部（MongoDB 查询/投影/排序上下文） */
