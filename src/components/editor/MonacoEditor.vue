@@ -17,6 +17,7 @@ import { useDatabaseStore } from "@/stores/database";
 import * as aiApi from "@/api/ai";
 import { formatMongoShell } from "@/utils/mongo-format";
 import { editorSettings } from "@/utils/editor-settings";
+import { Parser } from "acorn";
 
 const props = defineProps<{
   modelValue: string;
@@ -445,171 +446,24 @@ function updateStatementHighlight() {
 
 let lintTimer: ReturnType<typeof setTimeout> | null = null;
 
-/**
- * 将 MongoDB Shell 宽松 JSON (unquoted keys) 转为标准 JSON 以便 JSON.parse 验证。
- * 例: {_id:1, name:"test"} → {"_id":1, "name":"test"}
- *     ObjectId("abc")      → "ObjectId(abc)"
- */
-/**
- * 把所有 `identifier(...)` 调用 (含 `new Foo(...)`) 替换成 JSON 安全的占位字符串.
- * 字符串感知: 不动字符串内部的同样写法; 括号配对感知: 支持嵌套.
- * 覆盖范围: ObjectId/ISODate 等 shell 构造器 + 用户自定义 helper 函数 (encryptPhoneNumber(...) 之类).
- */
-function replaceFunctionCalls(text: string): string {
-  let out = "";
-  const n = text.length;
-  let i = 0;
-  const isIdentStart = (c: string) => /[a-zA-Z_$]/.test(c);
-  const isIdentChar = (c: string) => /[a-zA-Z0-9_$]/.test(c);
-
-  while (i < n) {
-    const c = text[i];
-    // 跳过字符串
-    if (c === '"' || c === "'") {
-      const q = c;
-      out += c;
-      i++;
-      while (i < n) {
-        out += text[i];
-        if (text[i] === "\\" && i + 1 < n) {
-          out += text[i + 1];
-          i += 2;
-          continue;
-        }
-        if (text[i] === q) {
-          i++;
-          break;
-        }
-        i++;
-      }
+/** 把普通字符串字面量内部的原始换行替换成空格 (等长).
+ *  acorn 按 JS 语法拒绝多行 "..." 字符串, 但执行器接受 (粘贴多行文本很常见);
+ *  等长替换保证 acorn 报错的 pos 能按原文偏移直接映射回编辑器. 模板串换行合法, 不动. */
+function maskStringNewlines(text: string): string {
+  const out = text.split("");
+  let inString = false;
+  let strChar = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === "\\") { i++; continue; }
+      if (ch === strChar) { inString = false; continue; }
+      if ((ch === "\n" || ch === "\r") && strChar !== "`") out[i] = " ";
       continue;
     }
-    if (isIdentStart(c)) {
-      const callStart = i;
-      let j = i;
-      while (j < n && isIdentChar(text[j])) j++;
-      let ident = text.slice(i, j);
-      // new Foo(...) : 把 new + 构造器名一并算进 callStart..
-      if (ident === "new") {
-        let p = j;
-        while (p < n && /\s/.test(text[p])) p++;
-        if (p < n && isIdentStart(text[p])) {
-          let q = p;
-          while (q < n && isIdentChar(text[q])) q++;
-          j = q;
-          ident = text.slice(p, q);
-        }
-      }
-      // 跳过空白看是否跟 (
-      let k = j;
-      while (k < n && /\s/.test(text[k])) k++;
-      if (k < n && text[k] === "(") {
-        // 配对找到对应 )
-        let depth = 0;
-        let m = k;
-        let inStr = false;
-        let strCh = "";
-        for (; m < n; m++) {
-          const ch = text[m];
-          if (inStr) {
-            if (ch === "\\") { m++; continue; }
-            if (ch === strCh) inStr = false;
-            continue;
-          }
-          if (ch === '"' || ch === "'") { inStr = true; strCh = ch; continue; }
-          if (ch === "(") depth++;
-          else if (ch === ")") {
-            depth--;
-            if (depth === 0) break;
-          }
-        }
-        if (m < n && depth === 0) {
-          out += JSON.stringify(text.slice(callStart, m + 1));
-          i = m + 1;
-          continue;
-        }
-      }
-      // 不是函数调用, 原样输出标识符
-      out += text.slice(callStart, j);
-      i = j;
-      continue;
-    }
-    out += c;
-    i++;
+    if (ch === '"' || ch === "'" || ch === "`") { inString = true; strChar = ch; }
   }
-  return out;
-}
-
-function relaxJsonForValidation(text: string): string {
-  // 0. 剥掉 JS 风格注释 (//... 与 /* ... */); 字符串内的同样写法保留.
-  let result = stripJsComments(text);
-  // 1. 把所有 identifier(...) 调用替换成占位字符串.
-  //    覆盖 ObjectId/ISODate 等 shell 类型, 也覆盖用户自定义 helper 函数调用.
-  result = replaceFunctionCalls(result);
-  // 正则字面量 /pattern/flags
-  result = result.replace(/\/(?:[^/\\]|\\.)+\/[gimsuy]*/g, (m) => JSON.stringify(m));
-
-  // 2. 给未加引号的 key 加引号
-  result = result.replace(
-    /([{,]\s*)([a-zA-Z_$][a-zA-Z0-9_$]*)(\s*:)/g,
-    '$1"$2"$3',
-  );
-  // 3. 把"裸标识符值" (脚本里引用的 var / 形参, 如 player._id / encryptedNewPhone)
-  //    也替成占位字符串. 这步在 key 加引号之后做, 避免错把刚加的 key 再吃一遍.
-  //    lookbehind: 前面不是 " ' 字母 数字 _ $ . —— 排除已在引号里 / 已是标识符一部分.
-  //    lookahead: 后面不接 ( —— 函数调用已经在第 1 步处理过.
-  result = result.replace(
-    /(?<!["'\w$.])[a-zA-Z_$][\w$]*(?:\.[a-zA-Z_$][\w$]*)*(?!\s*\()/g,
-    (m) => {
-      if (/^(true|false|null|undefined|NaN|Infinity)$/.test(m)) return m;
-      return JSON.stringify(m);
-    },
-  );
-  // 4. 去除尾随逗号 (Shell 风格 mongo 容忍 {a:1,} / [1,2,] / 多 stage 管道 stage,)
-  //    JSON.parse 不容尾随逗号, 会让 $project 等后续 stage 被误标红.
-  result = result.replace(/,(\s*[}\]])/g, "$1");
-  return result;
-}
-
-/** 剥掉 JS 风格 //... 行注释 与 /* *\/ 块注释; 字符串内的不动. */
-function stripJsComments(text: string): string {
-  let out = "";
-  const n = text.length;
-  let i = 0;
-  while (i < n) {
-    const c = text[i];
-    if (c === '"' || c === "'") {
-      const quote = c;
-      out += c;
-      i++;
-      while (i < n) {
-        const sc = text[i];
-        out += sc;
-        i++;
-        if (sc === "\\" && i < n) {
-          out += text[i];
-          i++;
-        } else if (sc === quote) {
-          break;
-        }
-      }
-      continue;
-    }
-    if (c === "/" && i + 1 < n && text[i + 1] === "/") {
-      i += 2;
-      while (i < n && text[i] !== "\n") i++;
-      continue;
-    }
-    if (c === "/" && i + 1 < n && text[i + 1] === "*") {
-      i += 2;
-      while (i + 1 < n && !(text[i] === "*" && text[i + 1] === "/")) i++;
-      i = Math.min(i + 2, n);
-      continue;
-    }
-    out += c;
-    i++;
-  }
-  return out;
+  return out.join("");
 }
 
 /**
@@ -634,10 +488,12 @@ function extractMethodArgs(
     for (let ci = 0; ci < line.length; ci++) {
       const ch = line[ci];
       if (inString) {
-        if (ch === strChar && line[ci - 1] !== "\\") inString = false;
+        // 先跳过转义对, 否则 "C:\\" 结尾的字符串会误判成未闭合
+        if (ch === "\\") { ci++; continue; }
+        if (ch === strChar) inString = false;
         continue;
       }
-      if (ch === '"' || ch === "'") { inString = true; strChar = ch; continue; }
+      if (ch === '"' || ch === "'" || ch === "`") { inString = true; strChar = ch; continue; }
       if (ch === "(") {
         depth++;
         if (depth === 1) {
@@ -650,7 +506,8 @@ function extractMethodArgs(
           const argText = extractRange(lines, parenStart.lineIdx, parenStart.colIdx + 1, li, ci);
           if (argText.trim()) {
             results.push({
-              argText: argText.trim(),
+              // 不 trim: 保持与 line/col 的原文对齐, acorn 报错的 loc 才能直接映射回编辑器
+              argText,
               line: stmtStartLine + parenStart.lineIdx,
               col: parenStart.colIdx + 2,
             });
@@ -746,10 +603,12 @@ function lintContent() {
       for (let ci = 0; ci < line.length; ci++) {
         const ch = line[ci];
         if (inString) {
-          if (ch === strChar && line[ci - 1] !== "\\") inString = false;
+          // 先跳过转义对, 否则 "C:\\" 结尾的字符串会误判成未闭合
+          if (ch === "\\") { ci++; continue; }
+          if (ch === strChar) inString = false;
           continue;
         }
-        if (ch === '"' || ch === "'") {
+        if (ch === '"' || ch === "'" || ch === "`") {
           inString = true;
           strChar = ch;
           unclosedStringLine = li;
@@ -839,61 +698,44 @@ function lintContent() {
     if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && !inString) {
       const args = extractMethodArgs(stmt.text, stmt.startLine);
       for (const arg of args) {
-        // 跳过纯数字参数 (limit(100), skip(0))
-        if (/^\d+$/.test(arg.argText)) continue;
-        // 跳过字符串参数 ("fieldName")
-        if (/^["'][^"']*["']$/.test(arg.argText)) continue;
-
-        // 尝试解析 {} 或 [] 参数
-        // argText 可能是多个逗号分隔的参数 (如 updateOne(filter, update)),
-        // 所以用 [argText] 当 JSON 数组解析, 兼容单参和多参.
-        if (arg.argText.startsWith("{") || arg.argText.startsWith("[")) {
-          try {
-            JSON.parse(`[${relaxJsonForValidation(arg.argText)}]`);
-          } catch (e) {
-            const errMsg = String(e).replace(/^SyntaxError:\s*/, "");
-            // 定位到参数在编辑器中的实际位置
-            // arg.line = 参数起始行（编辑器行号）
-            // arg.col  = 参数起始列（编辑器列号，'(' 后第一个字符）
-            const posMatch = errMsg.match(/position\s+(\d+)/i);
-            let errLine = arg.line;
-            let errCol = arg.col;
-
-            if (posMatch) {
-              const pos = parseInt(posMatch[1]);
-              // 在原始 argText 中定位 (不用 relaxed 避免偏移)
-              let count = 0;
-              const argLines = arg.argText.split("\n");
-              for (let al = 0; al < argLines.length; al++) {
-                if (count + argLines[al].length + 1 > pos) {
-                  errLine = arg.line + al;
-                  const offsetInArgLine = pos - count;
-                  // 第一行需要加上参数在编辑器中的起始列偏移
-                  errCol = al === 0
-                    ? arg.col + offsetInArgLine
-                    : offsetInArgLine + 1;
-                  break;
-                }
-                count += argLines[al].length + 1;
-              }
-            }
-
-            // 标记整个有问题的参数区域（方便用户看到）
-            const argEndLine = arg.line + arg.argText.split("\n").length - 1;
-            const argLastLineText = arg.argText.split("\n").pop() || "";
-            const argEndCol = arg.argText.split("\n").length === 1
-              ? arg.col + argLastLineText.length
-              : argLastLineText.length + 1;
-
-            markers.push({
-              severity: monaco.MarkerSeverity.Error,
-              message: `JSON 语法错误: ${errMsg}`,
-              startLineNumber: errLine,
-              startColumn: Math.max(1, errCol),
-              endLineNumber: argEndLine,
-              endColumn: argEndCol,
-            });
+        // 参数按 JS 表达式解析 (acorn), 而不是改写成 JSON 再 JSON.parse:
+        // mongosh 参数本来就是 JS —— 正则/模板串/ObjectId()/表达式/注释都合法,
+        // 任何 token 级改写都会制造误报 (曾误报 "LHT-S" / NaN / 除法 / 中文 key).
+        // 包一层 [] 兼容多参数 (filter, update); ] 前加 \n 防止参数结尾的行注释吞掉它.
+        try {
+          Parser.parseExpressionAt(`[${maskStringNewlines(arg.argText)}\n]`, 0, {
+            ecmaVersion: "latest",
+          });
+        } catch (e) {
+          const err = e as Error & { pos?: number };
+          // err.pos 相对包装文本 `[masked\n]` 的绝对偏移, -1 扣掉开头的 [;
+          // 掩码等长, 偏移与原始 argText 一致, 直接换算行列.
+          const argLines = arg.argText.split("\n");
+          let errLine = arg.line;
+          let errCol = arg.col;
+          if (typeof err.pos === "number") {
+            const off = Math.min(Math.max(err.pos - 1, 0), arg.argText.length);
+            const before = arg.argText.slice(0, off);
+            const lineIdx = (before.match(/\n/g) || []).length;
+            const colInLine = off - (before.lastIndexOf("\n") + 1);
+            errLine = arg.line + lineIdx;
+            errCol = lineIdx === 0 ? arg.col + colInLine : colInLine + 1;
           }
+          // 标记从出错位置到参数结尾（方便用户看到）
+          const argEndLine = arg.line + argLines.length - 1;
+          const argLastLineText = argLines[argLines.length - 1];
+          const argEndCol = argLines.length === 1
+            ? arg.col + argLastLineText.length
+            : argLastLineText.length + 1;
+
+          markers.push({
+            severity: monaco.MarkerSeverity.Error,
+            message: `语法错误: ${err.message.replace(/\s*\(\d+:\d+\)$/, "")}`,
+            startLineNumber: errLine,
+            startColumn: Math.max(1, errCol),
+            endLineNumber: argEndLine,
+            endColumn: argEndCol,
+          });
         }
       }
     }
