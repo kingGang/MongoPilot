@@ -300,16 +300,14 @@ function makeColSorter(key: string) {
   };
 }
 
-/** 拖动结束时把当前各列的实际宽度记进 colWidthMap (NaiveUI 在拖动时 mutate column.width) */
-function snapshotColWidths() {
-  for (const col of columns.value) {
-    if (!("key" in col)) continue;
-    const k = col.key;
-    if (typeof k !== "string" || k === "__index") continue;
-    if (typeof col.width === "number") {
-      colWidthMap.value[k] = col.width;
-    }
-  }
+/** naive-ui 不会改 column.width —— 拖动中的宽度存在其内部 map, 这里用官方
+ *  onUnstableColumnResize 回调实时同步: 1) 记进 colWidthMap 供列重建时沿用
+ *  2) scrollX 跟着重算, 表格总宽始终等于列宽之和 —— 否则两者不一致时
+ *  浏览器会按比例摊派差值, 拖一列其他列全跟着动 */
+function onColumnResize(_resized: number, limited: number, column: { key?: string | number }) {
+  const key = column.key;
+  if (typeof key !== "string" || key.startsWith("__")) return;
+  colWidthMap.value[key] = Math.round(limited);
 }
 
 const columns = shallowRef<DataTableColumns>([]);
@@ -383,6 +381,7 @@ watch(
             : formatBsonCell(val);
           return h("span", {
             style: "color:#c678dd;cursor:pointer",
+            title: oid,
             innerHTML: props.searchKeyword
               ? highlightKeyword(oid, props.searchKeyword, !!props.matchCase)
               : oid,
@@ -449,11 +448,12 @@ watch(
           }, label);
         }
 
-        // 简单类型: 双击进入编辑
+        // 简单类型: 双击进入编辑; 原生 title 悬停看完整内容 (列窄被截断时)
         const text = formatBsonCell(val);
         if (props.searchKeyword) {
           return h("span", {
             style: `${color ? `color:${color};` : ""}cursor:text`,
+            title: text,
             innerHTML: highlightKeyword(text, props.searchKeyword, !!props.matchCase),
             onDblclick: (e: MouseEvent) => {
               e.stopPropagation();
@@ -463,6 +463,7 @@ watch(
         }
         return h("span", {
           style: `${color ? `color:${color};` : ""}cursor:text`,
+          title: text,
           onDblclick: (e: MouseEvent) => {
             e.stopPropagation();
             startEdit(rowIdx, key, val, type);
@@ -470,15 +471,30 @@ watch(
         }, text);
       },
     }));
-    columns.value = selectionCol ? [selectionCol, indexCol, ...dataCols] : [indexCol, ...dataCols];
+    // 填充列: 无宽度, 表格比面板窄时吸收多余空间 (table-layout:fixed 下
+    // 没写宽度的列独占余量), 真实列的宽度不会被拉伸/挤压
+    const spacerCol = {
+      key: "__spacer",
+      title: "",
+      minWidth: 0,
+      render: () => null,
+    } as DataTableColumn;
+
+    columns.value = selectionCol
+      ? [selectionCol, indexCol, ...dataCols, spacerCol]
+      : [indexCol, ...dataCols, spacerCol];
   },
   { immediate: true },
 );
 
 const scrollX = computed(() => {
   let total = 0;
-  for (const col of columns.value) total += (col.width as number) || 160;
-  return Math.max(total, 800);
+  for (const col of columns.value) {
+    const k = "key" in col && typeof col.key === "string" ? col.key : "";
+    // colWidthMap 是拖动后的实时值; 没有数字宽度的列 (填充列) 不计
+    total += (k && colWidthMap.value[k]) || (typeof col.width === "number" ? col.width : 0);
+  }
+  return total;
 });
 
 /** 每行的 row-key = docSelectionKey 返回值 (父组件指定), 失败时 fallback 为行号 */
@@ -565,7 +581,7 @@ async function handleCtxSelect(action: string) {
 </script>
 
 <template>
-  <div class="table-view" @mouseup="snapshotColWidths">
+  <div class="table-view">
     <n-data-table
       :columns="columns"
       :data="data"
@@ -579,6 +595,7 @@ async function handleCtxSelect(action: string) {
       virtual-scroll
       size="small"
       @update:checked-row-keys="onCheckedChange"
+      @unstable-column-resize="onColumnResize"
     />
     <ValueDetail
       v-model:show="showDetail"

@@ -7,7 +7,7 @@
  * executeTool 不接收冻结的 context —— 每次调用都从 Pinia store **实时**读当前状态,
  * 这样 agent 在一轮里先 open_query_tab / switch_query_tab, 后续工具能看到最新状态.
  */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/api/invoke";
 import { Parser } from "acorn";
 import * as aiApi from "@/api/ai";
 import { useEditorStore } from "@/stores/editor";

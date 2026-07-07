@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./invoke";
 import type { CollectionStats, IndexInfo, CreateIndexOptions } from "@/types/document";
 
 export async function createCollection(

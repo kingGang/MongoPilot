@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./invoke";
 import type { DatabaseInfo, CollectionInfo } from "@/types/database";
 
 export async function listDatabases(connectionId: string): Promise<DatabaseInfo[]> {

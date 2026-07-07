@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./invoke";
 import type { ConnectionConfig, ServerInfo } from "@/types/connection";
 
 export async function listConnections(): Promise<ConnectionConfig[]> {

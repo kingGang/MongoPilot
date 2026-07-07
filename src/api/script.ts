@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./invoke";
 import type { ScriptFolderInfo, ScriptInfo, SaveScriptInput } from "@/types/script";
 
 export async function listScripts(): Promise<ScriptInfo[]> {

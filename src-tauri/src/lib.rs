@@ -59,6 +59,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::logging::log_client_error,
             commands::connection::list_connections,
             commands::connection::get_connection,
             commands::connection::save_connection,

@@ -3,7 +3,7 @@ import { ref, computed } from "vue";
 import type { EditorTab, ResultTab, ResultTabKind, TabExecutor } from "@/types/database";
 import * as queryApi from "@/api/query";
 import * as collApi from "@/api/collectionMgmt";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/api/invoke";
 import { listen } from "@tauri-apps/api/event";
 import { useConnectionStore } from "@/stores/connection";
 import {

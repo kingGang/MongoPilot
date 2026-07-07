@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./invoke";
 import type { QueryResult, HistoryEntry } from "@/types/database";
 
 export async function runQuery(

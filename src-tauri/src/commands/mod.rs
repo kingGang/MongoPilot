@@ -4,6 +4,7 @@ pub mod connection;
 pub mod database;
 pub mod document;
 pub mod export;
+pub mod logging;
 pub mod query;
 pub mod script;
 pub mod server;

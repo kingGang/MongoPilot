@@ -1,6 +1,15 @@
 import { createApp } from "vue";
 import { createPinia } from "pinia";
 import App from "./App.vue";
+import { logClientError } from "@/api/invoke";
+
+// 未捕获异常 / Promise rejection 落盘到 error.log —— 排查偶现问题
+window.addEventListener("error", (e) => {
+  logClientError(`window.error: ${e.message} @ ${e.filename}:${e.lineno}`);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  logClientError(`unhandledrejection: ${String(e.reason)}`);
+});
 
 // Monaco Editor worker 配置（语法着色依赖 worker）
 import("monaco-editor/esm/vs/editor/editor.worker?worker")

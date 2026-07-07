@@ -5,7 +5,7 @@ import {
 } from "naive-ui";
 import { FolderOpen as BrowseIcon, Download as ImportIcon } from "@vicons/ionicons5";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/api/invoke";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useConnectionStore } from "@/stores/connection";
 import { useDatabaseStore } from "@/stores/database";

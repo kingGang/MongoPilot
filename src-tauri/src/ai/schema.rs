@@ -117,6 +117,14 @@ fn collect_fields(doc: &Document, prefix: &str, stats: &mut HashMap<String, Fiel
         // 递归嵌套文档
         if let Bson::Document(nested) = value {
             collect_fields(nested, &full_key, stats);
+        } else if let Bson::Array(arr) = value {
+            // 数组内嵌文档: 子字段按 Mongo 点路径规则归并到 `attachment.id` 这类 key,
+            // 编辑器里 "$attachment." 的二级补全靠它; 每个数组只采前几个元素控制成本
+            for item in arr.iter().take(5) {
+                if let Bson::Document(nested) = item {
+                    collect_fields(nested, &full_key, stats);
+                }
+            }
         }
     }
 }

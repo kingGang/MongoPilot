@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./invoke";
 import type { ServerStatus, UserInfo, CreateUserRequest, ProfileEntry } from "@/types/server";
 
 export async function getServerStatus(connectionId: string): Promise<ServerStatus> {

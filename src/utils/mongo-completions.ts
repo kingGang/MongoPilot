@@ -20,7 +20,7 @@ interface MethodDef {
 const collectionMethods: MethodDef[] = [
   {
     label: "find",
-    insertText: "find(${1:{\\}})",
+    insertText: "find({$1})",
     detail: "method mongo.Collection.find(query object) : mongo.Cursor",
     documentation:
       "Selects documents in a collection and returns a cursor to the selected documents.",
@@ -28,7 +28,7 @@ const collectionMethods: MethodDef[] = [
   },
   {
     label: "findOne",
-    insertText: "findOne(${1:{\\}})",
+    insertText: "findOne({$1})",
     detail: "method mongo.Collection.findOne(query object) : object",
     documentation:
       "Returns one document that satisfies the specified query criteria. If multiple documents match, this method returns the first document according to the natural order.",
@@ -36,7 +36,7 @@ const collectionMethods: MethodDef[] = [
   },
   {
     label: "aggregate",
-    insertText: "aggregate(${1:[]})",
+    insertText: "aggregate([$1])",
     detail: "method mongo.Collection.aggregate(pipeline object[]) : mongo.AggregationCursor",
     documentation:
       "Calculates aggregate values for the data in a collection. Use aggregate for aggregation pipeline operations, or if you include the explain option.",
@@ -44,7 +44,7 @@ const collectionMethods: MethodDef[] = [
   },
   {
     label: "countDocuments",
-    insertText: "countDocuments(${1:{\\}})",
+    insertText: "countDocuments({$1})",
     detail: "method mongo.Collection.countDocuments(query object) : number",
     documentation: "Returns the count of documents that match the query for a collection or view.",
     kind: monaco.languages.CompletionItemKind.Method,
@@ -67,21 +67,21 @@ const collectionMethods: MethodDef[] = [
   },
   {
     label: "insertOne",
-    insertText: "insertOne(${1:{\\}})",
+    insertText: "insertOne({$1})",
     detail: "method mongo.Collection.insertOne(document object) : InsertOneResult",
     documentation: "Inserts a single document into a collection.",
     kind: monaco.languages.CompletionItemKind.Method,
   },
   {
     label: "insertMany",
-    insertText: "insertMany(${1:[]})",
+    insertText: "insertMany([$1])",
     detail: "method mongo.Collection.insertMany(documents object[]) : InsertManyResult",
     documentation: "Inserts multiple documents into a collection.",
     kind: monaco.languages.CompletionItemKind.Method,
   },
   {
     label: "updateOne",
-    insertText: "updateOne(${1:{\\}}, ${2:{\\$set: {\\}}})",
+    insertText: "updateOne({$1}, {\\$set: {$2}})",
     detail:
       "method mongo.Collection.updateOne(filter object, update object, options?) : UpdateResult",
     documentation: "Updates a single document within the collection based on the filter.",
@@ -89,7 +89,7 @@ const collectionMethods: MethodDef[] = [
   },
   {
     label: "updateMany",
-    insertText: "updateMany(${1:{\\}}, ${2:{\\$set: {\\}}})",
+    insertText: "updateMany({$1}, {\\$set: {$2}})",
     detail:
       "method mongo.Collection.updateMany(filter object, update object, options?) : UpdateResult",
     documentation: "Updates all documents that match the specified filter for a collection.",
@@ -97,35 +97,35 @@ const collectionMethods: MethodDef[] = [
   },
   {
     label: "replaceOne",
-    insertText: "replaceOne(${1:{\\}}, ${2:{\\}})",
+    insertText: "replaceOne({$1}, {$2})",
     detail: "method mongo.Collection.replaceOne(filter object, replacement object) : UpdateResult",
     documentation: "Replaces a single document within the collection based on the filter.",
     kind: monaco.languages.CompletionItemKind.Method,
   },
   {
     label: "deleteOne",
-    insertText: "deleteOne(${1:{\\}})",
+    insertText: "deleteOne({$1})",
     detail: "method mongo.Collection.deleteOne(filter object) : DeleteResult",
     documentation: "Removes a single document from a collection.",
     kind: monaco.languages.CompletionItemKind.Method,
   },
   {
     label: "deleteMany",
-    insertText: "deleteMany(${1:{\\}})",
+    insertText: "deleteMany({$1})",
     detail: "method mongo.Collection.deleteMany(filter object) : DeleteResult",
     documentation: "Removes all documents that match the filter from a collection.",
     kind: monaco.languages.CompletionItemKind.Method,
   },
   {
     label: "bulkWrite",
-    insertText: "bulkWrite(${1:[]})",
+    insertText: "bulkWrite([$1])",
     detail: "method mongo.Collection.bulkWrite(operations object[]) : BulkWriteResult",
     documentation: "Performs multiple write operations with controls for order of execution.",
     kind: monaco.languages.CompletionItemKind.Method,
   },
   {
     label: "findOneAndUpdate",
-    insertText: "findOneAndUpdate(${1:{\\}}, ${2:{\\$set: {\\}}})",
+    insertText: "findOneAndUpdate({$1}, {\\$set: {$2}})",
     detail: "method mongo.Collection.findOneAndUpdate(filter, update, options?) : object",
     documentation:
       "Modifies and returns a single document. By default, the returned document does not include the modifications made on the update.",
@@ -133,14 +133,14 @@ const collectionMethods: MethodDef[] = [
   },
   {
     label: "findOneAndReplace",
-    insertText: "findOneAndReplace(${1:{\\}}, ${2:{\\}})",
+    insertText: "findOneAndReplace({$1}, {$2})",
     detail: "method mongo.Collection.findOneAndReplace(filter, replacement, options?) : object",
     documentation: "Replaces a single document based on the specified filter.",
     kind: monaco.languages.CompletionItemKind.Method,
   },
   {
     label: "findOneAndDelete",
-    insertText: "findOneAndDelete(${1:{\\}})",
+    insertText: "findOneAndDelete({$1})",
     detail: "method mongo.Collection.findOneAndDelete(filter object, options?) : object",
     documentation:
       "Deletes a single document based on the filter and sort criteria, returning the deleted document.",
@@ -156,7 +156,7 @@ const collectionMethods: MethodDef[] = [
   },
   {
     label: "createIndexes",
-    insertText: "createIndexes(${1:[]})",
+    insertText: "createIndexes([$1])",
     detail: "method mongo.Collection.createIndexes(indexSpecs object[]) : string[]",
     documentation: "Creates one or more indexes on a collection.",
     kind: monaco.languages.CompletionItemKind.Method,
@@ -229,7 +229,7 @@ const collectionMethods: MethodDef[] = [
   },
   {
     label: "watch",
-    insertText: "watch(${1:[]})",
+    insertText: "watch([$1])",
     detail: "method mongo.Collection.watch(pipeline? object[]) : ChangeStream",
     documentation: "Opens a change stream cursor on a collection.",
     kind: monaco.languages.CompletionItemKind.Method,
@@ -239,7 +239,7 @@ const collectionMethods: MethodDef[] = [
 const cursorMethods: MethodDef[] = [
   {
     label: "sort",
-    insertText: "sort(${1:{_id: 1\\}})",
+    insertText: "sort({${1:_id: 1}})",
     detail: "method mongo.Cursor.sort(sortSpec object) : mongo.Cursor",
     documentation:
       "Specifies the order in which the query returns matching documents. {field: 1} for ascending, {field: -1} for descending.",
@@ -262,7 +262,7 @@ const cursorMethods: MethodDef[] = [
   },
   {
     label: "projection",
-    insertText: "projection(${1:{\\}})",
+    insertText: "projection({$1})",
     detail: "method mongo.Cursor.projection(projectionSpec object) : mongo.Cursor",
     documentation:
       "Specifies which fields to include or exclude. {field: 1} to include, {field: 0} to exclude.",
@@ -284,7 +284,7 @@ const cursorMethods: MethodDef[] = [
   },
   {
     label: "forEach",
-    insertText: "forEach(${1:function(doc) {\\}})",
+    insertText: "forEach(function(doc) {$1})",
     detail: "method mongo.Cursor.forEach(function) : void",
     documentation:
       "Iterates the cursor to apply a JavaScript function to each document from the cursor.",
@@ -292,7 +292,7 @@ const cursorMethods: MethodDef[] = [
   },
   {
     label: "map",
-    insertText: "map(${1:function(doc) { return doc; \\}})",
+    insertText: "map(function(doc) { return ${1:doc}; })",
     detail: "method mongo.Cursor.map(function) : array",
     documentation:
       "Applies a function to each document visited by the cursor and returns an array of the mapped values.",
@@ -329,7 +329,7 @@ const cursorMethods: MethodDef[] = [
   },
   {
     label: "hint",
-    insertText: "hint(${1:{\\}})",
+    insertText: "hint({$1})",
     detail: "method mongo.Cursor.hint(index object|string) : mongo.Cursor",
     documentation: "Forces MongoDB to use a specific index for a query.",
     kind: monaco.languages.CompletionItemKind.Method,
@@ -400,7 +400,7 @@ const dbMethods: MethodDef[] = [
   },
   {
     label: "runCommand",
-    insertText: "runCommand(${1:{\\}})",
+    insertText: "runCommand({$1})",
     detail: "method mongo.Database.runCommand(command object) : object",
     documentation:
       "Provides a helper to run specified database commands against the current database.",
@@ -408,7 +408,7 @@ const dbMethods: MethodDef[] = [
   },
   {
     label: "adminCommand",
-    insertText: "adminCommand(${1:{\\}})",
+    insertText: "adminCommand({$1})",
     detail: "method mongo.Database.adminCommand(command object) : object",
     documentation: "Runs a database command against the admin database.",
     kind: monaco.languages.CompletionItemKind.Method,
@@ -752,6 +752,207 @@ const aggregationStages: MethodDef[] = [
     insertText: "\\$sample: { size: ${1:10} }",
     detail: "Aggregation stage",
     documentation: "Randomly selects the specified number of documents.",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+];
+
+// ---- $group 累加器 & 常用聚合表达式操作符 ----
+
+const aggExpressionOperators: MethodDef[] = [
+  {
+    label: "$sum",
+    insertText: "\\$sum: ${1:1}",
+    detail: "$group 累加器",
+    documentation: '求和。`$sum: 1` 计数, `$sum: "$field"` 按字段求和。',
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$avg",
+    insertText: '\\$avg: "${1}"',
+    detail: "$group 累加器",
+    documentation: "求平均值。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$first",
+    insertText: '\\$first: "${1}"',
+    detail: "$group 累加器",
+    documentation: "取分组内第一个文档的字段值 (常配合 $sort 使用)。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$last",
+    insertText: '\\$last: "${1}"',
+    detail: "$group 累加器",
+    documentation: "取分组内最后一个文档的字段值 (常配合 $sort 使用)。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$count",
+    insertText: "\\$count: {}",
+    detail: "$group 累加器",
+    documentation: "计数, 等价于 $sum: 1 (MongoDB 5.0+)。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$stdDevPop",
+    insertText: '\\$stdDevPop: "${1}"',
+    detail: "$group 累加器",
+    documentation: "总体标准差。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$stdDevSamp",
+    insertText: '\\$stdDevSamp: "${1}"',
+    detail: "$group 累加器",
+    documentation: "样本标准差。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$mergeObjects",
+    insertText: '\\$mergeObjects: "${1}"',
+    detail: "$group 累加器 / 表达式",
+    documentation: "合并多个文档为一个。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$firstN",
+    insertText: '\\$firstN: { input: "${1}", n: ${2:3} }',
+    detail: "$group 累加器",
+    documentation: "取分组内前 N 个值 (MongoDB 5.2+)。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$lastN",
+    insertText: '\\$lastN: { input: "${1}", n: ${2:3} }',
+    detail: "$group 累加器",
+    documentation: "取分组内后 N 个值 (MongoDB 5.2+)。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$add",
+    insertText: "\\$add: [${1}]",
+    detail: "算术表达式",
+    documentation: "加法 (数字或 日期+毫秒)。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$subtract",
+    insertText: "\\$subtract: [${1}]",
+    detail: "算术表达式",
+    documentation: "减法。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$multiply",
+    insertText: "\\$multiply: [${1}]",
+    detail: "算术表达式",
+    documentation: "乘法。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$divide",
+    insertText: "\\$divide: [${1}]",
+    detail: "算术表达式",
+    documentation: "除法。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$concat",
+    insertText: "\\$concat: [${1}]",
+    detail: "字符串表达式",
+    documentation: "拼接字符串。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$cond",
+    insertText: "\\$cond: { if: ${1}, then: ${2}, else: ${3} }",
+    detail: "条件表达式",
+    documentation: "三元条件表达式。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$ifNull",
+    insertText: "\\$ifNull: [${1}, ${2}]",
+    detail: "条件表达式",
+    documentation: "第一个表达式为 null/缺失时取第二个。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$size",
+    insertText: '\\$size: "${1}"',
+    detail: "数组表达式",
+    documentation: "数组长度。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$arrayElemAt",
+    insertText: '\\$arrayElemAt: ["${1}", ${2:0}]',
+    detail: "数组表达式",
+    documentation: "取数组指定下标的元素。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$filter",
+    insertText: '\\$filter: { input: "${1}", as: "${2:item}", cond: ${3} }',
+    detail: "数组表达式",
+    documentation: "按条件过滤数组元素。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$map",
+    insertText: '\\$map: { input: "${1}", as: "${2:item}", in: ${3} }',
+    detail: "数组表达式",
+    documentation: "对数组每个元素应用表达式。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$dateToString",
+    insertText: '\\$dateToString: { format: "${1:%Y-%m-%d}", date: "${2}" }',
+    detail: "日期表达式",
+    documentation: "日期格式化为字符串。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$year",
+    insertText: '\\$year: "${1}"',
+    detail: "日期表达式",
+    documentation: "取年份。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$month",
+    insertText: '\\$month: "${1}"',
+    detail: "日期表达式",
+    documentation: "取月份 (1-12)。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$dayOfMonth",
+    insertText: '\\$dayOfMonth: "${1}"',
+    detail: "日期表达式",
+    documentation: "取日 (1-31)。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$toString",
+    insertText: '\\$toString: "${1}"',
+    detail: "类型转换",
+    documentation: "转字符串。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$toInt",
+    insertText: '\\$toInt: "${1}"',
+    detail: "类型转换",
+    documentation: "转整数。",
+    kind: monaco.languages.CompletionItemKind.Property,
+  },
+  {
+    label: "$toDate",
+    insertText: '\\$toDate: "${1}"',
+    detail: "类型转换",
+    documentation: "转日期。",
     kind: monaco.languages.CompletionItemKind.Property,
   },
 ];
@@ -1162,13 +1363,27 @@ export function registerMongoCompletions(arg?: CompletionOptions | (() => string
     }
 
     // 4. $ 操作符 (inside {} context)
+    // 引号里的 "$xxx" 是聚合字段引用不是操作符 —— 交给 case 5 按字段名补全
     const lineText = model.getLineContent(position.lineNumber);
     const charBefore = lineText.substring(0, position.column - 1);
-    if (charBefore.trimEnd().endsWith("$") || /\$\w*$/.test(charBefore)) {
+    const cursorInQuotes = isInsideQuotes(textUntilPosition);
+    if (!cursorInQuotes && (charBefore.trimEnd().endsWith("$") || /\$\w*$/.test(charBefore))) {
       const inAggregate = /\.aggregate\s*\(\s*\[/s.test(textUntilPosition);
 
       if (inAggregate) {
         for (const m of aggregationStages) {
+          suggestions.push({
+            label: m.label,
+            kind: m.kind,
+            insertText: m.insertText,
+            insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+            detail: m.detail,
+            documentation: { value: m.documentation },
+            range: { ...range, startColumn: Math.max(1, range.startColumn - 1) },
+          });
+        }
+        // $group 累加器 / 聚合表达式 ($sum / $first / $last / $cond / ...)
+        for (const m of aggExpressionOperators) {
           suggestions.push({
             label: m.label,
             kind: m.kind,
@@ -1251,9 +1466,12 @@ export function registerMongoCompletions(arg?: CompletionOptions | (() => string
               lineUpToCursor.lastIndexOf("'"),
             );
             if (lastQuote >= 0) {
+              // "$attachment." 这类聚合字段引用: $ 留在 range 外, 否则它参与
+              // Monaco 过滤匹配, 和字段名 attachment.xxx 对不上 → No suggestions
+              const skipDollar = lineUpToCursor[lastQuote + 1] === "$" ? 1 : 0;
               fieldRange = {
                 startLineNumber: position.lineNumber,
-                startColumn: lastQuote + 2, // after the quote
+                startColumn: lastQuote + 2 + skipDollar, // after the quote (and $)
                 endLineNumber: position.lineNumber,
                 endColumn: position.column,
               };
@@ -1288,6 +1506,25 @@ export function registerMongoCompletions(arg?: CompletionOptions | (() => string
           }
         } catch {
           /* ignore schema fetch errors */
+        }
+
+        // BSON 构造器 (ObjectId / ISODate / ...): 值位置 (":" 后) 排最前,
+        // key 位置也给但排在字段名后 —— 否则 {} 内永远补不出 ObjectId.
+        // 放在 try 外: schema 拉取失败时构造器照样可用.
+        if (inBraces && !inQuotes) {
+          const atValuePos = /:\s*[\w$]*$/.test(charBefore);
+          for (const m of globalFunctions) {
+            suggestions.push({
+              label: m.label,
+              kind: m.kind,
+              insertText: m.insertText,
+              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+              detail: m.detail,
+              documentation: { value: m.documentation },
+              range,
+              sortText: (atValuePos ? "0" : "zz") + m.label,
+            });
+          }
         }
 
         return { suggestions };
