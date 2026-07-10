@@ -634,7 +634,12 @@ const ctxMenuOptions = computed(() => {
     const active = connStore.isActive(connId);
     return [
       ...(active
-        ? [{ label: "断开连接", key: "disconnect" }, { label: "刷新", key: "refresh-conn" }]
+        ? [
+            { label: "断开连接", key: "disconnect" },
+            { label: "刷新", key: "refresh-conn" },
+            { type: "divider" as const, key: "d0" },
+            { label: "新建数据库...", key: "create-db" },
+          ]
         : [{ label: "连接", key: "connect" }]),
       { type: "divider" as const, key: "d1" },
       { label: "编辑", key: "edit" },
@@ -825,6 +830,7 @@ async function handleIndexCreated() {
 
 /** ServerTree 中所有写动作 key, 用于只读连接拦截 */
 const WRITE_ACTIONS = new Set<string>([
+  "create-db",
   "create-coll", "drop-db", "drop-coll",
   "add-index", "add-index-from-idx",
   "rebuild-indexes", "drop-indexes",
@@ -1111,6 +1117,45 @@ async function handleCtxSelect(action: string) {
   }
 
   // ---- DDL 操作 ----
+  if (action === "create-db" && nodeKey.startsWith("conn:")) {
+    const connId = nodeKey.slice(5);
+    dlg.create({
+      title: "新建数据库",
+      content: () => h("div", { style: "display:flex;flex-direction:column;gap:8px" }, [
+        h("p", { style: "margin:0;font-size:12px;color:#999;line-height:1.5" },
+          "MongoDB 需要至少一个集合才能落地数据库，请同时填写初始集合名。"),
+        h("input", {
+          id: "__create_db_name",
+          style: "width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px",
+          placeholder: "数据库名称",
+        }),
+        h("input", {
+          id: "__create_db_coll",
+          style: "width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px",
+          placeholder: "初始集合名称",
+        }),
+      ]),
+      positiveText: "创建",
+      negativeText: "取消",
+      onPositiveClick: async () => {
+        const dbName = (document.getElementById("__create_db_name") as HTMLInputElement | null)?.value?.trim();
+        const collName = (document.getElementById("__create_db_coll") as HTMLInputElement | null)?.value?.trim();
+        if (!dbName) { message.warning("请输入数据库名称"); return false; }
+        // 库名非法字符校验 (MongoDB 限制): 不能含 / \ . " $ * < > : | ? 及空格
+        if (/[/\\. "$*<>:|?]/.test(dbName)) { message.warning('数据库名不能含 / \\ . " $ * < > : | ? 及空格'); return false; }
+        if (!collName) { message.warning("请输入初始集合名称"); return false; }
+        // 已存在同名库时提醒
+        const exists = dbStore.getDatabases(connId).some((d) => d.name === dbName);
+        if (exists) { message.warning(`数据库 "${dbName}" 已存在`); return false; }
+        try {
+          await collApi.createCollection(connId, dbName, collName);
+          message.success(`数据库 ${dbName} 创建成功`);
+          await refreshConnection(connId);
+        } catch (e) { message.error(`创建失败: ${e}`); }
+      },
+    });
+  }
+
   if (action === "create-coll" && nodeKey.startsWith("db:")) {
     const { connId, dbName } = parseDbKey(nodeKey);
     dlg.create({

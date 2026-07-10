@@ -704,6 +704,25 @@ const __hydrate__ = (v) => {
   for (const k of keys) v[k] = __hydrate__(v[k]);
   return v;
 };
+// 把"最终解析为数组的 Promise"包装成既可 await、又能直接链式调用数组方法的对象,
+// 让 mongosh 传统同步写法 db.coll.find().toArray().map(...).filter(...) 成立
+// (toArray 实际是异步的, 直接 .map 会报 "map is not a function")。
+const __thenableArray__ = (p) => new Proxy(function () {}, {
+  get(_, m) {
+    if (m === 'then' || m === 'catch' || m === 'finally') {
+      const f = p[m];
+      return typeof f === 'function' ? f.bind(p) : f;
+    }
+    // 任意数组方法/属性: 解析后再应用, 结果继续包一层, 保持可链式 & 可 await
+    return (...args) =>
+      __thenableArray__(
+        p.then((arr) => {
+          const v = arr == null ? undefined : arr[m];
+          return typeof v === 'function' ? v.apply(arr, args) : v;
+        }),
+      );
+  },
+});
 // 游标: 链式方法累积, 终结方法 (toArray/forEach/...) 才真去后端查
 const __mkCursor__ = (render, baseMethod, baseArgs) => {
   const chain = [];
@@ -715,9 +734,9 @@ const __mkCursor__ = (render, baseMethod, baseArgs) => {
   const cur = new Proxy(function () {}, {
     get(_, m) {
       const mm = String(m);
-      if (mm === 'toArray') return async () => (await __runRead__(stmt())).documents.map(__hydrate__);
+      if (mm === 'toArray') return () => __thenableArray__((async () => (await __runRead__(stmt())).documents.map(__hydrate__))());
       if (mm === 'forEach') return async (fn) => { for (const d of (await __runRead__(stmt())).documents) fn(__hydrate__(d)); };
-      if (mm === 'map') return async (fn) => (await __runRead__(stmt())).documents.map(__hydrate__).map(fn);
+      if (mm === 'map') return (fn) => __thenableArray__((async () => (await __runRead__(stmt())).documents.map(__hydrate__).map(fn))());
       if (mm === 'count' || mm === 'size' || mm === 'itcount' || mm === 'length')
         return async () => (await __runRead__(stmt())).count;
       if (mm === 'hasNext') return async () => (await __runRead__(stmt())).documents.length > 0;
@@ -738,6 +757,12 @@ const __mkColl__ = (render) => new Proxy({}, {
     if (method === 'find' || method === 'aggregate') {
       return (...args) => __mkCursor__(render, method, args);
     }
+    // distinct 返回数组: 用 thenableArray 让 .distinct(...).map(...) 也能链式
+    if (method === 'distinct') {
+      return (...args) => __thenableArray__((async () =>
+        (await __runRead__(render + '.distinct(' + __renderArgs__(args) + ')')).documents.map(__hydrate__)
+      )());
+    }
     return async (...args) => {
       if (__WRITE__.has(method)) {
         __ops__.push({ collRender: render, method, args });
@@ -750,10 +775,6 @@ const __mkColl__ = (render) => new Proxy({}, {
       if (method === 'countDocuments' || method === 'count' || method === 'estimatedDocumentCount') {
         const r = await __runRead__(render + '.countDocuments(' + __renderArgs__(args) + ')');
         return r.count;
-      }
-      if (method === 'distinct') {
-        const r = await __runRead__(render + '.distinct(' + __renderArgs__(args) + ')');
-        return r.documents.map(__hydrate__);
       }
       // 未知方法当读处理
       const r = await __runRead__(render + '.find(' + __renderArgs__(args) + ')');

@@ -1,4 +1,4 @@
-use mongodb::bson::Document;
+use mongodb::bson::{Bson, Document};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::connection::manager::ConnectionManager;
@@ -93,33 +93,9 @@ pub async fn stream_import(
     let ext = request.file_path.rsplit('.').next().unwrap_or("json").to_lowercase();
     let documents: Vec<Document> = match ext.as_str() {
         "csv" => parse_csv_to_docs(&content)?,
-        "jsonl" => {
-            let mut docs = Vec::new();
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() { continue; }
-                let doc: Document = serde_json::from_str(line)
-                    .map_err(|e| AppError::InvalidInput(format!("JSON Lines 解析失败: {e}")))?;
-                docs.push(doc);
-            }
-            docs
-        }
-        _ => {
-            // JSON: 数组或单个对象
-            let val: serde_json::Value = serde_json::from_str(&content)
-                .map_err(|e| AppError::InvalidInput(format!("JSON 解析失败: {e}")))?;
-            match val {
-                serde_json::Value::Array(arr) => {
-                    arr.into_iter().map(|v| {
-                        serde_json::from_value(v).map_err(|e| AppError::InvalidInput(format!("文档解析失败: {e}")))
-                    }).collect::<Result<Vec<_>, _>>()?
-                }
-                serde_json::Value::Object(_) => {
-                    vec![serde_json::from_value(val).map_err(|e| AppError::InvalidInput(format!("文档解析失败: {e}")))?]
-                }
-                _ => return Err(AppError::InvalidInput("JSON 文件内容必须是数组或对象".into())),
-            }
-        }
+        // json / jsonl / ejson / simple-json 等文本 JSON 一律走同一套解析:
+        // 兼容 数组 / 单对象 / NDJSON(换行分隔多对象, EJSON 导出即此格式)
+        _ => parse_json_docs(&content)?,
     };
 
     let total = documents.len() as u64;
@@ -174,6 +150,80 @@ pub async fn stream_import(
     Ok(imported)
 }
 
+/// 解析 JSON / NDJSON / EJSON 文本为文档列表.
+/// 兼容三种结构:
+///   1) JSON 数组:        `[ {...}, {...} ]`
+///   2) 单个 JSON 对象:    `{...}`
+///   3) NDJSON / 换行或空白分隔的多个对象 (EJSON 导出即此格式): `{...}\n{...}\n...`
+///
+/// 每个值按 `Bson` 反序列化, 保留 Extended JSON 类型 ($oid/$date/$numberLong 等).
+/// 其中 $date 记录的是 UTC 瞬时值 (毫秒/带 Z 的 ISO), 原样回灌, **不做任何时区偏移**.
+fn parse_json_docs(content: &str) -> Result<Vec<Document>, AppError> {
+    let mut docs = Vec::new();
+    // StreamDeserializer 依次读取顶层的多个 JSON 值 (空白/换行分隔), 单个值也适用
+    let stream = serde_json::Deserializer::from_str(content).into_iter::<Bson>();
+    for item in stream {
+        let bson = item.map_err(|e| AppError::InvalidInput(format!("JSON 解析失败: {e}")))?;
+        match bson {
+            Bson::Document(mut d) => { revive_datetimes(&mut d); docs.push(d); }
+            Bson::Array(arr) => {
+                for v in arr {
+                    match v {
+                        Bson::Document(mut d) => { revive_datetimes(&mut d); docs.push(d); }
+                        Bson::Null => continue,
+                        _ => return Err(AppError::InvalidInput("数组元素必须是 JSON 对象".into())),
+                    }
+                }
+            }
+            Bson::Null => continue,
+            _ => return Err(AppError::InvalidInput("每条记录必须是 JSON 对象".into())),
+        }
+    }
+    Ok(docs)
+}
+
+/// 递归把文档里"带时区的 RFC3339 时间戳字符串"还原成 BSON Date.
+/// 用于 Simple JSON / CSV 等把 Date 导成字符串的格式往返: 例如 Simple JSON 把日期
+/// 写成 `2026-01-26T01:52:13.000Z` (UTC), 若原样以字符串导入, 前端按本地时区显示会差几小时.
+///
+/// **只识别严格 RFC3339 且带明确时区 (Z 或 ±HH:MM) 的字符串**; 裸日期 (无时区) 或普通文本
+/// 保持字符串不变, 避免把恰好像日期的普通字段误转成 Date. `$date` 类型的 EJSON 本就已是
+/// Date, 不受影响.
+fn revive_datetimes(doc: &mut Document) {
+    for (_k, v) in doc.iter_mut() {
+        revive_bson(v);
+    }
+}
+
+fn revive_bson(v: &mut Bson) {
+    match v {
+        Bson::String(s) => {
+            if let Some(dt) = str_to_bson_datetime(s) {
+                *v = dt;
+            }
+        }
+        Bson::Document(d) => revive_datetimes(d),
+        Bson::Array(arr) => {
+            for item in arr.iter_mut() {
+                revive_bson(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 严格判断: 带时区的 RFC3339 时间戳字符串 -> Bson::DateTime; 否则 None.
+fn str_to_bson_datetime(s: &str) -> Option<Bson> {
+    // 粗筛: 至少 "YYYY-MM-DDTHH:MM:SSZ" 长度, 且第 10 位是 'T', 减少无谓 parse
+    if s.len() < 20 || s.as_bytes().get(10) != Some(&b'T') {
+        return None;
+    }
+    // parse_from_rfc3339 要求必须带时区 (Z 或 ±HH:MM), 裸时间会被拒绝 —— 正是我们想要的
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| Bson::DateTime(mongodb::bson::DateTime::from_millis(dt.timestamp_millis())))
+}
+
 fn parse_csv_to_docs(content: &str) -> Result<Vec<Document>, AppError> {
     let mut lines = content.lines();
     let header_line = lines.next().ok_or_else(|| AppError::InvalidInput("CSV 文件为空".into()))?;
@@ -201,6 +251,8 @@ fn parse_csv_to_docs(content: &str) -> Result<Vec<Document>, AppError> {
                 doc.insert(h.to_string(), v);
             }
         }
+        // 带时区的 RFC3339 时间字符串还原成 Date (与 JSON 导入一致)
+        revive_datetimes(&mut doc);
         docs.push(doc);
     }
     Ok(docs)
@@ -220,4 +272,99 @@ pub async fn export_query(
 ) -> Result<u64, AppError> {
     let client = mgr.get_client(&request.connection_id).await?;
     exporter::stream_export(&client, &app, &request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mongodb::bson::{doc, DateTime};
+
+    /// 模拟 EJSON 导出的一行: bson Document -> serde_json 字符串 (relaxed extjson)
+    fn ejson_line(d: &Document) -> String {
+        serde_json::to_string(d).unwrap()
+    }
+
+    #[test]
+    fn ndjson_roundtrip_preserves_datetime_utc() {
+        // 一个普通 UTC 瞬时 + 一个 0001-01-01 (超出 relaxed 范围, 走 $numberLong)
+        let ms_normal: i64 = 1_737_884_733_123;
+        let ms_year1: i64 = -62_135_596_800_000; // 0001-01-01T00:00:00Z
+        let d1 = doc! { "_id": 1i32, "t": DateTime::from_millis(ms_normal) };
+        let d2 = doc! { "_id": 2i32, "t": DateTime::from_millis(ms_year1) };
+
+        // EJSON 导出 = 换行分隔的多行 (NDJSON)
+        let content = format!("{}\n{}", ejson_line(&d1), ejson_line(&d2));
+
+        let docs = parse_json_docs(&content).unwrap();
+        assert_eq!(docs.len(), 2);
+        // 日期原样回灌, 无时区偏移
+        assert_eq!(docs[0].get_datetime("t").unwrap().timestamp_millis(), ms_normal);
+        assert_eq!(docs[1].get_datetime("t").unwrap().timestamp_millis(), ms_year1);
+    }
+
+    #[test]
+    fn parses_json_array_and_single_object() {
+        assert_eq!(parse_json_docs(r#"[{"a":1},{"a":2}]"#).unwrap().len(), 2);
+        assert_eq!(parse_json_docs(r#"{"a":1}"#).unwrap().len(), 1);
+        // 末尾多余空行不影响
+        assert_eq!(parse_json_docs("{\"a\":1}\n{\"a\":2}\n").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn preserves_objectid_ext_json() {
+        let content = r#"{"_id":{"$oid":"507f1f77bcf86cd799439011"},"n":1}"#;
+        let docs = parse_json_docs(content).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert!(docs[0].get_object_id("_id").is_ok());
+    }
+
+    #[test]
+    fn simple_json_utc_string_revived_to_datetime() {
+        // Simple JSON 把 Date 导成 UTC 字符串 (…Z); 导入应还原为 Date, 且瞬时值一致
+        let ms: i64 = 1_769_392_333_000; // 2026-01-26T01:52:13Z
+        let content = r#"{"t":"2026-01-26T01:52:13.000Z"}"#;
+        let docs = parse_json_docs(content).unwrap();
+        assert_eq!(docs[0].get_datetime("t").unwrap().timestamp_millis(), ms);
+    }
+
+    #[test]
+    fn local_offset_string_revived_and_instant_preserved() {
+        // 带 +08:00 偏移的字符串: 应还原为同一 UTC 瞬时 (09:52:13+08 == 01:52:13Z)
+        let content = r#"{"t":"2026-01-26T09:52:13.000+08:00"}"#;
+        let docs = parse_json_docs(content).unwrap();
+        assert_eq!(docs[0].get_datetime("t").unwrap().timestamp_millis(), 1_769_392_333_000);
+    }
+
+    #[test]
+    fn naive_or_plain_strings_stay_strings() {
+        // 无时区的裸时间、纯日期、普通文本都不应被误转成 Date
+        let docs = parse_json_docs(
+            r#"{"a":"2026-01-26T09:52:13","b":"2026-01-26","c":"hello world","d":"12345"}"#,
+        )
+        .unwrap();
+        for k in ["a", "b", "c", "d"] {
+            assert!(docs[0].get_str(k).is_ok(), "字段 {k} 应保持字符串");
+        }
+    }
+
+    #[test]
+    fn csv_import_revives_datetime_column() {
+        // CSV 导出的日期是带时区字符串; 导入应还原成 Date, 其它列不受影响
+        let csv = "name,t,note\nfoo,2026-01-26T01:52:13.000Z,hello\n";
+        let docs = parse_csv_to_docs(csv).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].get_str("name").unwrap(), "foo");
+        assert_eq!(docs[0].get_str("note").unwrap(), "hello");
+        assert_eq!(docs[0].get_datetime("t").unwrap().timestamp_millis(), 1_769_392_333_000);
+    }
+
+    #[test]
+    fn revives_nested_datetime_strings() {
+        let content = r#"{"meta":{"created":"2026-01-26T01:52:13.000Z"},"tags":["2026-01-26T01:52:13.000Z"]}"#;
+        let docs = parse_json_docs(content).unwrap();
+        let meta = docs[0].get_document("meta").unwrap();
+        assert!(meta.get_datetime("created").is_ok());
+        let arr = docs[0].get_array("tags").unwrap();
+        assert!(matches!(arr[0], Bson::DateTime(_)));
+    }
 }

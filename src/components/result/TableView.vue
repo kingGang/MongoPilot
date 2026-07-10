@@ -532,6 +532,8 @@ function rowProps(row: Record<string, unknown>) {
   const classes: string[] = [];
   if (props.searchKeyword && matchSet.value.has(rowIdx)) classes.push("row-matched");
   if (props.searchKeyword && rowIdx === props.activeMatchDocIndex) classes.push("row-active-match");
+  const selKey = row.__selectKey as string;
+  if (props.selectedKeys && props.selectedKeys.has(selKey)) classes.push("row-selected");
   return {
     class: classes.join(" ") || undefined,
     "data-doc-index": String(rowIdx),
@@ -638,6 +640,17 @@ async function handleCtxSelect(action: string) {
 .table-view :deep(.n-data-table-td) {
   contain: layout paint;
   transition: none !important;
+}
+/* 鼠标悬停行 —— 淡灰底 */
+.table-view :deep(tr:hover > td) {
+  background-color: rgba(0, 0, 0, 0.04) !important;
+}
+/* 选中行 —— 淡绿底 (与勾选框颜色一致), 悬停时略深 */
+.table-view :deep(tr.row-selected > td) {
+  background-color: rgba(24, 160, 88, 0.1) !important;
+}
+.table-view :deep(tr.row-selected:hover > td) {
+  background-color: rgba(24, 160, 88, 0.16) !important;
 }
 /* 已修改字段标识 —— 浅黄底 + 橙色左条; 翻页 / 重查询时由父组件清除 */
 .table-view :deep(.n-data-table-td.tv-cell-dirty) {

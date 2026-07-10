@@ -32,6 +32,22 @@ pub struct ExportRequest {
     pub date_formats: Option<HashMap<String, String>>,
 }
 
+/// BSON Date -> **本地时区**带偏移的 RFC3339 字符串 (如 `2026-01-26T09:52:13.000+08:00`).
+/// 与前端按本地时区的显示一致, 且带明确偏移量, 导入时能无损还原回同一 UTC 瞬时.
+/// 超出可表示范围时回退为毫秒数字符串.
+/// ejson 格式**不**走这里 —— 它保留 BSON 的 $date (UTC), 作为精确交换格式.
+fn bson_datetime_to_local_rfc3339(dt: &mongodb::bson::DateTime) -> String {
+    let millis = dt.timestamp_millis();
+    let secs = millis / 1000;
+    let nsecs = ((millis % 1000) * 1_000_000) as u32;
+    match chrono::DateTime::from_timestamp(secs, nsecs) {
+        Some(utc) => utc
+            .with_timezone(&chrono::Local)
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
+        None => millis.to_string(),
+    }
+}
+
 /// 把单个 BSON 值按 override 类型强制转换为另一个 BSON 值.
 /// 失败 (如把 ObjectId 转 number) 落到 Bson::Null.
 fn apply_override(val: &Bson, override_type: &str) -> Bson {
@@ -44,16 +60,7 @@ fn apply_override(val: &Bson, override_type: &str) -> Bson {
             Bson::Int64(n) => Bson::String(n.to_string()),
             Bson::Double(n) => Bson::String(n.to_string()),
             Bson::Boolean(b) => Bson::String(b.to_string()),
-            Bson::DateTime(dt) => {
-                let millis = dt.timestamp_millis();
-                let secs = millis / 1000;
-                let nsecs = ((millis % 1000) * 1_000_000) as u32;
-                if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
-                    Bson::String(dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-                } else {
-                    Bson::String(millis.to_string())
-                }
-            }
+            Bson::DateTime(dt) => Bson::String(bson_datetime_to_local_rfc3339(dt)),
             Bson::Decimal128(d) => Bson::String(d.to_string()),
             other => Bson::String(
                 serde_json::to_string(&bson_to_simple(other)).unwrap_or_default(),
@@ -106,16 +113,7 @@ struct ExportProgress {
 fn bson_to_simple(val: &Bson) -> serde_json::Value {
     match val {
         Bson::ObjectId(oid) => serde_json::Value::String(oid.to_hex()),
-        Bson::DateTime(dt) => {
-            let millis = dt.timestamp_millis();
-            let secs = millis / 1000;
-            let nsecs = ((millis % 1000) * 1_000_000) as u32;
-            if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
-                serde_json::Value::String(dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-            } else {
-                serde_json::Value::String(millis.to_string())
-            }
-        }
+        Bson::DateTime(dt) => serde_json::Value::String(bson_datetime_to_local_rfc3339(dt)),
         Bson::Int32(n) => serde_json::json!(*n),
         Bson::Int64(n) => serde_json::Value::String(n.to_string()),
         Bson::Double(n) => serde_json::json!(*n),
@@ -520,8 +518,12 @@ fn bson_dt_to_excel(dt: &mongodb::bson::DateTime) -> Option<ExcelDateTime> {
     let secs = millis / 1000;
     let nsecs = ((millis % 1000) * 1_000_000) as u32;
     let cdt = chrono::DateTime::from_timestamp(secs, nsecs)?;
-    // parse_from_str 支持 "yyyy-mm-ddThh:mm:ss.sss"; 用 naive 表示避免时区后缀
-    let iso = cdt.naive_utc().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+    // Excel 无时区概念: 写入本地时区的墙钟时间, 与应用内显示一致 (原来写的是 UTC, 会差几小时)
+    let iso = cdt
+        .with_timezone(&chrono::Local)
+        .naive_local()
+        .format("%Y-%m-%dT%H:%M:%S%.3f")
+        .to_string();
     ExcelDateTime::parse_from_str(&iso).ok()
 }
 
@@ -571,5 +573,36 @@ fn write_bson_to_cell(
             let s = serde_json::to_string(&bson_to_simple(val)).unwrap_or_default();
             ws.write_string(row, col, &s).ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mongodb::bson::DateTime;
+
+    /// 无论构建机器在哪个时区, 本地 RFC3339 字符串都带偏移量, 解析回来必须是同一 UTC 瞬时.
+    #[test]
+    fn local_rfc3339_roundtrips_to_same_instant() {
+        for ms in [1_769_392_333_000i64, 0, 1_609_459_200_123, -62_135_596_800_000] {
+            let s = bson_datetime_to_local_rfc3339(&DateTime::from_millis(ms));
+            let back = chrono::DateTime::parse_from_rfc3339(&s)
+                .unwrap_or_else(|_| panic!("应能解析: {s}"))
+                .timestamp_millis();
+            assert_eq!(back, ms, "字符串 {s} 应还原为同一瞬时");
+        }
+    }
+
+    /// bson_to_simple 的日期输出也应带偏移量并可还原
+    #[test]
+    fn simple_date_output_has_offset_and_roundtrips() {
+        let v = bson_to_simple(&Bson::DateTime(DateTime::from_millis(1_769_392_333_000)));
+        let s = v.as_str().unwrap();
+        // 带 Z 或 ±HH:MM 偏移
+        assert!(s.ends_with('Z') || s.contains('+') || s[19..].contains('-'), "应含时区: {s}");
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis(),
+            1_769_392_333_000
+        );
     }
 }
