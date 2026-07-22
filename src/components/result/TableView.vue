@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, h, ref, shallowRef, nextTick, watch } from "vue";
+import { computed, h, ref, shallowRef, nextTick, watch, onBeforeUnmount } from "vue";
 import { NDataTable, NDropdown, useMessage } from "naive-ui";
 import type { DataTableColumns, DataTableColumn } from "naive-ui";
-import { getBsonType, formatBsonCell, getValueColor } from "@/utils/bson-format";
+import { getBsonType, formatBsonCell, getValueColor, objectIdHoverText } from "@/utils/bson-format";
 import { highlightKeyword } from "@/utils/text-highlight";
 import * as docApi from "@/api/document";
 import ValueDetail from "./ValueDetail.vue";
@@ -226,10 +226,107 @@ function isEditing(rowIdx: number, key: string): boolean {
   return editingRow.value === rowIdx && editingKey.value === key;
 }
 
-function objectPreview(val: unknown): string {
-  try { return JSON.stringify(val, null, 2).slice(0, 300); }
-  catch { return String(val); }
+// ---- 复杂单元格 hover 浮层 (Document / Array): 完整内容 + 逐字段可复制 ----
+// 换掉原来的原生 title (会被视口裁掉、无法选中复制) + objectPreview 300 字截断。
+// 单实例 Teleport 浮层, 只在 mouseenter/leave 时切换, 不给每格挂组件, 拖列不卡。
+const hoverShow = ref(false);
+const hoverX = ref(0);
+const hoverY = ref(0);
+const hoverValue = shallowRef<unknown>(null);
+let hoverHideTimer: ReturnType<typeof setTimeout> | null = null;
+
+interface HoverRow {
+  label: string;
+  preview: string;
+  color: string;
+  raw: unknown;
 }
+
+const hoverTitle = computed(() => {
+  const val = hoverValue.value;
+  if (Array.isArray(val)) return `Array · ${val.length} 项`;
+  if (val && typeof val === "object") return `Document · ${Object.keys(val).length} 字段`;
+  return "";
+});
+
+function fieldPreview(v: unknown, t: string): string {
+  if (v === null || v === undefined) return "null";
+  if (t === "Document") return `{${Object.keys(v as object).length} fields}`;
+  if (t === "Array") return `[${(v as unknown[]).length}]`;
+  const s = formatBsonCell(v);
+  return s.length > 200 ? s.slice(0, 200) + "…" : s;
+}
+
+const hoverRows = computed<HoverRow[]>(() => {
+  const val = hoverValue.value;
+  if (val === null || typeof val !== "object") return [];
+  const entries: [string, unknown][] = Array.isArray(val)
+    ? (val as unknown[]).map((v, i) => [`[${i}]`, v] as [string, unknown])
+    : Object.entries(val as Record<string, unknown>);
+  return entries.map(([k, v]) => {
+    const t = getBsonType(v);
+    return { label: k, preview: fieldPreview(v, t), color: getValueColor(t), raw: v };
+  });
+});
+
+const hoverStyle = computed(() => {
+  const pad = 12;
+  const w = 460;
+  const hMax = 380;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  let left = hoverX.value + pad;
+  if (left + w > vw - 8) left = hoverX.value - w - pad; // 右边放不下 -> 翻到光标左边
+  if (left < 8) left = Math.max(8, vw - w - 8);
+  let top = hoverY.value + pad;
+  if (top + hMax > vh - 8) top = Math.max(8, vh - hMax - 8);
+  return { left: `${left}px`, top: `${top}px`, width: `${w}px`, maxHeight: `${hMax}px` };
+});
+
+function showHover(e: MouseEvent, val: unknown) {
+  if (hoverHideTimer) {
+    clearTimeout(hoverHideTimer);
+    hoverHideTimer = null;
+  }
+  hoverValue.value = val;
+  hoverX.value = e.clientX;
+  hoverY.value = e.clientY;
+  hoverShow.value = true;
+}
+function scheduleHideHover() {
+  if (hoverHideTimer) clearTimeout(hoverHideTimer);
+  hoverHideTimer = setTimeout(() => {
+    hoverShow.value = false;
+    hoverHideTimer = null;
+  }, 160);
+}
+function cancelHideHover() {
+  if (hoverHideTimer) {
+    clearTimeout(hoverHideTimer);
+    hoverHideTimer = null;
+  }
+}
+async function copyText(text: string, okMsg: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    message.success(okMsg);
+  } catch {
+    message.error("复制失败");
+  }
+}
+function copyHoverAll() {
+  try {
+    copyText(JSON.stringify(hoverValue.value, null, 2), "已复制 JSON");
+  } catch {
+    message.error("复制失败");
+  }
+}
+function copyHoverField(row: HoverRow) {
+  const v = row.raw;
+  const text = v !== null && typeof v === "object" ? JSON.stringify(v) : formatBsonCell(v);
+  copyText(text, `已复制 ${row.label}`);
+}
+onBeforeUnmount(() => cancelHideHover());
 
 /** 列宽持久化: key -> width. 拖动结束 snapshot 一次, 下次重建列时沿用 */
 const colWidthMap = ref<Record<string, number>>({});
@@ -381,7 +478,7 @@ watch(
             : formatBsonCell(val);
           return h("span", {
             style: "color:#c678dd;cursor:pointer",
-            title: oid,
+            title: type === "ObjectId" ? objectIdHoverText(val) : oid,
             innerHTML: props.searchKeyword
               ? highlightKeyword(oid, props.searchKeyword, !!props.matchCase)
               : oid,
@@ -440,20 +537,24 @@ watch(
             : `[${(val as unknown[]).length}]`;
           return h("span", {
             style: "color:#61afef;cursor:pointer",
-            title: objectPreview(val),
+            onMouseenter: (e: MouseEvent) => showHover(e, val),
+            onMouseleave: () => scheduleHideHover(),
             onClick: (e: MouseEvent) => {
               e.stopPropagation();
+              hoverShow.value = false;
               openDetail(key, val, row);
             },
           }, label);
         }
 
-        // 简单类型: 双击进入编辑; 原生 title 悬停看完整内容 (列窄被截断时)
+        // 简单类型: 双击进入编辑; 原生 title 悬停看完整内容 (列窄被截断时)。
+        // ObjectId 的 title 额外带上内嵌创建时间。
         const text = formatBsonCell(val);
+        const cellTitle = type === "ObjectId" ? objectIdHoverText(val) : text;
         if (props.searchKeyword) {
           return h("span", {
             style: `${color ? `color:${color};` : ""}cursor:text`,
-            title: text,
+            title: cellTitle,
             innerHTML: highlightKeyword(text, props.searchKeyword, !!props.matchCase),
             onDblclick: (e: MouseEvent) => {
               e.stopPropagation();
@@ -463,7 +564,7 @@ watch(
         }
         return h("span", {
           style: `${color ? `color:${color};` : ""}cursor:text`,
-          title: text,
+          title: cellTitle,
           onDblclick: (e: MouseEvent) => {
             e.stopPropagation();
             startEdit(rowIdx, key, val, type);
@@ -629,6 +730,34 @@ async function handleCtxSelect(action: string) {
       @select="handleCtxSelect"
       @clickoutside="showCtxMenu = false"
     />
+    <Teleport to="body">
+      <div
+        v-if="hoverShow"
+        class="cell-hover-float"
+        :style="hoverStyle"
+        @mouseenter="cancelHideHover"
+        @mouseleave="scheduleHideHover"
+      >
+        <div class="cell-hover-head">
+          <span class="chh-title">{{ hoverTitle }}</span>
+          <button class="chh-copy-all" @click="copyHoverAll">复制 JSON</button>
+        </div>
+        <div class="cell-hover-body">
+          <div
+            v-for="(row, i) in hoverRows"
+            :key="i"
+            class="chh-row"
+            :title="'点击复制 ' + row.label"
+            @click="copyHoverField(row)"
+          >
+            <span class="chh-key">{{ row.label }}</span>
+            <span class="chh-colon">:</span>
+            <span class="chh-val" :style="{ color: row.color || undefined }">{{ row.preview }}</span>
+            <span class="chh-copy-icon">⧉</span>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -710,5 +839,86 @@ async function handleCtxSelect(action: string) {
   font-size: 12px;
   background: #fff;
   box-sizing: border-box;
+}
+
+/* 复杂单元格 hover 浮层 (Teleport 到 body) */
+.cell-hover-float {
+  position: fixed;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border: 1px solid #e0e0e6;
+  border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.16);
+  overflow: hidden;
+  font-size: 12px;
+}
+.cell-hover-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #eee;
+  background: #fafafa;
+}
+.chh-title {
+  font-weight: 600;
+  color: #666;
+}
+.chh-copy-all {
+  flex: 0 0 auto;
+  border: 1px solid #d0d0d6;
+  background: #fff;
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: #333;
+  cursor: pointer;
+}
+.chh-copy-all:hover {
+  background: #f0f0f0;
+}
+.cell-hover-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 0;
+}
+.chh-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+  font-family: "Consolas", "Menlo", monospace;
+  white-space: nowrap;
+}
+.chh-row:hover {
+  background: #f2f6ff;
+}
+.chh-key {
+  flex: 0 0 auto;
+  color: #c678dd;
+}
+.chh-colon {
+  flex: 0 0 auto;
+  color: #999;
+}
+.chh-val {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chh-copy-icon {
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: #ccc;
+}
+.chh-row:hover .chh-copy-icon {
+  color: #61afef;
 }
 </style>

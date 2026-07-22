@@ -84,6 +84,138 @@ pub async fn drop_collection(
     Ok(())
 }
 
+/// 把一个集合的全部文档 + 非 `_id_` 索引复制到目标集合, 返回复制的文档数.
+/// 调用方需保证 dst 为空/新建. 供 "复制集合" 与 "重命名数据库" 复用.
+pub(crate) async fn copy_collection_contents(
+    src: &mongodb::Collection<Document>,
+    dst: &mongodb::Collection<Document>,
+) -> Result<i64, AppError> {
+    use futures::StreamExt;
+    // 1) 复制文档 (分批 insert_many, 保留原始 _id)
+    let mut cursor = src.find(doc! {}).await.map_err(AppError::Mongo)?;
+    let mut batch: Vec<Document> = Vec::new();
+    let mut total = 0i64;
+    while let Some(d) = cursor.next().await {
+        batch.push(d.map_err(AppError::Mongo)?);
+        if batch.len() >= 1000 {
+            total += batch.len() as i64;
+            dst.insert_many(std::mem::take(&mut batch))
+                .await
+                .map_err(AppError::Mongo)?;
+        }
+    }
+    if !batch.is_empty() {
+        total += batch.len() as i64;
+        dst.insert_many(batch).await.map_err(AppError::Mongo)?;
+    }
+    // 2) 复制索引 (跳过默认 _id_)
+    let mut idx_cursor = src.list_indexes().await.map_err(AppError::Mongo)?;
+    let mut models: Vec<IndexModel> = Vec::new();
+    while let Some(idx) = idx_cursor.next().await {
+        let idx = idx.map_err(AppError::Mongo)?;
+        let is_id = idx
+            .options
+            .as_ref()
+            .and_then(|o| o.name.as_deref())
+            .map(|n| n == "_id_")
+            .unwrap_or(false);
+        if !is_id {
+            models.push(idx);
+        }
+    }
+    if !models.is_empty() {
+        dst.create_indexes(models).await.map_err(AppError::Mongo)?;
+    }
+    Ok(total)
+}
+
+/// 重命名集合: `renameCollection` (admin 库命令). 同库内改名, 瞬时完成.
+#[tauri::command]
+pub async fn rename_collection(
+    mgr: State<'_, ConnectionManager>,
+    connection_id: String,
+    database: String,
+    old_name: String,
+    new_name: String,
+    drop_target: Option<bool>,
+) -> Result<(), AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许重命名集合".into()));
+    }
+    if new_name.trim().is_empty() {
+        return Err(AppError::InvalidInput("新集合名不能为空".into()));
+    }
+    if old_name == new_name {
+        return Err(AppError::InvalidInput("新集合名不能与原名相同".into()));
+    }
+    let client = mgr.get_client(&connection_id).await?;
+    // renameCollection 必须对 admin 库执行, 命名空间用 "db.coll" 全称.
+    client
+        .database("admin")
+        .run_command(doc! {
+            "renameCollection": format!("{database}.{old_name}"),
+            "to": format!("{database}.{new_name}"),
+            "dropTarget": drop_target.unwrap_or(false),
+        })
+        .await
+        .map_err(AppError::Mongo)?;
+    Ok(())
+}
+
+/// 复制/克隆集合: 把文档 + 索引拷到同库下一个新集合. 返回复制的文档数.
+#[tauri::command]
+pub async fn duplicate_collection(
+    mgr: State<'_, ConnectionManager>,
+    connection_id: String,
+    database: String,
+    source_name: String,
+    target_name: String,
+) -> Result<i64, AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许复制集合".into()));
+    }
+    if target_name.trim().is_empty() {
+        return Err(AppError::InvalidInput("目标集合名不能为空".into()));
+    }
+    if source_name == target_name {
+        return Err(AppError::InvalidInput("目标集合名不能与源集合相同".into()));
+    }
+    let client = mgr.get_client(&connection_id).await?;
+    let db = client.database(&database);
+    let existing = db.list_collection_names().await.map_err(AppError::Mongo)?;
+    if existing.iter().any(|n| n == &target_name) {
+        return Err(AppError::InvalidInput(format!(
+            "集合 \"{target_name}\" 已存在"
+        )));
+    }
+    // 先建空集合 (源集合无文档时也能落地)
+    db.create_collection(&target_name)
+        .await
+        .map_err(AppError::Mongo)?;
+    let src = db.collection::<Document>(&source_name);
+    let dst = db.collection::<Document>(&target_name);
+    copy_collection_contents(&src, &dst).await
+}
+
+/// 清空集合: 删除全部文档, 保留集合与索引. 返回删除的文档数.
+#[tauri::command]
+pub async fn remove_all_documents(
+    mgr: State<'_, ConnectionManager>,
+    connection_id: String,
+    database: String,
+    collection_name: String,
+) -> Result<i64, AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许清空集合".into()));
+    }
+    let client = mgr.get_client(&connection_id).await?;
+    let coll = client
+        .database(&database)
+        .collection::<Document>(&collection_name);
+    let r = coll.delete_many(doc! {}).await.map_err(AppError::Mongo)?;
+    Ok(r.deleted_count as i64)
+}
+
 #[tauri::command]
 pub async fn get_collection_stats(
     mgr: State<'_, ConnectionManager>,

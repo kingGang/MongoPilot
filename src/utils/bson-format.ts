@@ -83,6 +83,35 @@ function formatOid(val: unknown): string {
   return String(val);
 }
 
+/** 从 ObjectId 提取内嵌的创建时间 (前 4 字节 = Unix 秒). 非法/非 ObjectId 返回 null. */
+export function objectIdCreatedAt(val: unknown): Date | null {
+  let hex: string | null = null;
+  if (typeof val === "string") hex = val;
+  else if (typeof val === "object" && val !== null) {
+    const oid = (val as Record<string, unknown>).$oid;
+    if (typeof oid === "string") hex = oid;
+  }
+  if (!hex || hex.length < 8) return null;
+  const secs = parseInt(hex.slice(0, 8), 16);
+  if (isNaN(secs)) return null;
+  const d = new Date(secs * 1000);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+/** ObjectId 的 hover 文本: `ObjectId("hex")` + 内嵌创建时间 (多行, 供原生 title 用). */
+export function objectIdHoverText(val: unknown): string {
+  const hex =
+    typeof val === "string"
+      ? val
+      : typeof val === "object" && val !== null
+        ? String((val as Record<string, unknown>).$oid ?? "")
+        : "";
+  const base = `ObjectId("${hex}")`;
+  const d = objectIdCreatedAt(val);
+  if (!d) return base;
+  return `${base}\n创建时间: ${formatDateStr(d)} — ${relativeTime(d)}`;
+}
+
 // ---- 统一格式化 ----
 
 /** 将任意 BSON 值格式化为人类可读字符串 */

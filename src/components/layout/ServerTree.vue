@@ -651,6 +651,8 @@ const ctxMenuOptions = computed(() => {
       { label: "新建查询", key: "new-query-db" },
       { label: "创建集合...", key: "create-coll" },
       { type: "divider" as const, key: "d2" },
+      { label: "重命名数据库...", key: "rename-db" },
+      { type: "divider" as const, key: "d2b" },
       { label: "刷新", key: "refresh-db" },
       { type: "divider" as const, key: "d3" },
       { label: "删除数据库", key: "drop-db" },
@@ -660,6 +662,9 @@ const ctxMenuOptions = computed(() => {
     return [
       { label: "查询", key: "query-coll" },
       { type: "divider" as const, key: "d4a" },
+      { label: "重命名集合...", key: "rename-coll" },
+      { label: "复制集合...", key: "duplicate-coll" },
+      { type: "divider" as const, key: "d4a2" },
       { label: "导入数据...", key: "import-coll" },
       { label: "导出数据...", key: "export-coll" },
       { type: "divider" as const, key: "d4b" },
@@ -667,6 +672,7 @@ const ctxMenuOptions = computed(() => {
       { type: "divider" as const, key: "d4c" },
       { label: "刷新", key: "refresh-coll-parent" },
       { type: "divider" as const, key: "d4" },
+      { label: "清空集合...", key: "truncate-coll" },
       { label: "删除集合", key: "drop-coll" },
     ];
   }
@@ -832,6 +838,7 @@ async function handleIndexCreated() {
 const WRITE_ACTIONS = new Set<string>([
   "create-db",
   "create-coll", "drop-db", "drop-coll",
+  "rename-db", "rename-coll", "duplicate-coll", "truncate-coll",
   "add-index", "add-index-from-idx",
   "rebuild-indexes", "drop-indexes",
   "update-index", "drop-this-index",
@@ -1213,6 +1220,116 @@ async function handleCtxSelect(action: string) {
           message.success(`集合 ${collName} 已删除`);
           await refreshDb(connId, dbName);
         } catch (e) { message.error(`删除失败: ${e}`); }
+      },
+    });
+  }
+
+  if (action === "rename-coll" && nodeKey.startsWith("coll:")) {
+    const { connId, dbName, collName } = parseCollKey(nodeKey);
+    dlg.create({
+      title: "重命名集合",
+      content: () => h("div", { style: "display:flex;flex-direction:column;gap:8px" }, [
+        h("p", { style: "margin:0;font-size:12px;color:#999" }, `把集合 "${collName}" 重命名为:`),
+        h("input", {
+          id: "__rename_coll_input",
+          value: collName,
+          style: "width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px",
+          placeholder: "新集合名称",
+        }),
+      ]),
+      positiveText: "重命名",
+      negativeText: "取消",
+      onPositiveClick: async () => {
+        const newName = (document.getElementById("__rename_coll_input") as HTMLInputElement | null)?.value?.trim();
+        if (!newName) { message.warning("请输入新集合名称"); return false; }
+        if (newName === collName) { message.warning("新名称与原名相同"); return false; }
+        try {
+          await collApi.renameCollection(connId, dbName, collName, newName);
+          message.success(`集合已重命名为 ${newName}`);
+          await refreshDb(connId, dbName);
+        } catch (e) { message.error(`重命名失败: ${e}`); }
+      },
+    });
+  }
+
+  if (action === "duplicate-coll" && nodeKey.startsWith("coll:")) {
+    const { connId, dbName, collName } = parseCollKey(nodeKey);
+    dlg.create({
+      title: "复制集合",
+      content: () => h("div", { style: "display:flex;flex-direction:column;gap:8px" }, [
+        h("p", { style: "margin:0;font-size:12px;color:#999;line-height:1.5" },
+          `把 "${collName}" 的文档和索引复制到同库下的新集合:`),
+        h("input", {
+          id: "__dup_coll_input",
+          value: `${collName}_copy`,
+          style: "width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px",
+          placeholder: "新集合名称",
+        }),
+      ]),
+      positiveText: "复制",
+      negativeText: "取消",
+      onPositiveClick: async () => {
+        const target = (document.getElementById("__dup_coll_input") as HTMLInputElement | null)?.value?.trim();
+        if (!target) { message.warning("请输入新集合名称"); return false; }
+        if (target === collName) { message.warning("新名称不能与源集合相同"); return false; }
+        const loading = message.loading("正在复制集合...", { duration: 0 });
+        try {
+          const n = await collApi.duplicateCollection(connId, dbName, collName, target);
+          loading.destroy();
+          message.success(`已复制到 ${target}（${n} 个文档）`);
+          await refreshDb(connId, dbName);
+        } catch (e) { loading.destroy(); message.error(`复制失败: ${e}`); }
+      },
+    });
+  }
+
+  if (action === "truncate-coll" && nodeKey.startsWith("coll:")) {
+    const { connId, dbName, collName } = parseCollKey(nodeKey);
+    dlg.warning({
+      title: "清空集合",
+      content: `确定要删除集合 "${collName}" 的所有文档吗？集合与索引会保留，但数据不可恢复！`,
+      positiveText: "清空",
+      negativeText: "取消",
+      onPositiveClick: async () => {
+        try {
+          const n = await collApi.removeAllDocuments(connId, dbName, collName);
+          message.success(`已清空 ${collName}（删除 ${n} 个文档）`);
+          await refreshDb(connId, dbName);
+        } catch (e) { message.error(`清空失败: ${e}`); }
+      },
+    });
+  }
+
+  if (action === "rename-db" && nodeKey.startsWith("db:")) {
+    const { connId, dbName } = parseDbKey(nodeKey);
+    dlg.create({
+      title: "重命名数据库",
+      content: () => h("div", { style: "display:flex;flex-direction:column;gap:8px" }, [
+        h("p", { style: "margin:0;font-size:12px;color:#e0803a;line-height:1.5" },
+          "MongoDB 无原生重命名库命令：会把本库所有集合(文档+索引)复制到新库名，再删除旧库。大库会较慢。"),
+        h("input", {
+          id: "__rename_db_input",
+          value: dbName,
+          style: "width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px",
+          placeholder: "新数据库名称",
+        }),
+      ]),
+      positiveText: "重命名",
+      negativeText: "取消",
+      onPositiveClick: async () => {
+        const newName = (document.getElementById("__rename_db_input") as HTMLInputElement | null)?.value?.trim();
+        if (!newName) { message.warning("请输入新数据库名称"); return false; }
+        if (newName === dbName) { message.warning("新名称与原名相同"); return false; }
+        if (/[/\\. "$*<>:|?]/.test(newName)) { message.warning('数据库名不能含 / \\ . " $ * < > : | ? 及空格'); return false; }
+        const exists = dbStore.getDatabases(connId).some((d) => d.name === newName);
+        if (exists) { message.warning(`数据库 "${newName}" 已存在`); return false; }
+        const loading = message.loading("正在重命名数据库（复制集合中）...", { duration: 0 });
+        try {
+          const r = await dbApi.renameDatabase(connId, dbName, newName);
+          loading.destroy();
+          message.success(`已重命名为 ${newName}（复制 ${r.copiedCollections} 个集合 / ${r.copiedDocuments} 个文档）`);
+          await refreshConnection(connId);
+        } catch (e) { loading.destroy(); message.error(`重命名失败: ${e}`); }
       },
     });
   }

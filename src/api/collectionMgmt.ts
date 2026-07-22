@@ -17,6 +17,41 @@ export async function dropCollection(
   return invoke("drop_collection", { connectionId, database, collectionName });
 }
 
+/** 重命名集合 (renameCollection, 同库内改名). */
+export async function renameCollection(
+  connectionId: string,
+  database: string,
+  oldName: string,
+  newName: string,
+  dropTarget = false,
+): Promise<void> {
+  return invoke("rename_collection", { connectionId, database, oldName, newName, dropTarget });
+}
+
+/** 复制/克隆集合 (文档 + 索引 拷到同库新集合). 返回复制的文档数. */
+export async function duplicateCollection(
+  connectionId: string,
+  database: string,
+  sourceName: string,
+  targetName: string,
+): Promise<number> {
+  return invoke<number>("duplicate_collection", {
+    connectionId,
+    database,
+    sourceName,
+    targetName,
+  });
+}
+
+/** 清空集合 (删除全部文档, 保留集合与索引). 返回删除的文档数. */
+export async function removeAllDocuments(
+  connectionId: string,
+  database: string,
+  collectionName: string,
+): Promise<number> {
+  return invoke<number>("remove_all_documents", { connectionId, database, collectionName });
+}
+
 export async function getCollectionStats(
   connectionId: string,
   database: string,

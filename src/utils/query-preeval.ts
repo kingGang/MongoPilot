@@ -501,6 +501,9 @@ const WRITE_METHODS = new Set([
   "findOneAndUpdate",
   "findOneAndReplace",
   "findOneAndDelete",
+  // 索引 DDL: 后端执行器现已支持, 脚本模式按写操作收集 (否则会被当成 find 误跑)
+  "createIndex",
+  "dropIndex",
 ]);
 
 /** 去掉 mongosh 的 `use xxx` 行 (不是合法 JS), 换成空行保持行号 */

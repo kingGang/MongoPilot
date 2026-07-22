@@ -1,5 +1,5 @@
 import { defineStore, acceptHMRUpdate } from "pinia";
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
 import type { EditorTab, ResultTab, ResultTabKind, TabExecutor } from "@/types/database";
 import * as queryApi from "@/api/query";
 import * as collApi from "@/api/collectionMgmt";
@@ -487,16 +487,26 @@ export const useEditorStore = defineStore("editor", () => {
       return;
     }
 
-    // 选中的不是直接以 db. 开头 (例如选了 "helper 函数 + 一条查询" 整段):
-    //   - 里面有 db.xxx 语句  -> 抽出最后一条当作要跑的查询, 走预求值
+    // 选中的不是直接以 db. 开头 (例如选了 "helper 函数 + 查询" 整段):
+    //   - 里面有多条 db.xxx 语句 -> 逐条顺序执行 (迁移脚本 = helper + 一堆 createIndex)
+    //   - 里面只有一条 db.xxx    -> 抽出那条走预求值 (helper + 单查询的调试场景)
     //   - 完全没有 db 语句、又有 helper/load -> 走脚本模式, 但**只跑选区**:
     //     拼 "tab.content 里的纯 helper (函数 + 字面量 var)" + "选区" 成迷你脚本.
     //     这样脚本里其它 print() / db read / 控制流不会被跑掉.
     let runText = text;
     if (!stripped.startsWith("db.") && !stripped.startsWith("use ")) {
       const dbStmts = extractDbStatements(text);
-      if (dbStmts.length > 0) {
-        runText = dbStmts[dbStmts.length - 1];
+      if (dbStmts.length > 1) {
+        // 多条 db 语句 -> 逐条执行, 每条一个结果 tab.
+        // (之前这里只取最后一条 dbStmts[length-1], 前面所有语句被静默丢弃 ->
+        //  全选一个多语句迁移脚本点 Run 时, 只有最后一条 createIndex 生效。)
+        for (const s of dbStmts) {
+          await executeQuery(editorTabId, s);
+        }
+        return;
+      }
+      if (dbStmts.length === 1) {
+        runText = dbStmts[0];
       } else if (needsPreEvaluation(tab.content)) {
         // 用户跑整段时, text 已经包含整个脚本 -> 不需要拼 miniScript (拼 helper + 选区
         // 是为了 "选了非 db.* 行只跑选区" 场景). 整段直接走 executeScript 用默认
@@ -845,6 +855,89 @@ export const useEditorStore = defineStore("editor", () => {
     if (s.includes("输入无效")) return s;
     return s;
   }
+
+  // ---- 编辑器 tab 持久化 (localStorage): 关闭 / 重启后自动恢复打开的 tab ----
+  // 只存轻量身份字段 + content; resultTabs / loading 等运行态不存 (恢复后为空).
+  const TABS_PERSIST_KEY = "mongopilot:editor:open-tabs:v1";
+
+  interface PersistedTab {
+    id: string;
+    title: string;
+    connectionId: string;
+    database: string;
+    collection: string;
+    content: string;
+    executor?: TabExecutor;
+    skipLint?: boolean;
+  }
+
+  function serializeOpenTabs(): string {
+    const payload = {
+      tabs: tabs.value.map<PersistedTab>((t) => ({
+        id: t.id,
+        title: t.title,
+        connectionId: t.connectionId,
+        database: t.database,
+        collection: t.collection,
+        content: t.content,
+        executor: t.executor,
+        skipLint: t.skipLint,
+      })),
+      activeTabId: activeTabId.value,
+    };
+    return JSON.stringify(payload);
+  }
+
+  function loadPersistedTabs() {
+    let raw: string | null = null;
+    try {
+      raw = localStorage.getItem(TABS_PERSIST_KEY);
+    } catch {
+      return; // localStorage 不可用 -> 放弃恢复
+    }
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw) as { tabs?: PersistedTab[]; activeTabId?: string | null };
+      if (!parsed || !Array.isArray(parsed.tabs) || parsed.tabs.length === 0) return;
+      tabs.value = parsed.tabs
+        .filter((t) => t && typeof t.id === "string")
+        .map((t) => ({
+          id: t.id,
+          title: String(t.title ?? "Query"),
+          connectionId: String(t.connectionId ?? ""),
+          database: String(t.database ?? ""),
+          collection: String(t.collection ?? ""),
+          content: String(t.content ?? ""),
+          resultTabs: [],
+          activeResultTabId: null,
+          executor: t.executor,
+          skipLint: t.skipLint,
+        }));
+      const wanted = parsed.activeTabId;
+      activeTabId.value =
+        wanted && tabs.value.some((t) => t.id === wanted) ? wanted : (tabs.value[0]?.id ?? null);
+    } catch {
+      /* 解析失败 -> 保持空, 不阻断启动 */
+    }
+  }
+
+  // 启动时恢复上次打开的 tab
+  loadPersistedTabs();
+
+  // tab 身份 / 内容 / 激活项变化 -> 防抖写回 localStorage.
+  // 用 computed 只读取轻量字段, 依赖不含 resultTabs —— 查询结果变化不触发持久化.
+  const openTabsSignature = computed(() => serializeOpenTabs());
+  let persistTimer: ReturnType<typeof setTimeout> | null = null;
+  watch(openTabsSignature, (sig) => {
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => {
+      try {
+        localStorage.setItem(TABS_PERSIST_KEY, sig);
+      } catch {
+        /* 配额满 / 不可用 -> 忽略 */
+      }
+    }, 400);
+  });
 
   return {
     tabs,

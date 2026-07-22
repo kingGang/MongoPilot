@@ -1,4 +1,4 @@
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{doc, Bson, Document};
 use mongodb::Client;
 use serde::Serialize;
 
@@ -380,6 +380,10 @@ pub async fn execute_shell_query(
         execute_delete(&collection, rest, "deleteMany", true).await?
     } else if rest.starts_with("replaceOne(") {
         execute_replace_one(&collection, rest).await?
+    } else if rest.starts_with("createIndex(") {
+        execute_create_index(&collection, rest).await?
+    } else if rest.starts_with("dropIndex(") {
+        execute_drop_index(&collection, rest).await?
     } else {
         return Err(AppError::InvalidInput(format!("不支持的操作: {rest}")));
     };
@@ -808,6 +812,119 @@ async fn execute_replace_one(
         execution_time_ms: 0,
         pending_count: None,
     })
+}
+
+// ---- createIndex ----
+
+/// `db.coll.createIndex(keys)` 或 `db.coll.createIndex(keys, options)`.
+/// 支持的 options: name / unique / sparse / background / expireAfterSeconds /
+/// partialFilterExpression. 其它 mongosh option 暂忽略 (不报错), 覆盖迁移脚本常见写法.
+async fn execute_create_index(
+    collection: &mongodb::Collection<Document>,
+    rest: &str,
+) -> Result<QueryResult, AppError> {
+    let arg_str = extract_parens(rest, "createIndex")?;
+    // 拆成 (keys, options?); 只有 keys 时 split_two_args 返回 Err, 退化成单参.
+    let (keys_str, opts_str) = match split_two_args(&arg_str) {
+        Ok((k, o)) => (k, Some(o)),
+        Err(_) => (arg_str.clone(), None),
+    };
+    let keys = parse_json_arg(&keys_str)?;
+    if keys.is_empty() {
+        return Err(AppError::InvalidInput(
+            "createIndex 需要至少一个索引键, 例如 createIndex({ field: 1 })".into(),
+        ));
+    }
+
+    let opts_doc = match opts_str {
+        Some(ref s) if !s.trim().is_empty() => parse_json_arg(s)?,
+        _ => doc! {},
+    };
+    let mut idx_opts = mongodb::options::IndexOptions::default();
+    if let Ok(name) = opts_doc.get_str("name") {
+        idx_opts.name = Some(name.to_string());
+    }
+    if let Ok(v) = opts_doc.get_bool("unique") {
+        idx_opts.unique = Some(v);
+    }
+    if let Ok(v) = opts_doc.get_bool("sparse") {
+        idx_opts.sparse = Some(v);
+    }
+    if let Ok(v) = opts_doc.get_bool("background") {
+        idx_opts.background = Some(v);
+    }
+    // expireAfterSeconds: 兼容 int32 / int64 / double
+    if let Some(secs) = opts_doc.get("expireAfterSeconds").and_then(bson_as_i64) {
+        idx_opts.expire_after = Some(std::time::Duration::from_secs(secs.max(0) as u64));
+    }
+    // 部分索引: partialFilterExpression
+    if let Ok(pfe) = opts_doc.get_document("partialFilterExpression") {
+        idx_opts.partial_filter_expression = Some(pfe.clone());
+    }
+
+    let model = mongodb::IndexModel::builder()
+        .keys(keys.clone())
+        .options(Some(idx_opts))
+        .build();
+    let created = collection
+        .create_index(model)
+        .await
+        .map_err(AppError::Mongo)?;
+    let result_doc = doc! {
+        "ok": 1,
+        "createdIndex": created.index_name,
+        "keys": keys,
+    };
+    Ok(QueryResult {
+        documents: vec![result_doc],
+        count: 1,
+        total_count: 1,
+        execution_time_ms: 0,
+        pending_count: None,
+    })
+}
+
+// ---- dropIndex ----
+
+/// `db.coll.dropIndex("indexName")`. 仅支持按索引名删除 (driver 能力所限);
+/// 传键对象 (dropIndex({a:1})) 时给出明确提示.
+async fn execute_drop_index(
+    collection: &mongodb::Collection<Document>,
+    rest: &str,
+) -> Result<QueryResult, AppError> {
+    let arg_str = extract_parens(rest, "dropIndex")?;
+    let trimmed = arg_str.trim();
+    if trimmed.starts_with('{') {
+        return Err(AppError::InvalidInput(
+            "dropIndex 目前仅支持按索引名删除, 例如 dropIndex(\"idx_name\")".into(),
+        ));
+    }
+    let name = trimmed.trim_matches(|c| c == '"' || c == '\'').to_string();
+    if name.is_empty() {
+        return Err(AppError::InvalidInput("dropIndex 需要索引名".into()));
+    }
+    collection
+        .drop_index(name.clone())
+        .await
+        .map_err(AppError::Mongo)?;
+    let result_doc = doc! { "ok": 1, "droppedIndex": name };
+    Ok(QueryResult {
+        documents: vec![result_doc],
+        count: 1,
+        total_count: 1,
+        execution_time_ms: 0,
+        pending_count: None,
+    })
+}
+
+/// 把 BSON 数值 (Int32 / Int64 / Double) 取成 i64; 非数值返回 None.
+fn bson_as_i64(b: &Bson) -> Option<i64> {
+    match b {
+        Bson::Int32(v) => Some(*v as i64),
+        Bson::Int64(v) => Some(*v),
+        Bson::Double(v) => Some(*v as i64),
+        _ => None,
+    }
 }
 
 /// 从 chars[start] (须是 " ' ` 之一) 跳过整个字符串字面量, 返回闭合引号后的下标.

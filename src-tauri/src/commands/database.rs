@@ -144,3 +144,79 @@ pub async fn drop_database(
     client.database(&database).drop().await.map_err(AppError::Mongo)?;
     Ok(())
 }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameDatabaseSummary {
+    pub copied_collections: i64,
+    pub copied_documents: i64,
+}
+
+/// 重命名数据库. MongoDB 没有原生 rename database 命令: 把旧库每个集合
+/// (文档 + 非 _id_ 索引) 复制到新库名, 全部成功后再 drop 旧库.
+/// 系统集合 (system.*) 跳过. 大库会较慢 —— 本质是一次数据拷贝.
+#[tauri::command]
+pub async fn rename_database(
+    mgr: State<'_, ConnectionManager>,
+    connection_id: String,
+    old_name: String,
+    new_name: String,
+) -> Result<RenameDatabaseSummary, AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许重命名数据库".into()));
+    }
+    if new_name.trim().is_empty() {
+        return Err(AppError::InvalidInput("新数据库名不能为空".into()));
+    }
+    if old_name == new_name {
+        return Err(AppError::InvalidInput("新数据库名不能与原名相同".into()));
+    }
+    // 库名非法字符 (与前端校验一致)
+    if new_name.contains(|c: char| "/\\. \"$*<>:|?".contains(c)) {
+        return Err(AppError::InvalidInput(
+            "数据库名不能含 / \\ . \" $ * < > : | ? 及空格".into(),
+        ));
+    }
+    let client = mgr.get_client(&connection_id).await?;
+    let existing_dbs = client
+        .list_database_names()
+        .await
+        .map_err(AppError::Mongo)?;
+    if existing_dbs.iter().any(|n| n == &new_name) {
+        return Err(AppError::InvalidInput(format!(
+            "数据库 \"{new_name}\" 已存在, 请换一个名字"
+        )));
+    }
+
+    let old_db = client.database(&old_name);
+    let new_db = client.database(&new_name);
+    let coll_names = old_db
+        .list_collection_names()
+        .await
+        .map_err(AppError::Mongo)?;
+
+    let mut copied_collections = 0i64;
+    let mut copied_documents = 0i64;
+    for cname in &coll_names {
+        if cname.starts_with("system.") {
+            continue; // 系统集合不迁移
+        }
+        // 先建空集合, 保证无文档的集合也迁过去
+        new_db
+            .create_collection(cname)
+            .await
+            .map_err(AppError::Mongo)?;
+        let src = old_db.collection::<Document>(cname);
+        let dst = new_db.collection::<Document>(cname);
+        copied_documents +=
+            crate::commands::collection::copy_collection_contents(&src, &dst).await?;
+        copied_collections += 1;
+    }
+    // 全部复制完成后再删旧库
+    old_db.drop().await.map_err(AppError::Mongo)?;
+
+    Ok(RenameDatabaseSummary {
+        copied_collections,
+        copied_documents,
+    })
+}
