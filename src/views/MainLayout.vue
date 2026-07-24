@@ -16,6 +16,8 @@ import {
 } from "@vicons/ionicons5";
 import ImportDialog from "@/components/result/ImportDialog.vue";
 import ExportDialog from "@/components/result/ExportDialog.vue";
+import BackupDialog from "@/components/backup/BackupDialog.vue";
+import RestoreDialog from "@/components/backup/RestoreDialog.vue";
 import ConnectionManagerDialog from "@/components/connection/ConnectionManager.vue";
 import MenuBar from "@/components/layout/MenuBar.vue";
 import StatusBar from "@/components/layout/StatusBar.vue";
@@ -563,6 +565,34 @@ function handleImportColl(connId: string, db: string, coll: string) {
   showImportDialog.value = true;
 }
 
+// ---- 备份 / 恢复 ----
+const showBackupDialog = ref(false);
+const showRestoreDialog = ref(false);
+const backupCtx = ref<{ connId: string; db: string; coll: string } | null>(null);
+const restoreCtx = ref<{ connId: string; db: string } | null>(null);
+
+/** coll 为空串 = 备份整库 */
+function handleBackupDb(connId: string, db: string, coll: string) {
+  backupCtx.value = { connId, db, coll };
+  showBackupDialog.value = true;
+}
+
+function handleRestoreDb(connId: string, db: string) {
+  restoreCtx.value = { connId, db };
+  showRestoreDialog.value = true;
+}
+
+/** 菜单栏入口: 用当前活跃 tab 的连接/库 */
+function handleBackupFromMenu(restore: boolean) {
+  const tab = editorStore.activeTab;
+  if (!tab) {
+    msg.warning("请先连接到一个数据库");
+    return;
+  }
+  if (restore) handleRestoreDb(tab.connectionId, tab.database);
+  else handleBackupDb(tab.connectionId, tab.database, "");
+}
+
 function handleExportColl(connId: string, db: string, coll: string) {
   // 先打开查询 tab 执行查询，然后打开导出
   const tabId = editorStore.createTab(connId, db, coll);
@@ -620,6 +650,12 @@ function handleMenuAction(key: string) {
     case "tools.profiler":
       showProfiler.value = true;
       break;
+    case "tools.backup":
+      handleBackupFromMenu(false);
+      break;
+    case "tools.restore":
+      handleBackupFromMenu(true);
+      break;
     case "file.import":
       handleImport();
       break;
@@ -668,6 +704,8 @@ function handleMenuAction(key: string) {
                 @delete-connection="handleDeleteConnection"
                 @import-coll="handleImportColl"
                 @export-coll="handleExportColl"
+                @backup-db="handleBackupDb"
+                @restore-db="handleRestoreDb"
               />
             </div>
           </n-layout-sider>
@@ -898,6 +936,25 @@ function handleMenuAction(key: string) {
       :collection="exportCollCtx?.coll ?? activeTab?.collection ?? ''"
       :query-text="activeTab?.content ?? ''"
       @exported="(c) => { handleExported(c); exportCollCtx = null; }"
+    />
+
+    <!-- 备份 -->
+    <BackupDialog
+      v-if="backupCtx"
+      v-model:show="showBackupDialog"
+      :connection-id="backupCtx.connId"
+      :database="backupCtx.db"
+      :collection="backupCtx.coll || undefined"
+      @done="(s) => msg.success(`备份完成: ${s.collections} 个集合 / ${s.documents.toLocaleString()} 条文档`)"
+    />
+
+    <!-- 恢复 -->
+    <RestoreDialog
+      v-if="restoreCtx"
+      v-model:show="showRestoreDialog"
+      :connection-id="restoreCtx.connId"
+      :database="restoreCtx.db"
+      @done="(s) => msg.success(`恢复完成: ${s.collections} 个集合 / ${s.documents.toLocaleString()} 条文档`)"
     />
 
     <!-- Server Monitor -->

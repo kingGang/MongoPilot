@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod backup;
 pub mod collection;
 pub mod connection;
 pub mod database;

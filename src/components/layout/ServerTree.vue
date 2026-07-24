@@ -38,6 +38,9 @@ const emit = defineEmits<{
   deleteConnection: [id: string];
   importColl: [connId: string, database: string, collection: string];
   exportColl: [connId: string, database: string, collection: string];
+  /** collection 为空串表示备份整库 */
+  backupDb: [connId: string, database: string, collection: string];
+  restoreDb: [connId: string, database: string];
 }>();
 
 const connStore = useConnectionStore();
@@ -652,6 +655,9 @@ const ctxMenuOptions = computed(() => {
       { label: "创建集合...", key: "create-coll" },
       { type: "divider" as const, key: "d2" },
       { label: "重命名数据库...", key: "rename-db" },
+      { type: "divider" as const, key: "d2a" },
+      { label: "备份数据库...", key: "backup-db" },
+      { label: "从备份恢复...", key: "restore-db" },
       { type: "divider" as const, key: "d2b" },
       { label: "刷新", key: "refresh-db" },
       { type: "divider" as const, key: "d3" },
@@ -667,6 +673,7 @@ const ctxMenuOptions = computed(() => {
       { type: "divider" as const, key: "d4a2" },
       { label: "导入数据...", key: "import-coll" },
       { label: "导出数据...", key: "export-coll" },
+      { label: "备份集合...", key: "backup-coll" },
       { type: "divider" as const, key: "d4b" },
       { label: "复制集合名称", key: "copy-coll-name-from-coll" },
       { type: "divider" as const, key: "d4c" },
@@ -839,6 +846,7 @@ const WRITE_ACTIONS = new Set<string>([
   "create-db",
   "create-coll", "drop-db", "drop-coll",
   "rename-db", "rename-coll", "duplicate-coll", "truncate-coll",
+  "restore-db",
   "add-index", "add-index-from-idx",
   "rebuild-indexes", "drop-indexes",
   "update-index", "drop-this-index",
@@ -922,6 +930,18 @@ async function handleCtxSelect(action: string) {
   if (action === "export-coll" && nodeKey.startsWith("coll:")) {
     const { connId, dbName, collName } = parseCollKey(nodeKey);
     emit("exportColl", connId, dbName, collName);
+  }
+  if (action === "backup-coll" && nodeKey.startsWith("coll:")) {
+    const { connId, dbName, collName } = parseCollKey(nodeKey);
+    emit("backupDb", connId, dbName, collName);
+  }
+  if (action === "backup-db" && nodeKey.startsWith("db:")) {
+    const { connId, dbName } = parseDbKey(nodeKey);
+    emit("backupDb", connId, dbName, "");
+  }
+  if (action === "restore-db" && nodeKey.startsWith("db:")) {
+    const { connId, dbName } = parseDbKey(nodeKey);
+    emit("restoreDb", connId, dbName);
   }
   if (action === "copy-coll-name-from-coll" && nodeKey.startsWith("coll:")) {
     const { collName } = parseCollKey(nodeKey);

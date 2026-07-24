@@ -514,13 +514,94 @@ function stripUseStatements(content: string): string {
     .join("\n");
 }
 
+/** 字符串/注释感知地收集所有**具名** function 声明/表达式的名字 (`function NAME`). */
+function collectFunctionNames(code: string): Set<string> {
+  const names = new Set<string>();
+  const n = code.length;
+  let i = 0;
+  let inStr = false;
+  let strCh = "";
+  let inLine = false;
+  let inBlock = false;
+  const isIdent = (ch: string) => /[\w$]/.test(ch || "");
+  while (i < n) {
+    const c = code[i];
+    const next = code[i + 1];
+    if (inLine) {
+      if (c === "\n") inLine = false;
+      i++;
+      continue;
+    }
+    if (inBlock) {
+      if (c === "*" && next === "/") {
+        i += 2;
+        inBlock = false;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (inStr) {
+      if (c === "\\") {
+        i += 2;
+        continue;
+      }
+      if (c === strCh) inStr = false;
+      i++;
+      continue;
+    }
+    if (c === "/" && next === "/") {
+      inLine = true;
+      i++;
+      continue;
+    }
+    if (c === "/" && next === "*") {
+      inBlock = true;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      inStr = true;
+      strCh = c;
+      i++;
+      continue;
+    }
+    if (
+      c === "f" &&
+      code.startsWith("function", i) &&
+      !isIdent(code[i - 1]) &&
+      !isIdent(code[i + 8])
+    ) {
+      let j = i + 8;
+      while (j < n && /\s/.test(code[j])) j++;
+      let name = "";
+      while (j < n && isIdent(code[j])) name += code[j++];
+      if (name) names.add(name);
+      i += 8;
+      continue;
+    }
+    i++;
+  }
+  return names;
+}
+
 /**
- * 字符串/注释感知地给**不在 function 体内**的顶层 db 引用 (db. / db[) 加上 await,
- * 让 mongosh 那种同步写法的 db 读操作能 await 真正的后端查询。
- * function 体内的 db 调用不动 —— 那里多数是写操作, async 代理方法被调用时会同步收集,
- * 不需要 await (在普通 function 里加 await 反而是语法错误)。
+ * 让 mongosh 那种同步写法在 webview 沙箱里成立: 把 db 读操作 await 成真正的后端查询。
+ *
+ * 关键难点是 mongosh 允许在**普通 function 里**同步读写 (`var p=db.x.findOne(...)`),
+ * 但沙箱里 db 调用是 async 的, 不 await 就拿到 Promise (`p._id` 变 undefined 报错)。
+ * 因此这里做一个轻量 async 改写:
+ *   1. 每个**具名** `function foo(){}` 改成 `async function foo(){}`;
+ *   2. 函数体内 / 顶层的 db. / db[ 调用一律加 await (所处函数已是 async, 合法);
+ *   3. 对这些具名函数的**调用点**也加 await (`foo(...)` -> `await foo(...)`),
+ *      这样 `db.x.findOne({k: encrypt(v)})` 里的 helper 调用也能拿到真实返回值,
+ *      顶层 `foo(...)` 的写操作也能在脚本收尾前被收集。
+ *
+ * 只改具名 function + 顶层; 匿名/箭头函数体内的 db 调用维持不 await (避免在非 async
+ * 作用域里插 await 造成语法错) —— 迁移脚本极少这么写。
  */
 function awaitifyDbCalls(code: string): string {
+  const funcNames = collectFunctionNames(code);
   let out = "";
   let i = 0;
   const n = code.length;
@@ -529,9 +610,13 @@ function awaitifyDbCalls(code: string): string {
   let inLine = false;
   let inBlock = false;
   let braceDepth = 0;
-  const funcDepths: number[] = []; // 进入 function 体时压入当时的 braceDepth
-  let pendingFunc = false; // 见到 function 关键字, 等它的 {
+  // 每进入一个 function 体压入 { 该体的 braceDepth, 是否 async }
+  const funcStack: { depth: number; isAsync: boolean }[] = [];
+  let pendingFunc: { isAsync: boolean } | null = null; // 见到 function 关键字, 等它的 {
+  let pendingAsyncModifier = false; // 见到 `async` 修饰, 下一个 function 已是 async
   const isIdent = (ch: string) => /[\w$]/.test(ch || "");
+  const enclosingAsync = () =>
+    funcStack.length === 0 ? true : funcStack[funcStack.length - 1].isAsync;
 
   while (i < n) {
     const c = code[i];
@@ -584,48 +669,88 @@ function awaitifyDbCalls(code: string): string {
       i++;
       continue;
     }
-    // function 关键字 -> 等它的 { 来标记函数体
+    // `async` 修饰符: 若紧跟 function, 记下让 function 分支别重复插 async
+    if (
+      c === "a" &&
+      code.startsWith("async", i) &&
+      !isIdent(code[i - 1]) &&
+      code[i - 1] !== "." &&
+      !isIdent(code[i + 5])
+    ) {
+      let j = i + 5;
+      while (j < n && /\s/.test(code[j])) j++;
+      if (code.startsWith("function", j)) pendingAsyncModifier = true;
+      out += "async";
+      i += 5;
+      continue;
+    }
+    // function 关键字: 具名的改成 async, 并直接消费掉函数名 (避免被下方调用检测器误判)
     if (
       c === "f" &&
       code.startsWith("function", i) &&
       !isIdent(code[i - 1]) &&
       !isIdent(code[i + 8])
     ) {
-      pendingFunc = true;
-      out += "function";
-      i += 8;
+      let j = i + 8;
+      while (j < n && /\s/.test(code[j])) j++;
+      let k = j;
+      while (k < n && isIdent(code[k])) k++;
+      const isNamed = k > j;
+      const alreadyAsync = pendingAsyncModifier;
+      pendingAsyncModifier = false;
+      const willBeAsync = isNamed || alreadyAsync;
+      if (isNamed && !alreadyAsync) out += "async ";
+      out += code.slice(i, k); // "function" + 空白 + 名字
+      i = k;
+      pendingFunc = { isAsync: willBeAsync };
       continue;
     }
     if (c === "{") {
       braceDepth++;
       if (pendingFunc) {
-        funcDepths.push(braceDepth);
-        pendingFunc = false;
+        funcStack.push({ depth: braceDepth, isAsync: pendingFunc.isAsync });
+        pendingFunc = null;
       }
       out += c;
       i++;
       continue;
     }
     if (c === "}") {
-      if (funcDepths.length && funcDepths[funcDepths.length - 1] === braceDepth) {
-        funcDepths.pop();
+      if (funcStack.length && funcStack[funcStack.length - 1].depth === braceDepth) {
+        funcStack.pop();
       }
       braceDepth--;
       out += c;
       i++;
       continue;
     }
-    // 顶层 (不在任何 function 体内) 的 db. / db[ -> 加 await
+    // db. / db[ -> 加 await (所处作用域是 async 时才加, 否则会是语法错)
     if (
       c === "d" &&
       next === "b" &&
       (code[i + 2] === "." || code[i + 2] === "[") &&
       !isIdent(code[i - 1]) &&
-      code[i - 1] !== "." &&
-      funcDepths.length === 0
+      code[i - 1] !== "."
     ) {
-      out += "await db";
+      out += enclosingAsync() ? "await db" : "db";
       i += 2;
+      continue;
+    }
+    // 标识符: 若是"具名函数的调用" (紧跟 `(`), 在 async 作用域里加 await
+    if (isIdent(c) && !isIdent(code[i - 1]) && code[i - 1] !== ".") {
+      let k = i;
+      let ident = "";
+      while (k < n && isIdent(code[k])) ident += code[k++];
+      if (funcNames.has(ident)) {
+        let j = k;
+        while (j < n && /\s/.test(code[j])) j++;
+        // 排除 `new Foo()` (await new 不合法) 和非调用
+        const isCall = code[j] === "(";
+        const afterNew = /(^|[^\w$])new\s*$/.test(out);
+        if (isCall && !afterNew && enclosingAsync()) out += "await ";
+      }
+      out += ident;
+      i = k;
       continue;
     }
     out += c;

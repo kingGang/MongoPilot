@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod backup;
 pub mod commands;
 pub mod connection;
 pub mod crypto;
@@ -133,6 +134,9 @@ pub fn run() {
             commands::export::read_import_file,
             commands::export::import_documents,
             commands::export::stream_import,
+            commands::backup::backup_database,
+            commands::backup::scan_backup_dir,
+            commands::backup::restore_backup,
             commands::script::list_scripts,
             commands::script::list_script_folders,
             commands::script::get_script,

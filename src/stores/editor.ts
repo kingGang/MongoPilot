@@ -487,6 +487,23 @@ export const useEditorStore = defineStore("editor", () => {
       return;
     }
 
+    // 多条顶层 db.* / use 语句 -> 逐条顺序执行, 每条一个结果 tab.
+    // 关键: 无论整段是否以 db. 开头都要在这里拆。之前多语句拆分只写在下面
+    // "不以 db. 开头" 的分支里, 于是「全选一串 `db.coll.updateOne(...);` 点 Run」时,
+    // 整段被当成单条查询直接丢给后端, execute_shell_query 只解析第一条 -> 只有一条生效。
+    // helper / read-then-write 脚本已在上面 escalateToScript 处理; 这里只认
+    // "纯粹一串独立 db.* 语句" (不需要预求值的情形)。单条(含跨行链式)会返回 length===1,
+    // 落到下面单查询路径, 行为不变。
+    if (!needsPreEvaluation(text)) {
+      const topStmts = extractDbStatements(text);
+      if (topStmts.length > 1) {
+        for (const s of topStmts) {
+          await executeQuery(editorTabId, s);
+        }
+        return;
+      }
+    }
+
     // 选中的不是直接以 db. 开头 (例如选了 "helper 函数 + 查询" 整段):
     //   - 里面有多条 db.xxx 语句 -> 逐条顺序执行 (迁移脚本 = helper + 一堆 createIndex)
     //   - 里面只有一条 db.xxx    -> 抽出那条走预求值 (helper + 单查询的调试场景)
