@@ -1,4 +1,5 @@
 use mongodb::bson::{doc, Bson, Document};
+use mongodb::options::ReturnDocument;
 use mongodb::Client;
 use serde::Serialize;
 
@@ -380,6 +381,14 @@ pub async fn execute_shell_query(
         execute_delete(&collection, rest, "deleteMany", true).await?
     } else if rest.starts_with("replaceOne(") {
         execute_replace_one(&collection, rest).await?
+    } else if rest.starts_with("findOneAndUpdate(") {
+        execute_find_one_and_modify(&collection, rest, "findOneAndUpdate", false).await?
+    } else if rest.starts_with("findOneAndReplace(") {
+        execute_find_one_and_modify(&collection, rest, "findOneAndReplace", true).await?
+    } else if rest.starts_with("findOneAndDelete(") {
+        execute_find_one_and_delete(&collection, rest).await?
+    } else if rest.starts_with("bulkWrite(") {
+        execute_bulk_write(&collection, rest).await?
     } else if rest.starts_with("createIndex(") {
         execute_create_index(&collection, rest).await?
     } else if rest.starts_with("dropIndex(") {
@@ -814,6 +823,230 @@ async fn execute_replace_one(
     })
 }
 
+// ---- findOneAndUpdate / findOneAndReplace / findOneAndDelete ----
+
+/// 把 findOneAnd* 返回的 Option<Document> 包成 QueryResult (有文档=1 条, 无=0 条).
+fn find_one_and_result(result: Option<Document>) -> QueryResult {
+    match result {
+        Some(doc) => QueryResult {
+            documents: vec![doc],
+            count: 1,
+            total_count: 1,
+            execution_time_ms: 0,
+            pending_count: None,
+        },
+        None => QueryResult {
+            documents: vec![],
+            count: 0,
+            total_count: 0,
+            execution_time_ms: 0,
+            pending_count: None,
+        },
+    }
+}
+
+/// 解析 options 里的"返回哪份文档": 兼容 mongosh 两种写法.
+/// `returnNewDocument: true/false` (旧) 或 `returnDocument: "after"/"before"` (新).
+/// 返回 Some(true)=改后, Some(false)=改前, None=未指定 (驱动默认改前).
+fn parse_return_after(opts: &Document) -> Option<bool> {
+    if let Ok(b) = opts.get_bool("returnNewDocument") {
+        return Some(b);
+    }
+    if let Ok(s) = opts.get_str("returnDocument") {
+        return Some(s.eq_ignore_ascii_case("after"));
+    }
+    None
+}
+
+/// findOneAndUpdate(filter, update, options?) / findOneAndReplace(filter, replacement, options?).
+/// 支持 options: returnDocument/returnNewDocument, upsert, sort, projection.
+async fn execute_find_one_and_modify(
+    collection: &mongodb::Collection<Document>,
+    rest: &str,
+    method: &str,
+    replace: bool,
+) -> Result<QueryResult, AppError> {
+    let arg_str = extract_parens(rest, method)?;
+    let args = split_top_level_args(&arg_str);
+    if args.len() < 2 {
+        return Err(AppError::InvalidInput(format!(
+            "{method} 需要 (filter, {}, options?)",
+            if replace { "replacement" } else { "update" }
+        )));
+    }
+    let filter: Document = parse_json_arg(&args[0])?;
+    let doc2: Document = parse_json_arg(&args[1])?;
+    let opts: Document = match args.get(2) {
+        Some(s) if !s.is_empty() => parse_json_arg(s)?,
+        _ => doc! {},
+    };
+
+    let return_after = parse_return_after(&opts);
+    let upsert = opts.get_bool("upsert").ok();
+    let sort = opts.get_document("sort").ok().cloned();
+    let projection = opts.get_document("projection").ok().cloned();
+
+    let result: Option<Document> = if replace {
+        let mut a = collection.find_one_and_replace(filter, doc2);
+        if let Some(u) = upsert {
+            a = a.upsert(u);
+        }
+        if let Some(s) = sort {
+            a = a.sort(s);
+        }
+        if let Some(p) = projection {
+            a = a.projection(p);
+        }
+        if let Some(after) = return_after {
+            a = a.return_document(if after { ReturnDocument::After } else { ReturnDocument::Before });
+        }
+        a.await.map_err(AppError::Mongo)?
+    } else {
+        let mut a = collection.find_one_and_update(filter, doc2);
+        if let Some(u) = upsert {
+            a = a.upsert(u);
+        }
+        if let Some(s) = sort {
+            a = a.sort(s);
+        }
+        if let Some(p) = projection {
+            a = a.projection(p);
+        }
+        if let Some(after) = return_after {
+            a = a.return_document(if after { ReturnDocument::After } else { ReturnDocument::Before });
+        }
+        a.await.map_err(AppError::Mongo)?
+    };
+
+    Ok(find_one_and_result(result))
+}
+
+/// findOneAndDelete(filter, options?). 支持 options: sort, projection.
+async fn execute_find_one_and_delete(
+    collection: &mongodb::Collection<Document>,
+    rest: &str,
+) -> Result<QueryResult, AppError> {
+    let arg_str = extract_parens(rest, "findOneAndDelete")?;
+    let args = split_top_level_args(&arg_str);
+    let filter: Document = match args.first() {
+        Some(s) if !s.is_empty() => parse_json_arg(s)?,
+        _ => doc! {},
+    };
+    let opts: Document = match args.get(1) {
+        Some(s) if !s.is_empty() => parse_json_arg(s)?,
+        _ => doc! {},
+    };
+    let mut a = collection.find_one_and_delete(filter);
+    if let Ok(s) = opts.get_document("sort") {
+        a = a.sort(s.clone());
+    }
+    if let Ok(p) = opts.get_document("projection") {
+        a = a.projection(p.clone());
+    }
+    let result = a.await.map_err(AppError::Mongo)?;
+    Ok(find_one_and_result(result))
+}
+
+// ---- bulkWrite ----
+
+/// bulkWrite([ops], options?). 把操作数组逐条分发到 insert/update/delete
+/// (顺序执行, 不依赖驱动 8.0 的原生 bulkWrite). 支持的操作类型:
+/// insertOne / updateOne / updateMany / replaceOne / deleteOne / deleteMany.
+/// update/replacement 仅支持文档形式 (与 updateOne 一致, 不支持聚合管道 update).
+async fn execute_bulk_write(
+    collection: &mongodb::Collection<Document>,
+    rest: &str,
+) -> Result<QueryResult, AppError> {
+    let arg_str = extract_parens(rest, "bulkWrite")?;
+    // 首参是操作数组; 第二参 options 目前忽略 (ordered 语义: 顺序执行, 出错即停)
+    let ops_str = split_top_level_args(&arg_str)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+
+    // 复用 insertMany 那套 shell -> JSON 清洗, 把 [ {...}, {...} ] 解析成 Vec<Document>
+    let cleaned = strip_trailing_commas(&relax_json(&convert_shell_types(&strip_comments(&ops_str))));
+    let ops: Vec<Document> = serde_json::from_str(&cleaned)
+        .map_err(|e| AppError::InvalidInput(format!("bulkWrite 操作数组解析失败: {e}")))?;
+    if ops.is_empty() {
+        return Err(AppError::InvalidInput("bulkWrite 需要至少一个操作".into()));
+    }
+
+    let mut inserted = 0i64;
+    let mut matched = 0i64;
+    let mut modified = 0i64;
+    let mut deleted = 0i64;
+    let mut upserted = 0i64;
+
+    let need_doc = |spec: &Document, key: &str, idx: usize| -> Result<Document, AppError> {
+        spec.get_document(key)
+            .cloned()
+            .map_err(|_| AppError::InvalidInput(format!("bulkWrite[{idx}] 缺少或非法的 {key}")))
+    };
+
+    for (idx, op) in ops.iter().enumerate() {
+        if let Ok(spec) = op.get_document("insertOne") {
+            let d = need_doc(spec, "document", idx)?;
+            collection.insert_one(d).await.map_err(AppError::Mongo)?;
+            inserted += 1;
+        } else if let Ok(spec) = op.get_document("updateOne").or_else(|_| op.get_document("updateMany")) {
+            let many = op.get_document("updateMany").is_ok();
+            let filter = need_doc(spec, "filter", idx)?;
+            let update = need_doc(spec, "update", idx)?;
+            let upsert = spec.get_bool("upsert").unwrap_or(false);
+            let r = if many {
+                collection.update_many(filter, update).upsert(upsert).await.map_err(AppError::Mongo)?
+            } else {
+                collection.update_one(filter, update).upsert(upsert).await.map_err(AppError::Mongo)?
+            };
+            matched += r.matched_count as i64;
+            modified += r.modified_count as i64;
+            if r.upserted_id.is_some() {
+                upserted += 1;
+            }
+        } else if let Ok(spec) = op.get_document("replaceOne") {
+            let filter = need_doc(spec, "filter", idx)?;
+            let replacement = need_doc(spec, "replacement", idx)?;
+            let upsert = spec.get_bool("upsert").unwrap_or(false);
+            let r = collection.replace_one(filter, replacement).upsert(upsert).await.map_err(AppError::Mongo)?;
+            matched += r.matched_count as i64;
+            modified += r.modified_count as i64;
+            if r.upserted_id.is_some() {
+                upserted += 1;
+            }
+        } else if let Ok(spec) = op.get_document("deleteOne").or_else(|_| op.get_document("deleteMany")) {
+            let many = op.get_document("deleteMany").is_ok();
+            let filter = need_doc(spec, "filter", idx)?;
+            let r = if many {
+                collection.delete_many(filter).await.map_err(AppError::Mongo)?
+            } else {
+                collection.delete_one(filter).await.map_err(AppError::Mongo)?
+            };
+            deleted += r.deleted_count as i64;
+        } else {
+            return Err(AppError::InvalidInput(format!(
+                "bulkWrite[{idx}] 不支持的操作类型 (仅支持 insertOne/updateOne/updateMany/replaceOne/deleteOne/deleteMany)"
+            )));
+        }
+    }
+
+    let result_doc = doc! {
+        "acknowledged": true,
+        "insertedCount": inserted,
+        "matchedCount": matched,
+        "modifiedCount": modified,
+        "deletedCount": deleted,
+        "upsertedCount": upserted,
+    };
+    Ok(QueryResult {
+        documents: vec![result_doc],
+        count: 1,
+        total_count: 1,
+        execution_time_ms: 0,
+        pending_count: None,
+    })
+}
+
 // ---- createIndex ----
 
 /// `db.coll.createIndex(keys)` 或 `db.coll.createIndex(keys, options)`.
@@ -973,6 +1206,38 @@ fn split_two_args(s: &str) -> Result<(String, String), AppError> {
     Err(AppError::InvalidInput(
         "需要两个参数: (filter, update/replacement)".into(),
     ))
+}
+
+/// 按顶层逗号拆分参数列表 (跳过字符串与嵌套 括号/花括号/方括号), 各段去首尾空白.
+/// 空输入返回空 Vec; 用于 findOneAnd* / bulkWrite 这类可选第 2/3 参的方法.
+fn split_top_level_args(s: &str) -> Vec<String> {
+    if s.trim().is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut args = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' || c == '\'' || c == '`' {
+            i = skip_string_literal(&chars, i);
+            continue;
+        }
+        match c {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(chars[start..i].iter().collect::<String>().trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    args.push(chars[start..].iter().collect::<String>().trim().to_string());
+    args
 }
 
 /// 从链式调用中提取指定方法的参数
@@ -1507,6 +1772,34 @@ mod tests {
     fn extract_parens_ignores_paren_in_string() {
         let result = extract_parens(r#"find({name: "a(b"})"#, "find").unwrap();
         assert_eq!(result, r#"{name: "a(b"}"#);
+    }
+
+    #[test]
+    fn split_top_level_args_basic_and_nested() {
+        // 三参: filter, update, options —— 嵌套花括号/字符串里的逗号不拆
+        let args = split_top_level_args(r#"{a:1}, {$set:{b:2, c:3}}, {upsert:true, returnDocument:"after"}"#);
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], "{a:1}");
+        assert_eq!(args[1], "{$set:{b:2, c:3}}");
+        assert_eq!(args[2], r#"{upsert:true, returnDocument:"after"}"#);
+    }
+
+    #[test]
+    fn split_top_level_args_single_and_empty() {
+        assert_eq!(split_top_level_args("{a:1}"), vec!["{a:1}".to_string()]);
+        assert!(split_top_level_args("   ").is_empty());
+        // 操作数组作为单个参数不被内部逗号拆开
+        let args = split_top_level_args(r#"[{insertOne:{document:{x:1}}}, {deleteOne:{filter:{y:2}}}]"#);
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn parse_return_after_both_forms() {
+        use mongodb::bson::doc;
+        assert_eq!(parse_return_after(&doc! { "returnNewDocument": true }), Some(true));
+        assert_eq!(parse_return_after(&doc! { "returnDocument": "after" }), Some(true));
+        assert_eq!(parse_return_after(&doc! { "returnDocument": "before" }), Some(false));
+        assert_eq!(parse_return_after(&doc! { "upsert": true }), None);
     }
 
     #[test]

@@ -13,6 +13,7 @@ import {
   Layers as DbIcon,
   Save as SaveIcon,
   Options as BuilderIcon,
+  GitNetworkOutline as AggBuilderIcon,
   ChevronDown as ChevronIcon,
   Brush as FormatIcon,
   CodeSlash as SnippetIcon,
@@ -40,6 +41,7 @@ const emit = defineEmits<{
   history: [];
   explain: [];
   queryBuilder: [];
+  aggBuilder: [];
   import: [];
   export: [];
   saveScript: [];
@@ -300,6 +302,14 @@ function onDbSelect(name: string) {
           </n-button>
         </template>
         可视化查询构建器
+      </n-tooltip>
+      <n-tooltip trigger="hover" :delay="400">
+        <template #trigger>
+          <n-button class="icon-btn" size="small" quaternary @click="emit('aggBuilder')">
+            <template #icon><n-icon :size="15"><AggBuilderIcon /></n-icon></template>
+          </n-button>
+        </template>
+        聚合管道构建器
       </n-tooltip>
       <n-tooltip trigger="hover" :delay="400">
         <template #trigger>

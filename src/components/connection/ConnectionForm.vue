@@ -122,7 +122,8 @@ function handleCopyUri() {
           <n-form-item label="认证方式">
             <n-select v-model:value="form.authType" :options="authTypeOptions" />
           </n-form-item>
-          <template v-if="form.authType === 'password'">
+          <!-- 密码 / LDAP: 用户名 + 密码 -->
+          <template v-if="form.authType === 'password' || form.authType === 'ldap'">
             <n-form-item label="用户名">
               <n-input v-model:value="form.username" />
             </n-form-item>
@@ -133,10 +134,27 @@ function handleCopyUri() {
                 show-password-on="click"
               />
             </n-form-item>
-            <n-form-item label="认证数据库">
-              <n-input v-model:value="form.authDb" placeholder="admin" />
+          </template>
+          <!-- authSource 只对密码认证有意义; ldap/x509 固定走 $external -->
+          <n-form-item v-if="form.authType === 'password'" label="认证数据库">
+            <n-input v-model:value="form.authDb" placeholder="admin" />
+          </n-form-item>
+          <!-- X.509: 用户名可选 (留空从证书 subject 取) -->
+          <template v-if="form.authType === 'x509'">
+            <n-form-item label="用户名">
+              <n-input v-model:value="form.username" placeholder="留空则从证书 subject 自动获取" />
             </n-form-item>
           </template>
+          <n-form-item v-if="form.authType === 'x509'" label=" " :show-feedback="false">
+            <span class="auth-hint">
+              X.509 以「TLS/SSL」页里的<strong>客户端证书文件</strong>作为身份，authSource 固定 $external。请在 TLS 页填好证书文件并启用 TLS。
+            </span>
+          </n-form-item>
+          <n-form-item v-if="form.authType === 'ldap'" label=" " :show-feedback="false">
+            <span class="auth-hint">
+              LDAP 走 PLAIN 机制、authSource $external。用户名/密码为明文，建议同时启用 TLS 加密传输。
+            </span>
+          </n-form-item>
         </n-form>
       </n-tab-pane>
 
@@ -255,5 +273,10 @@ function handleCopyUri() {
   margin-top: 16px;
   display: flex;
   justify-content: flex-end;
+}
+.auth-hint {
+  font-size: 12px;
+  color: #999;
+  line-height: 1.5;
 }
 </style>

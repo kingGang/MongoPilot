@@ -17,6 +17,7 @@ import {
   SwapVertical as SortIcon,
   RefreshOutline as RefreshIcon,
   ContractOutline as CollapseIcon,
+  Star as StarIcon,
 } from "@vicons/ionicons5";
 import { useConnectionStore } from "@/stores/connection";
 import { useDatabaseStore } from "@/stores/database";
@@ -60,6 +61,81 @@ const sortCollByName = ref<boolean>(localStorage.getItem(SORT_LS_KEY) === "true"
 function toggleCollSort() {
   sortCollByName.value = !sortCollByName.value;
   localStorage.setItem(SORT_LS_KEY, String(sortCollByName.value));
+}
+
+// ---- 集合收藏 / 注释 (localStorage 持久化, 键 = connId:db.coll, 仅本机可见) ----
+const FAV_LS_KEY = "mongopilot.favoriteCollections";
+const COMMENT_LS_KEY = "mongopilot.collectionComments";
+
+function loadFavSet(): Set<string> {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(FAV_LS_KEY) || "[]") as string[]);
+  } catch {
+    return new Set();
+  }
+}
+function loadComments(): Record<string, string> {
+  try {
+    return JSON.parse(localStorage.getItem(COMMENT_LS_KEY) || "{}") as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+const favorites = ref<Set<string>>(loadFavSet());
+const comments = ref<Record<string, string>>(loadComments());
+
+function isFavorite(ck: string): boolean {
+  return favorites.value.has(ck);
+}
+function toggleFavorite(ck: string) {
+  const s = new Set(favorites.value);
+  if (s.has(ck)) s.delete(ck);
+  else s.add(ck);
+  favorites.value = s;
+  localStorage.setItem(FAV_LS_KEY, JSON.stringify([...s]));
+}
+function getComment(ck: string): string {
+  return comments.value[ck] || "";
+}
+function setCommentFor(ck: string, text: string) {
+  const c = { ...comments.value };
+  const t = text.trim();
+  if (t) c[ck] = t;
+  else delete c[ck];
+  comments.value = c;
+  localStorage.setItem(COMMENT_LS_KEY, JSON.stringify(c));
+}
+
+/** 弹框设置/编辑集合注释 */
+function promptSetComment(ck: string, collName: string) {
+  const existing = getComment(ck);
+  const inputId = "__coll_comment_input";
+  dlg.create({
+    title: `注释 — ${collName}`,
+    content: () =>
+      h("div", { style: "display:flex;flex-direction:column;gap:8px" }, [
+        h(
+          "p",
+          { style: "margin:0;font-size:12px;color:#888;line-height:1.5" },
+          "给集合加个备注（仅本机可见，存于本地）。留空保存即清除。",
+        ),
+        h("textarea", {
+          id: inputId,
+          value: existing,
+          rows: 3,
+          style:
+            "width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px;resize:vertical;box-sizing:border-box",
+          placeholder: "注释内容",
+        }),
+      ]),
+    positiveText: "保存",
+    negativeText: "取消",
+    onPositiveClick: () => {
+      const input = document.getElementById(inputId) as HTMLTextAreaElement | null;
+      setCommentFor(ck, input?.value ?? "");
+      message.success(getComment(ck) ? "注释已保存" : "注释已清除");
+    },
+  });
 }
 
 // 工具栏: 刷新所有已连接 / 全部折叠
@@ -665,6 +741,8 @@ const ctxMenuOptions = computed(() => {
     ];
   }
   if (key.startsWith("coll:")) {
+    const { connId, dbName, collName } = parseCollKey(key);
+    const ck = `${connId}:${dbName}.${collName}`;
     return [
       { label: "查询", key: "query-coll" },
       { type: "divider" as const, key: "d4a" },
@@ -675,6 +753,9 @@ const ctxMenuOptions = computed(() => {
       { label: "导出数据...", key: "export-coll" },
       { label: "备份集合...", key: "backup-coll" },
       { type: "divider" as const, key: "d4b" },
+      { label: isFavorite(ck) ? "取消收藏" : "添加到收藏", key: "toggle-favorite" },
+      { label: getComment(ck) ? "编辑注释..." : "设置注释...", key: "set-comment-coll" },
+      { type: "divider" as const, key: "d4b2" },
       { label: "复制集合名称", key: "copy-coll-name-from-coll" },
       { type: "divider" as const, key: "d4c" },
       { label: "刷新", key: "refresh-coll-parent" },
@@ -706,10 +787,6 @@ const ctxMenuOptions = computed(() => {
       { type: "divider" as const, key: "di3" },
       { label: menuRow("复制名称", "Alt+Ctrl+C"), key: "copy-coll-name" },
       { type: "divider" as const, key: "di4" },
-      { label: menuRow("设置注释..."), key: "set-comment" },
-      { label: menuRow("添加到收藏"), key: "add-to-favorites" },
-      { type: "divider" as const, key: "di5" },
-      { label: menuRow("显示节点定位器", "Ctrl+F"), key: "show-locator" },
       { label: menuRow("刷新", "Ctrl+R"), key: "refresh-indexes" },
     ];
   }
@@ -1043,8 +1120,15 @@ async function handleCtxSelect(action: string) {
         () => message.error("复制失败"),
       );
     }
-    if (action === "set-comment" || action === "add-to-favorites" || action === "show-locator") {
-      message.info("此功能暂未实现");
+    if (action === "toggle-favorite" && nodeKey.startsWith("coll:")) {
+      const { connId: cid, dbName: db, collName: coll } = parseCollKey(nodeKey);
+      const ck = `${cid}:${db}.${coll}`;
+      toggleFavorite(ck);
+      message.success(isFavorite(ck) ? `已收藏 ${coll}` : `已取消收藏 ${coll}`);
+    }
+    if (action === "set-comment-coll" && nodeKey.startsWith("coll:")) {
+      const { connId: cid, dbName: db, collName: coll } = parseCollKey(nodeKey);
+      promptSetComment(`${cid}:${db}.${coll}`, coll);
     }
     if (action === "refresh-indexes") {
       delete indexCache.value[`${connId}:${dbName}.${collName}`];
@@ -1674,7 +1758,34 @@ function renderLabel({ option }: { option: TreeOption }): VNodeChild {
       },
     },
     {
-      trigger: () => h("span", { style: "cursor:pointer" }, node.label as string),
+      trigger: () => {
+        const fav = isFavorite(cacheKey);
+        const comment = getComment(cacheKey);
+        const parts: VNodeChild[] = [];
+        if (fav) {
+          parts.push(
+            h(
+              NIcon,
+              { size: 12, color: "#f0a020", style: "margin-right:3px;vertical-align:-1px" },
+              { default: () => h(StarIcon) },
+            ),
+          );
+        }
+        parts.push(h("span", {}, node.label as string));
+        if (comment) {
+          parts.push(
+            h(
+              "span",
+              {
+                style:
+                  "color:#999;font-size:11px;margin-left:6px;font-style:italic;white-space:nowrap",
+              },
+              `// ${comment}`,
+            ),
+          );
+        }
+        return h("span", { style: "cursor:pointer" }, parts);
+      },
       default: () => {
         const s = statsCache.value[cacheKey];
         if (!s) return h("span", { style: "color:#999;font-size:12px" }, "加载中...");

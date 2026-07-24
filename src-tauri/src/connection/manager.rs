@@ -1,12 +1,99 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use mongodb::{options::ClientOptions, Client};
+use mongodb::{
+    options::{AuthMechanism, ClientOptions, Credential, Tls, TlsOptions},
+    Client,
+};
 
 use crate::connection::config::ConnectionConfig;
 use crate::connection::ssh_tunnel::{SshAuth, SshTunnel};
 use crate::error::AppError;
+
+/// 客户端证书 (cert+key 合一的 PEM) 的解析结果.
+/// MongoDB 驱动的 `tlsCertificateKeyFile` 要一个同时含证书和私钥的 PEM 文件;
+/// UI 里 cert / key 是分开两栏, 因此:
+///   - 只填了 cert (通常本身就是合并 PEM) -> 直接用;
+///   - cert 和 key 分开两个文件 -> 读出来拼成一个临时 PEM 再用.
+fn resolve_cert_key_file(config: &ConnectionConfig) -> Option<PathBuf> {
+    let cert = config.tls_cert_file.as_deref().filter(|s| !s.is_empty());
+    let key = config.tls_key_file.as_deref().filter(|s| !s.is_empty());
+    match (cert, key) {
+        (Some(c), None) => Some(PathBuf::from(c)),
+        (None, Some(k)) => Some(PathBuf::from(k)),
+        (Some(c), Some(k)) if c == k => Some(PathBuf::from(c)),
+        (Some(c), Some(k)) => combine_cert_key(c, k),
+        (None, None) => None,
+    }
+}
+
+/// 把分开的 cert / key 文件拼成一个临时 PEM (cert 在前, key 在后).
+/// 文件名用 cert+key 路径 hash, 稳定复用, 重连时覆盖同一文件.
+fn combine_cert_key(cert_path: &str, key_path: &str) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let cert = std::fs::read(cert_path).ok()?;
+    let key = std::fs::read(key_path).ok()?;
+    let mut combined = cert;
+    combined.push(b'\n');
+    combined.extend_from_slice(&key);
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cert_path.hash(&mut hasher);
+    key_path.hash(&mut hasher);
+    let path = std::env::temp_dir().join(format!("mongopilot-tls-{:x}.pem", hasher.finish()));
+    std::fs::write(&path, combined).ok()?;
+    Some(path)
+}
+
+/// 把 config 里的认证机制 / TLS 证书应用到已 parse 的 ClientOptions 上.
+/// `build_uri` 只会拼出 `user:pass` 形式的密码认证 + `tls=true`, 这里补齐:
+///   - x509 / ldap 认证机制 (URI 层拼不出, 需要显式 Credential);
+///   - TLS 的 CA 文件 / 客户端证书 / 跳过校验 (URI 塞 Windows 路径易踩坑, 走结构体).
+fn apply_auth_and_tls(opts: &mut ClientOptions, config: &ConnectionConfig) {
+    // ---- TLS ----
+    if config.tls {
+        let mut tls = TlsOptions::builder().build();
+        if let Some(ca) = config.tls_ca_file.as_deref().filter(|s| !s.is_empty()) {
+            tls.ca_file_path = Some(PathBuf::from(ca));
+        }
+        if let Some(cert_key) = resolve_cert_key_file(config) {
+            tls.cert_key_file_path = Some(cert_key);
+        }
+        if config.tls_allow_invalid {
+            // 当前 TLS 后端只暴露 allow_invalid_certificates (它已放行自签/过期/主机名不匹配)
+            tls.allow_invalid_certificates = Some(true);
+        }
+        opts.tls = Some(Tls::Enabled(tls));
+    }
+
+    // ---- 认证机制 ----
+    // x509: 证书即身份, 无密码, authSource 必须是 $external, 用户名可省 (从证书 subject 取).
+    // ldap: PLAIN 机制, 明文用户名/密码走 $external.
+    match config.auth_type.as_str() {
+        "x509" => {
+            opts.credential = Some(
+                Credential::builder()
+                    .username(config.username.clone())
+                    .source("$external".to_string())
+                    .mechanism(AuthMechanism::MongoDbX509)
+                    .build(),
+            );
+        }
+        "ldap" => {
+            opts.credential = Some(
+                Credential::builder()
+                    .username(config.username.clone())
+                    .password(config.password.clone())
+                    .source("$external".to_string())
+                    .mechanism(AuthMechanism::Plain)
+                    .build(),
+            );
+        }
+        _ => {}
+    }
+}
 
 /// 持有活跃的 MongoDB 客户端连接，以连接配置 ID 为键。
 pub struct ConnectionManager {
@@ -138,6 +225,8 @@ impl ConnectionManager {
             opts.direct_connection = Some(true);
         }
 
+        apply_auth_and_tls(&mut opts, config);
+
         let client = Client::with_options(opts).map_err(AppError::Mongo)?;
 
         // 通过 ping 验证连通性
@@ -177,6 +266,8 @@ impl ConnectionManager {
         if opts.repl_set_name.is_none() {
             opts.direct_connection = Some(true);
         }
+
+        apply_auth_and_tls(&mut opts, config);
 
         let client = Client::with_options(opts).map_err(AppError::Mongo)?;
 

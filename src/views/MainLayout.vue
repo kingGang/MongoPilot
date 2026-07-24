@@ -31,6 +31,7 @@ import EditorTabs from "@/components/editor/EditorTabs.vue";
 import MonacoEditor from "@/components/editor/MonacoEditor.vue";
 import QueryToolbar from "@/components/editor/QueryToolbar.vue";
 import VisualQueryBuilder from "@/components/editor/VisualQueryBuilder.vue";
+import AggregationBuilder from "@/components/editor/AggregationBuilder.vue";
 import ResultPanel from "@/components/result/ResultPanel.vue";
 import ResultTabsBar from "@/components/result/ResultTabsBar.vue";
 import QueryHistory from "@/components/editor/QueryHistory.vue";
@@ -300,6 +301,7 @@ async function confirmSaveScript() {
 }
 const showQueryBuilder = ref(false);
 const queryBuilderInitialText = ref("");
+const showAggBuilder = ref(false);
 
 const activeTab = computed(() => editorStore.activeTab);
 
@@ -342,6 +344,16 @@ function handleQueryBuilderInsert(queryText: string) {
   const tab = editorStore.activeTab;
   if (!tab) return;
   editorStore.setContent(tab.id, queryText);
+}
+
+/** 工具栏聚合按钮 → 打开聚合管道构建器 */
+function handleOpenAggBuilder() {
+  const tab = editorStore.activeTab;
+  if (!tab) {
+    msg.warning("请先打开一个查询页");
+    return;
+  }
+  showAggBuilder.value = true;
 }
 
 // 连接操作
@@ -732,6 +744,7 @@ function handleMenuAction(key: string) {
                         }"
                         @explain="handleExplain"
                         @query-builder="handleOpenQueryBuilder"
+                        @agg-builder="handleOpenAggBuilder"
                         @format="handleFormat"
                         @insert-snippet="handleInsertSnippet"
                         @import="handleImport"
@@ -841,6 +854,15 @@ function handleMenuAction(key: string) {
       :database="activeTab.database"
       :collection="activeTab.collection"
       :initial-query-text="queryBuilderInitialText"
+      @run="handleQueryBuilderRun"
+      @insert="handleQueryBuilderInsert"
+    />
+    <AggregationBuilder
+      v-if="activeTab"
+      v-model:show="showAggBuilder"
+      :connection-id="activeTab.connectionId"
+      :database="activeTab.database"
+      :collection="activeTab.collection"
       @run="handleQueryBuilderRun"
       @insert="handleQueryBuilderInsert"
     />
