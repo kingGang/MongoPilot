@@ -19,6 +19,17 @@ export async function updateDocument(
   return invoke("update_document", { connectionId, database, collection, id, document });
 }
 
+/** 只更新被改的字段: 后端执行 `updateOne({_id}, {$set: fields})` */
+export async function setDocumentFields(
+  connectionId: string,
+  database: string,
+  collection: string,
+  id: string,
+  fields: Record<string, unknown>,
+): Promise<void> {
+  return invoke("set_document_fields", { connectionId, database, collection, id, fields });
+}
+
 export async function deleteDocument(
   connectionId: string,
   database: string,

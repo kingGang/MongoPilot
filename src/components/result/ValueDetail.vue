@@ -195,9 +195,9 @@ async function handleSave() {
   if (props.connectionId && props.database && props.collection && props.document) {
     saving.value = true;
     try {
-      const updatedDoc = { ...JSON.parse(JSON.stringify(props.document)), [props.field]: newValue };
       const idStr = props.documentId || extractId(props.document);
-      await docApi.updateDocument(props.connectionId, props.database, props.collection, idStr, updatedDoc);
+      // 只 $set 被改的这一个字段, 不重写整条文档
+      await docApi.setDocumentFields(props.connectionId, props.database, props.collection, idStr, { [props.field]: newValue });
       // 本地原地 mutate, Vue 响应式会让单元格立刻刷新, 不再需要整页 re-fetch
       (props.document as Record<string, unknown>)[props.field] = newValue;
       emit("saved");

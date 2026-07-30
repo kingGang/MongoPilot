@@ -65,6 +65,50 @@ pub async fn update_document(
     Ok(())
 }
 
+/// 只更新指定字段: `updateOne({_id}, {$set: fields})`.
+/// 表格内联编辑用它, 只动被改的字段, 不重写整条文档 (避免其它字段 BSON 类型漂移).
+#[tauri::command]
+pub async fn set_document_fields(
+    mgr: State<'_, ConnectionManager>,
+    connection_id: String,
+    database: String,
+    collection: String,
+    id: String,
+    fields: serde_json::Value,
+) -> Result<(), AppError> {
+    if mgr.is_read_only(&connection_id).await {
+        return Err(AppError::InvalidInput("只读连接: 不允许更新文档".into()));
+    }
+    let client = mgr.get_client(&connection_id).await?;
+    let coll = client.database(&database).collection::<Document>(&collection);
+
+    let mut set_doc: Document = serde_json::from_value(fields)
+        .map_err(|e| AppError::InvalidInput(format!("无效的更新字段 JSON: {e}")))?;
+
+    // 不允许通过 $set 改 _id
+    set_doc.remove("_id");
+    if set_doc.is_empty() {
+        return Ok(());
+    }
+
+    let filter = if let Ok(oid) = ObjectId::parse_str(&id) {
+        doc! { "_id": oid }
+    } else {
+        doc! { "_id": &id }
+    };
+
+    let result = coll
+        .update_one(filter, doc! { "$set": set_doc })
+        .await
+        .map_err(AppError::Mongo)?;
+
+    if result.matched_count == 0 {
+        return Err(AppError::NotFound(format!("文档 {id} 不存在")));
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn delete_document(
     mgr: State<'_, ConnectionManager>,

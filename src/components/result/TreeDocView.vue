@@ -279,8 +279,8 @@ async function commitInlineEdit() {
   }
   const docId = extractDocId(doc);
   try {
-    const updatedDoc = { ...JSON.parse(JSON.stringify(doc)), [key]: finalVal };
-    await docApi.updateDocument(props.connectionId, props.database, props.collection, docId, updatedDoc);
+    // 只 $set 被改的这一个字段, 不重写整条文档
+    await docApi.setDocumentFields(props.connectionId, props.database, props.collection, docId, { [key]: finalVal });
     (doc as Record<string, unknown>)[key] = finalVal;
     emitDirty(docIdx, key);
     message.success("已保存");

@@ -200,11 +200,9 @@ async function commitEdit() {
     ? String((docId as Record<string, unknown>).$oid ?? JSON.stringify(docId))
     : String(docId);
 
-  // 构建更新后的完整文档
-  const updatedDoc = { ...JSON.parse(JSON.stringify(doc)), [key]: finalVal };
-
   try {
-    await docApi.updateDocument(props.connectionId, props.database, props.collection, idStr, updatedDoc);
+    // 只 $set 被改的这一个字段, 不重写整条文档 (其它字段的 BSON 类型不受影响)
+    await docApi.setDocumentFields(props.connectionId, props.database, props.collection, idStr, { [key]: finalVal });
     // 更新本地数据
     (doc as Record<string, unknown>)[key] = finalVal;
     emitDirty(doc, key);
@@ -230,9 +228,10 @@ function isEditing(rowIdx: number, key: string): boolean {
 // 换掉原来的原生 title (会被视口裁掉、无法选中复制) + objectPreview 300 字截断。
 // 单实例 Teleport 浮层, 只在 mouseenter/leave 时切换, 不给每格挂组件, 拖列不卡。
 const hoverShow = ref(false);
-const hoverX = ref(0);
-const hoverY = ref(0);
+// 锚定到被悬停的单元格 (而非鼠标坐标) —— 定位稳定, 移过去不跑偏
+const hoverAnchor = ref({ left: 0, right: 0, top: 0, bottom: 0 });
 const hoverValue = shallowRef<unknown>(null);
+const hoverMode = ref<"fields" | "json">("fields");
 let hoverHideTimer: ReturnType<typeof setTimeout> | null = null;
 
 interface HoverRow {
@@ -269,17 +268,33 @@ const hoverRows = computed<HoverRow[]>(() => {
   });
 });
 
+const hoverJson = computed(() => {
+  try {
+    return JSON.stringify(hoverValue.value, null, 2);
+  } catch {
+    return String(hoverValue.value);
+  }
+});
+
 const hoverStyle = computed(() => {
-  const pad = 12;
+  const gap = 6;
   const w = 460;
   const hMax = 380;
+  const rowH = 22;
+  const headH = 34;
   const vw = window.innerWidth;
   const vh = window.innerHeight;
-  let left = hoverX.value + pad;
-  if (left + w > vw - 8) left = hoverX.value - w - pad; // 右边放不下 -> 翻到光标左边
-  if (left < 8) left = Math.max(8, vw - w - 8);
-  let top = hoverY.value + pad;
-  if (top + hMax > vh - 8) top = Math.max(8, vh - hMax - 8);
+  const a = hoverAnchor.value;
+  // 按实际内容估算面板高度 (字段模式一行一字段, JSON 模式按行数),
+  // 只在真的放不下时才翻转/上移 —— 避免小面板被按 380 预留而顶飞到单元格上方老远
+  const lines = hoverMode.value === "json" ? hoverJson.value.split("\n").length : hoverRows.value.length;
+  const estH = Math.min(hMax, headH + lines * rowH + 10);
+  // 默认贴在单元格右侧, 顶部与单元格对齐
+  let left = a.right + gap;
+  if (left + w > vw - 8) left = a.left - w - gap; // 右侧放不下 -> 翻到单元格左侧
+  if (left < 8) left = Math.max(8, Math.min(a.left, vw - w - 8));
+  let top = a.top;
+  if (top + estH > vh - 8) top = Math.max(8, vh - estH - 8); // 下方放不下 -> 上移
   return { left: `${left}px`, top: `${top}px`, width: `${w}px`, maxHeight: `${hMax}px` };
 });
 
@@ -289,8 +304,13 @@ function showHover(e: MouseEvent, val: unknown) {
     hoverHideTimer = null;
   }
   hoverValue.value = val;
-  hoverX.value = e.clientX;
-  hoverY.value = e.clientY;
+  const el = e.currentTarget as HTMLElement | null;
+  if (el && typeof el.getBoundingClientRect === "function") {
+    const r = el.getBoundingClientRect();
+    hoverAnchor.value = { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
+  } else {
+    hoverAnchor.value = { left: e.clientX, right: e.clientX, top: e.clientY, bottom: e.clientY };
+  }
   hoverShow.value = true;
 }
 function scheduleHideHover() {
@@ -740,21 +760,34 @@ async function handleCtxSelect(action: string) {
       >
         <div class="cell-hover-head">
           <span class="chh-title">{{ hoverTitle }}</span>
-          <button class="chh-copy-all" @click="copyHoverAll">复制 JSON</button>
+          <div class="chh-head-right">
+            <div class="chh-modes">
+              <button class="chh-mode" :class="{ active: hoverMode === 'fields' }" @click="hoverMode = 'fields'">
+                字段
+              </button>
+              <button class="chh-mode" :class="{ active: hoverMode === 'json' }" @click="hoverMode = 'json'">
+                JSON
+              </button>
+            </div>
+            <button class="chh-copy-all" @click="copyHoverAll">复制 JSON</button>
+          </div>
         </div>
         <div class="cell-hover-body">
-          <div
-            v-for="(row, i) in hoverRows"
-            :key="i"
-            class="chh-row"
-            :title="'点击复制 ' + row.label"
-            @click="copyHoverField(row)"
-          >
-            <span class="chh-key">{{ row.label }}</span>
-            <span class="chh-colon">:</span>
-            <span class="chh-val" :style="{ color: row.color || undefined }">{{ row.preview }}</span>
-            <span class="chh-copy-icon">⧉</span>
-          </div>
+          <template v-if="hoverMode === 'fields'">
+            <div
+              v-for="(row, i) in hoverRows"
+              :key="i"
+              class="chh-row"
+              :title="'点击复制 ' + row.label"
+              @click="copyHoverField(row)"
+            >
+              <span class="chh-key">{{ row.label }}</span>
+              <span class="chh-colon">:</span>
+              <span class="chh-val" :style="{ color: row.color || undefined }">{{ row.preview }}</span>
+              <span class="chh-copy-icon">⧉</span>
+            </div>
+          </template>
+          <pre v-else class="chh-json">{{ hoverJson }}</pre>
         </div>
       </div>
     </Teleport>
@@ -868,6 +901,32 @@ async function handleCtxSelect(action: string) {
   font-weight: 600;
   color: #666;
 }
+.chh-head-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chh-modes {
+  display: flex;
+  border: 1px solid #d0d0d6;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.chh-mode {
+  border: none;
+  background: #fff;
+  padding: 2px 10px;
+  font-size: 12px;
+  color: #666;
+  cursor: pointer;
+}
+.chh-mode + .chh-mode {
+  border-left: 1px solid #d0d0d6;
+}
+.chh-mode.active {
+  background: #e6f0ff;
+  color: #2266dd;
+}
 .chh-copy-all {
   flex: 0 0 auto;
   border: 1px solid #d0d0d6;
@@ -920,5 +979,15 @@ async function handleCtxSelect(action: string) {
 }
 .chh-row:hover .chh-copy-icon {
   color: #61afef;
+}
+.chh-json {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: "Consolas", "Menlo", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+  color: #333;
+  user-select: text;
 }
 </style>

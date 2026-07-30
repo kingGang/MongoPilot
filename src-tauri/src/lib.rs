@@ -85,6 +85,7 @@ pub fn run() {
             commands::query::clear_all_query_history,
             commands::document::insert_document,
             commands::document::update_document,
+            commands::document::set_document_fields,
             commands::document::delete_document,
             commands::document::delete_documents,
             commands::collection::create_collection,
