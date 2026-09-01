@@ -274,6 +274,33 @@ pub async fn export_query(
     exporter::stream_export(&client, &app, &request).await
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyzeFieldsRequest {
+    pub connection_id: String,
+    pub database: String,
+    pub query_text: String,
+    /// 只扫前 n 条; 不传 = 扫描全部结果
+    pub sample_limit: Option<i64>,
+}
+
+/// 扫描查询结果的全部顶层字段（导出对话框用）。
+/// 前端只有当前页文档，schema-less 集合里后面才出现的字段靠这个补齐。
+#[tauri::command]
+pub async fn analyze_query_fields(
+    mgr: State<'_, ConnectionManager>,
+    request: AnalyzeFieldsRequest,
+) -> Result<Vec<exporter::FieldInfo>, AppError> {
+    let client = mgr.get_client(&request.connection_id).await?;
+    exporter::analyze_fields(
+        &client,
+        &request.database,
+        &request.query_text,
+        request.sample_limit,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

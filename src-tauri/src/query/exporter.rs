@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use futures::StreamExt;
-use mongodb::bson::{Bson, Document};
+use mongodb::bson::{doc, Bson, Document};
 use mongodb::Client;
 use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
 use serde::Deserialize;
@@ -195,6 +195,30 @@ fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
+/// 从 `db.coll.find(...)` / `db.getCollection("a.b").aggregate(...)` 里
+/// 切出 (集合名, 剩余调用链). 导出与字段扫描共用同一份解析.
+fn split_collection(query_text: &str) -> Result<(String, &str), AppError> {
+    let query = query_text.trim();
+    let query = query
+        .strip_prefix("db.")
+        .ok_or_else(|| AppError::InvalidInput("查询必须以 db. 开头".into()))?;
+    if query.starts_with("getCollection(") {
+        let gc_end = query
+            .find(')')
+            .ok_or_else(|| AppError::InvalidInput("getCollection() 括号不匹配".into()))?;
+        let inner = &query["getCollection(".len()..gc_end];
+        let name = inner.trim().trim_matches(|c| c == '"' || c == '\'');
+        let after = &query[gc_end + 1..];
+        let after = after.strip_prefix('.').unwrap_or(after);
+        Ok((name.to_string(), after))
+    } else {
+        let dot_pos = query
+            .find('.')
+            .ok_or_else(|| AppError::InvalidInput("格式错误".into()))?;
+        Ok((query[..dot_pos].to_string(), &query[dot_pos + 1..]))
+    }
+}
+
 /// 从查询文本解析出 filter/sort/projection/limit/skip 并构建 MongoDB cursor
 async fn build_find_cursor(
     collection: &mongodb::Collection<Document>,
@@ -271,25 +295,7 @@ pub async fn stream_export(
     app: &AppHandle,
     req: &ExportRequest,
 ) -> Result<u64, AppError> {
-    let query = req.query_text.trim();
-    let query = query.strip_prefix("db.").ok_or_else(|| {
-        AppError::InvalidInput("查询必须以 db. 开头".into())
-    })?;
-    let (coll_name, rest) = if query.starts_with("getCollection(") {
-        let gc_end = query.find(')').ok_or_else(|| {
-            AppError::InvalidInput("getCollection() 括号不匹配".into())
-        })?;
-        let inner = &query["getCollection(".len()..gc_end];
-        let name = inner.trim().trim_matches(|c| c == '"' || c == '\'');
-        let after = &query[gc_end + 1..];
-        let after = after.strip_prefix('.').unwrap_or(after);
-        (name.to_string(), after)
-    } else {
-        let dot_pos = query.find('.').ok_or_else(|| {
-            AppError::InvalidInput("格式错误".into())
-        })?;
-        (query[..dot_pos].to_string(), &query[dot_pos + 1..])
-    };
+    let (coll_name, rest) = split_collection(&req.query_text)?;
 
     let db = client.database(&req.database);
     let collection = db.collection::<Document>(&coll_name);
@@ -576,6 +582,160 @@ fn write_bson_to_cell(
     }
 }
 
+/// 导出对话框里列出的一个字段
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldInfo {
+    pub name: String,
+    /// 与前端 `getBsonType()` 对齐的类型名 (String / Int32 / Date / Document ...)
+    pub bson_type: String,
+}
+
+/// MongoDB `$type` 返回值 -> 前端使用的 BSON 类型名
+fn map_mongo_type(t: &str) -> &'static str {
+    match t {
+        "double" => "Double",
+        "string" => "String",
+        "object" => "Document",
+        "array" => "Array",
+        "binData" => "Binary",
+        "objectId" => "ObjectId",
+        "bool" => "Boolean",
+        "date" => "Date",
+        "null" | "missing" => "Null",
+        "regex" => "Regex",
+        "javascript" | "javascriptWithScope" => "JavaScript",
+        "int" => "Int32",
+        "timestamp" => "Timestamp",
+        "long" => "Int64",
+        "decimal" => "Decimal128",
+        "minKey" => "MinKey",
+        "maxKey" => "MaxKey",
+        _ => "Unknown",
+    }
+}
+
+/// 一个字段在整个结果集里可能出现多种类型: 取第一个非 Null 的作为展示类型.
+/// (先排序, 保证同一份数据每次扫描结果一致)
+fn pick_bson_type(types: &[String]) -> String {
+    let mut sorted: Vec<&str> = types.iter().map(|s| s.as_str()).collect();
+    sorted.sort_unstable();
+    for t in &sorted {
+        let mapped = map_mongo_type(t);
+        if mapped != "Null" {
+            return mapped.to_string();
+        }
+    }
+    "Null".to_string()
+}
+
+/// 把 `find(...)` 调用链翻译成等价的聚合管道 (只用于字段扫描,
+/// 解析规则与 [`build_find_cursor`] 保持一致).
+fn find_to_pipeline(rest: &str) -> Result<Vec<Document>, AppError> {
+    let filter_str = extract_parens(rest, "find")?;
+    let filter: Document = parse_json_arg(&filter_str)?;
+
+    let after_find = &rest[rest.find(')').unwrap_or(rest.len()) + 1..];
+    let projection = parse_chained_arg(after_find, ".projection(");
+    let sort = parse_chained_arg(after_find, ".sort(");
+    let limit = parse_chained_arg(after_find, ".limit(").and_then(|s| s.trim().parse::<i64>().ok());
+    let skip = parse_chained_arg(after_find, ".skip(").and_then(|s| s.trim().parse::<i64>().ok());
+
+    let mut pipeline = vec![doc! { "$match": filter }];
+    if let Some(sort_str) = sort {
+        let d: Document = parse_json_arg(&sort_str)?;
+        if !d.is_empty() {
+            pipeline.push(doc! { "$sort": d });
+        }
+    }
+    if let Some(sk) = skip.filter(|v| *v > 0) {
+        pipeline.push(doc! { "$skip": sk });
+    }
+    if let Some(l) = limit.filter(|v| *v > 0) {
+        pipeline.push(doc! { "$limit": l });
+    }
+    if let Some(proj_str) = projection {
+        let d: Document = parse_json_arg(&proj_str)?;
+        if !d.is_empty() {
+            pipeline.push(doc! { "$project": d });
+        }
+    }
+    Ok(pipeline)
+}
+
+/// 扫描查询结果里出现过的**全部**顶层字段.
+///
+/// 前端只拿到当前页的文档, schema-less 集合里后面几页才出现的字段就漏了;
+/// 这里在服务端用 `$objectToArray` + `$group` 汇总键名, 只把键名/类型传回来, 不搬数据.
+///
+/// `sample_limit`: `Some(n)` 只扫前 n 条 (快速预览), `None` 扫全部结果.
+pub async fn analyze_fields(
+    client: &Client,
+    database: &str,
+    query_text: &str,
+    sample_limit: Option<i64>,
+) -> Result<Vec<FieldInfo>, AppError> {
+    let (coll_name, rest) = split_collection(query_text)?;
+    let collection = client.database(database).collection::<Document>(&coll_name);
+
+    let mut pipeline = if rest.starts_with("find(") {
+        find_to_pipeline(rest)?
+    } else if rest.starts_with("aggregate(") {
+        let arg_str = extract_parens(rest, "aggregate")?;
+        aggregate_pipeline_from_arg(&arg_str)?
+    } else {
+        return Err(AppError::InvalidInput(
+            "字段扫描仅支持 find 或 aggregate 查询".into(),
+        ));
+    };
+
+    // $out / $merge 会把结果写库, 后面不能再接 stage
+    if pipeline
+        .iter()
+        .any(|st| st.contains_key("$out") || st.contains_key("$merge"))
+    {
+        return Err(AppError::InvalidInput(
+            "含 $out / $merge 的管道不支持字段扫描".into(),
+        ));
+    }
+
+    if let Some(n) = sample_limit.filter(|n| *n > 0) {
+        pipeline.push(doc! { "$limit": n });
+    }
+    pipeline.push(doc! { "$project": { "_mpKv": { "$objectToArray": "$$ROOT" } } });
+    pipeline.push(doc! { "$unwind": "$_mpKv" });
+    pipeline.push(doc! { "$group": {
+        "_id": "$_mpKv.k",
+        "types": { "$addToSet": { "$type": "$_mpKv.v" } },
+    }});
+    pipeline.push(doc! { "$sort": { "_id": 1 } });
+
+    let mut cursor = collection
+        .aggregate(pipeline)
+        .allow_disk_use(true)
+        .await
+        .map_err(AppError::Mongo)?;
+
+    let mut fields = Vec::new();
+    while let Some(item) = cursor.next().await {
+        let d = item.map_err(AppError::Mongo)?;
+        let Ok(name) = d.get_str("_id") else { continue };
+        let types: Vec<String> = d
+            .get_array("types")
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|b| b.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        fields.push(FieldInfo {
+            name: name.to_string(),
+            bson_type: pick_bson_type(&types),
+        });
+    }
+    Ok(fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +751,51 @@ mod tests {
                 .timestamp_millis();
             assert_eq!(back, ms, "字符串 {s} 应还原为同一瞬时");
         }
+    }
+
+    #[test]
+    fn split_collection_handles_plain_and_get_collection() {
+        let (c, rest) = split_collection("db.email.find({})").unwrap();
+        assert_eq!(c, "email");
+        assert!(rest.starts_with("find("));
+
+        let (c, rest) = split_collection("  db.getCollection(\"a.b\").aggregate([])  ").unwrap();
+        assert_eq!(c, "a.b");
+        assert!(rest.starts_with("aggregate("));
+
+        assert!(split_collection("email.find({})").is_err());
+    }
+
+    /// find 调用链 -> 聚合管道: 阶段顺序 $match -> $sort -> $skip -> $limit -> $project
+    #[test]
+    fn find_to_pipeline_keeps_stage_order() {
+        let p = find_to_pipeline(
+            r#"find({"a":1}).projection({"b":1}).sort({"c":-1}).skip(5).limit(10)"#,
+        )
+        .unwrap();
+        let names: Vec<&str> = p.iter().map(|d| d.keys().next().unwrap().as_str()).collect();
+        assert_eq!(names, vec!["$match", "$sort", "$skip", "$limit", "$project"]);
+        assert_eq!(p[3].get_i64("$limit").unwrap(), 10);
+    }
+
+    #[test]
+    fn find_to_pipeline_without_chain_is_match_only() {
+        let p = find_to_pipeline("find({})").unwrap();
+        assert_eq!(p.len(), 1);
+        assert!(p[0].contains_key("$match"));
+    }
+
+    /// 字段在结果集里既有 null 又有真实类型时, 展示真实类型
+    #[test]
+    fn pick_bson_type_prefers_non_null() {
+        assert_eq!(
+            pick_bson_type(&["null".into(), "string".into()]),
+            "String"
+        );
+        assert_eq!(pick_bson_type(&["missing".into()]), "Null");
+        assert_eq!(pick_bson_type(&[]), "Null");
+        assert_eq!(pick_bson_type(&["objectId".into()]), "ObjectId");
+        assert_eq!(pick_bson_type(&["long".into()]), "Int64");
     }
 
     /// bson_to_simple 的日期输出也应带偏移量并可还原

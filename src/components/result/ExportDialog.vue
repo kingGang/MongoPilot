@@ -13,7 +13,7 @@ import { invoke } from "@/api/invoke";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useConnectionStore } from "@/stores/connection";
 import { useDatabaseStore } from "@/stores/database";
-import { FORMAT_LIST, type ExportFormat } from "@/api/export";
+import { FORMAT_LIST, analyzeQueryFields, type ExportFormat, type QueryFieldInfo } from "@/api/export";
 import { getBsonType } from "@/utils/bson-format";
 
 const props = defineProps<{
@@ -64,6 +64,14 @@ function handleConnChange(connId: string) {
   selectedConnId.value = connId;
   const dbs = dbStore.getDatabases(connId);
   selectedDb.value = dbs[0]?.name ?? "";
+  scannedFields.value = [];
+  if (props.show) runFieldScan();
+}
+
+function handleDbChange(db: string) {
+  selectedDb.value = db;
+  scannedFields.value = [];
+  if (props.show) runFieldScan();
 }
 
 // ---- 表单 ----
@@ -97,7 +105,8 @@ const delimiterOptions = [
 ];
 
 // ---- 字段 ----
-const allFields = computed(() => {
+/** 当前页文档里出现的字段 (保持文档里的键顺序) */
+const localFields = computed(() => {
   const fieldSet = new Set<string>();
   for (const doc of props.documents) {
     for (const key of Object.keys(doc)) fieldSet.add(key);
@@ -105,8 +114,34 @@ const allFields = computed(() => {
   return Array.from(fieldSet);
 });
 
-/** 每个字段的 BSON 类型: 取首个非空值推断, 若全空则 Null */
+/** 后端对整个结果集扫描出来的字段 (schema-less 集合里后面才出现的字段) */
+const scannedFields = ref<QueryFieldInfo[]>([]);
+const scanning = ref(false);
+const scanError = ref("");
+/** 并发保护: 只认最后一次扫描的结果 */
+let scanToken = 0;
+
+/** 当前页字段在前, 扫描出来的新字段按名字追加在后 */
+const allFields = computed(() => {
+  const out = [...localFields.value];
+  const seen = new Set(out);
+  for (const f of scannedFields.value) {
+    if (!seen.has(f.name)) {
+      seen.add(f.name);
+      out.push(f.name);
+    }
+  }
+  return out;
+});
+
+/**
+ * 每个字段的 BSON 类型: 优先按当前页文档里首个非空值推断;
+ * 当前页取不到 (字段没出现 / 全是 null) 时用后端扫描的类型.
+ */
 const fieldTypes = computed<Record<string, string>>(() => {
+  const scanned: Record<string, string> = {};
+  for (const f of scannedFields.value) scanned[f.name] = f.bsonType;
+
   const m: Record<string, string> = {};
   for (const f of allFields.value) {
     let t = "Null";
@@ -116,10 +151,49 @@ const fieldTypes = computed<Record<string, string>>(() => {
       t = getBsonType(v);
       break;
     }
+    if (t === "Null" && scanned[f]) t = scanned[f];
     m[f] = t;
   }
   return m;
 });
+
+/** 给 Date 字段补上默认 Excel pattern (只补没设过的) */
+function fillDateFormats(fields: string[]) {
+  const next = { ...fieldDateFormats.value };
+  for (const f of fields) {
+    if (fieldTypes.value[f] === "Date" && next[f] === undefined) {
+      next[f] = DEFAULT_DATE_FORMAT;
+    }
+  }
+  fieldDateFormats.value = next;
+}
+
+/** 扫描整个结果集的字段 —— 当前页之外的字段靠它补齐 */
+async function runFieldScan() {
+  const q = props.queryText?.trim();
+  if (!q || !selectedConnId.value || !selectedDb.value) return;
+
+  const token = ++scanToken;
+  scanning.value = true;
+  scanError.value = "";
+  const before = new Set(allFields.value);
+  try {
+    const list = await analyzeQueryFields(selectedConnId.value, selectedDb.value, q);
+    if (token !== scanToken) return;
+    scannedFields.value = list;
+    // 新发现的字段默认勾选 (用户已手动取消的不受影响)
+    const added = allFields.value.filter((f) => !before.has(f));
+    if (added.length) {
+      selectedFields.value = [...selectedFields.value, ...added];
+      fillDateFormats(added);
+    }
+  } catch (e) {
+    if (token !== scanToken) return;
+    scanError.value = String(e);
+  } finally {
+    if (token === scanToken) scanning.value = false;
+  }
+}
 
 /**
  * 把 BSON 类型映射成在当前导出格式下的"导出类型"标签.
@@ -223,6 +297,8 @@ watch(() => props.show, (show) => {
   if (show) {
     selectedConnId.value = props.connectionId;
     selectedDb.value = props.database;
+    scannedFields.value = [];
+    scanError.value = "";
     selectedFields.value = [...allFields.value];
     fieldOverrides.value = {};
     // Date 字段填默认 pattern, 其他不动
@@ -236,6 +312,11 @@ watch(() => props.show, (show) => {
     exporting.value = false;
     exportedCount.value = 0;
     exportTotal.value = 0;
+    // 当前页只是结果的一部分, 到服务端把整个结果集的字段扫全
+    runFieldScan();
+  } else {
+    scanToken++; // 关闭时丢弃在途扫描结果
+    scanning.value = false;
   }
 });
 
@@ -366,11 +447,12 @@ const canExport = computed(() =>
             @update:value="handleConnChange"
           />
           <n-select
-            v-model:value="selectedDb"
+            :value="selectedDb"
             :options="dbOptions"
             size="small"
             style="width: 180px; margin-left: 8px"
             :disabled="exporting"
+            @update:value="handleDbChange"
           />
         </div>
 
@@ -443,7 +525,21 @@ const canExport = computed(() =>
       <div class="field-section">
         <div class="field-header">
           <span class="field-title">Fields Selection:</span>
-          <span class="field-hint">May not list all fields due to MongoDB schema-less feature</span>
+          <span v-if="scanning" class="field-scanning">正在扫描全部结果的字段...</span>
+          <span v-else-if="scanError" class="field-hint" :title="scanError">
+            字段扫描失败，仅列出当前页出现的字段
+          </span>
+          <span v-else-if="scannedFields.length" class="field-scanned">
+            已扫描全部结果，共 {{ allFields.length }} 个字段
+          </span>
+          <span v-else class="field-hint">May not list all fields due to MongoDB schema-less feature</span>
+          <n-button
+            text
+            size="tiny"
+            class="field-rescan"
+            :disabled="scanning || exporting"
+            @click="runFieldScan"
+          >重新扫描</n-button>
         </div>
 
         <div class="field-toolbar">
@@ -631,6 +727,18 @@ const canExport = computed(() =>
 .field-hint {
   font-size: 12px;
   color: #d03050;
+}
+.field-scanning {
+  font-size: 12px;
+  color: #888;
+}
+.field-scanned {
+  font-size: 12px;
+  color: #18a058;
+}
+.field-rescan {
+  margin-left: auto;
+  font-size: 12px;
 }
 /* Grid 5 列: checkbox | 字段名 | 字段类型 | 导出类型 (select) | 计数/auto提示 */
 .field-toolbar,

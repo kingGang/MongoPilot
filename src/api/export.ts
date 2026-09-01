@@ -77,6 +77,39 @@ export const FORMAT_LIST: FormatInfo[] = [
 ];
 
 // =====================================================================
+//  字段扫描
+// =====================================================================
+
+export interface QueryFieldInfo {
+  name: string;
+  /** 与 getBsonType() 对齐的类型名 */
+  bsonType: string;
+}
+
+/**
+ * 扫描查询结果里出现过的全部顶层字段。
+ * 前端只有当前页文档，schema-less 集合里后面才出现的字段靠后端聚合补齐
+ * （服务端 $objectToArray + $group，只回传键名/类型，不搬数据）。
+ *
+ * @param sampleLimit 只扫前 n 条；不传 = 扫描全部结果
+ */
+export async function analyzeQueryFields(
+  connectionId: string,
+  database: string,
+  queryText: string,
+  sampleLimit?: number,
+): Promise<QueryFieldInfo[]> {
+  return invoke<QueryFieldInfo[]>("analyze_query_fields", {
+    request: {
+      connectionId,
+      database,
+      queryText,
+      sampleLimit: sampleLimit ?? null,
+    },
+  });
+}
+
+// =====================================================================
 //  BSON 值转换（3 种模式）
 // =====================================================================
 

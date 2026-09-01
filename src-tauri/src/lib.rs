@@ -132,6 +132,7 @@ pub fn run() {
             commands::export::write_export_file,
             commands::export::write_export_binary,
             commands::export::export_query,
+            commands::export::analyze_query_fields,
             commands::export::read_import_file,
             commands::export::import_documents,
             commands::export::stream_import,
