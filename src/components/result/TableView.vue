@@ -3,6 +3,8 @@ import { computed, h, ref, shallowRef, nextTick, watch, onBeforeUnmount } from "
 import { NDataTable, NDropdown, useMessage } from "naive-ui";
 import type { DataTableColumns, DataTableColumn } from "naive-ui";
 import { getBsonType, formatBsonCell, getValueColor, objectIdHoverText } from "@/utils/bson-format";
+import { useImageHover, imageUrlCandidate } from "@/utils/image-preview";
+import ImageHoverPreview from "./ImageHoverPreview.vue";
 import { highlightKeyword } from "@/utils/text-highlight";
 import * as docApi from "@/api/document";
 import ValueDetail from "./ValueDetail.vue";
@@ -223,6 +225,18 @@ function cancelEdit() {
 function isEditing(rowIdx: number, key: string): boolean {
   return editingRow.value === rowIdx && editingKey.value === key;
 }
+
+// ---- 图片链接 hover 浮层: 值是图片 URL 时悬停出缩略图 ----
+const {
+  imgVisible,
+  imgUrl,
+  imgSize,
+  imgAnchor,
+  showImageHover,
+  hideImageHoverSoon,
+  cancelImageHoverHide,
+  hideImageHover,
+} = useImageHover();
 
 // ---- 复杂单元格 hover 浮层 (Document / Array): 完整内容 + 逐字段可复制 ----
 // 换掉原来的原生 title (会被视口裁掉、无法选中复制) + objectPreview 300 字截断。
@@ -571,6 +585,13 @@ watch(
         // ObjectId 的 title 额外带上内嵌创建时间。
         const text = formatBsonCell(val);
         const cellTitle = type === "ObjectId" ? objectIdHoverText(val) : text;
+        // 图片链接: 额外挂 hover 出缩略图 (值本身照常显示/编辑)
+        const imgHandlers = imageUrlCandidate(val)
+          ? {
+              onMouseenter: (e: MouseEvent) => showImageHover(e, val),
+              onMouseleave: () => hideImageHoverSoon(),
+            }
+          : {};
         if (props.searchKeyword) {
           return h("span", {
             style: `${color ? `color:${color};` : ""}cursor:text`,
@@ -578,8 +599,10 @@ watch(
             innerHTML: highlightKeyword(text, props.searchKeyword, !!props.matchCase),
             onDblclick: (e: MouseEvent) => {
               e.stopPropagation();
+              hideImageHover();
               startEdit(rowIdx, key, val, type);
             },
+            ...imgHandlers,
           });
         }
         return h("span", {
@@ -587,8 +610,10 @@ watch(
           title: cellTitle,
           onDblclick: (e: MouseEvent) => {
             e.stopPropagation();
+            hideImageHover();
             startEdit(rowIdx, key, val, type);
           },
+          ...imgHandlers,
         }, text);
       },
     }));
@@ -749,6 +774,14 @@ async function handleCtxSelect(action: string) {
       :y="ctxMenuY"
       @select="handleCtxSelect"
       @clickoutside="showCtxMenu = false"
+    />
+    <ImageHoverPreview
+      :show="imgVisible"
+      :url="imgUrl"
+      :size="imgSize"
+      :anchor="imgAnchor"
+      @enter="cancelImageHoverHide"
+      @leave="hideImageHoverSoon"
     />
     <Teleport to="body">
       <div

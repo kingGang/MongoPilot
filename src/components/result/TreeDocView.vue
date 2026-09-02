@@ -2,6 +2,8 @@
 import { ref, computed, watch, nextTick } from "vue";
 import { NTooltip, NDropdown, NCheckbox, useMessage } from "naive-ui";
 import { getBsonType, formatTreeValue, extractIdDisplay, getTypeColor, getValueColor } from "@/utils/bson-format";
+import { useImageHover } from "@/utils/image-preview";
+import ImageHoverPreview from "./ImageHoverPreview.vue";
 import { highlightKeyword } from "@/utils/text-highlight";
 import ValueDetail from "./ValueDetail.vue";
 import DocumentViewer from "./DocumentViewer.vue";
@@ -41,6 +43,24 @@ const emit = defineEmits<{
   /** 编辑成功 -> 上报 (docKey, field) 让父组件维护 dirty 集合 */
   dirty: [docKey: string, field: string];
 }>();
+
+/** 叶子值双击: 先收掉图片浮层再走原来的编辑/详情逻辑 */
+function onLeafDblclick(row: RowItem, e: MouseEvent) {
+  hideImageHover();
+  onValueDblclick(row, e);
+}
+
+// ---- 图片链接 hover 浮层: 值是图片 URL 时悬停出缩略图 ----
+const {
+  imgVisible,
+  imgUrl,
+  imgSize,
+  imgAnchor,
+  showImageHover,
+  hideImageHoverSoon,
+  cancelImageHoverHide,
+  hideImageHover,
+} = useImageHover();
 
 // 是否启用多选 UI (需父组件提供 key 函数)
 const selectionEnabled = computed(() => !!props.docKeyFn);
@@ -636,7 +656,9 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
                   cursor: isEditableLeaf(row) ? 'text' : 'default',
                 }"
                 :title="isEditableLeaf(row) ? '双击修改' : ''"
-                @dblclick.stop="onValueDblclick(row, $event)"
+                @mouseenter="showImageHover($event, row.value)"
+                @mouseleave="hideImageHoverSoon()"
+                @dblclick.stop="onLeafDblclick(row, $event)"
                 v-html="hl(row.displayValue)"
               />
             </template>
@@ -647,6 +669,14 @@ function flattenFields(obj: Record<string, unknown>, parentPath: string, depth: 
         </tr>
       </tbody>
     </table>
+    <ImageHoverPreview
+      :show="imgVisible"
+      :url="imgUrl"
+      :size="imgSize"
+      :anchor="imgAnchor"
+      @enter="cancelImageHoverHide"
+      @leave="hideImageHoverSoon"
+    />
     <ValueDetail
       v-model:show="showDetail"
       :field="detailField"
