@@ -484,6 +484,8 @@ export interface ScriptRunResult {
   output: string[];
   /** 脚本执行抛错时的信息; null 表示成功跑完 */
   error: string | null;
+  /** 脚本最后一个表达式的值 (mongosh 里会被当结果显示); 没有则 undefined */
+  value?: unknown;
 }
 
 /** 会改库的方法 —— 脚本模式里这些被收集, 其它读方法返回安全默认值 */
@@ -585,22 +587,309 @@ function collectFunctionNames(code: string): Set<string> {
   return names;
 }
 
+// ---------------------------------------------------------------------------
+// awaitify —— 把 mongosh 的同步写法改写成沙箱里的 async/await
+// ---------------------------------------------------------------------------
+
+/** acorn 节点: 只用到 type/start/end, 其余子节点按需取 */
+type AstNode = { type: string; start: number; end: number; [key: string]: unknown };
+
+const FUNC_TYPES = new Set([
+  "FunctionDeclaration",
+  "FunctionExpression",
+  "ArrowFunctionExpression",
+]);
+
+/**
+ * 回调里有 db 调用时需要"逐个 await"的数组方法 -> 沙箱里的异步版助手。
+ * 回调被改成 async 后原生 forEach/map 不会等它 (只会拿到一堆 Promise),
+ * 必须换成串行版, 语义才和 mongosh 的同步写法一致。
+ */
+const ASYNC_ITER_HELPERS: Record<string, string> = {
+  forEach: "__aForEach__",
+  map: "__aMap__",
+  filter: "__aFilter__",
+  some: "__aSome__",
+  every: "__aEvery__",
+  find: "__aFind__",
+  findIndex: "__aFindIndex__",
+  flatMap: "__aFlatMap__",
+  reduce: "__aReduce__",
+};
+
+interface SrcEdit {
+  start: number;
+  end: number;
+  text: string;
+  /** 同一位置的先后: 小的先输出 (return < async < 数组助手前缀 < await) */
+  order: number;
+  /** 同位置同 order 时覆盖范围大的先输出 —— 外层调用要包住内层 */
+  span: number;
+}
+
+function isAstNode(v: unknown): v is AstNode {
+  return typeof v === "object" && v !== null && typeof (v as { type?: unknown }).type === "string";
+}
+
+/** 泛型子节点遍历: 不依赖 estree 的节点字段表 */
+function astChildren(node: AstNode): AstNode[] {
+  const out: AstNode[] = [];
+  for (const key of Object.keys(node)) {
+    if (key === "type" || key === "start" || key === "end") continue;
+    const v = node[key];
+    if (Array.isArray(v)) {
+      for (const c of v) if (isAstNode(c)) out.push(c);
+    } else if (isAstNode(v)) {
+      out.push(v);
+    }
+  }
+  return out;
+}
+
+/** 一个要插 `await ` 的位置 */
+interface AwaitSite {
+  pos: number;
+  /** 所在函数 (null = 顶层) */
+  fn: AstNode | null;
+  /** null = db.* 链, 恒定要 await; 否则是具名函数调用, 被调函数变 async 时才要 */
+  calleeName: string | null;
+}
+
+/** 一个 `arr.forEach(cb)` 之类的调用点 */
+interface IterSite {
+  callStart: number;
+  callEnd: number;
+  objStart: number;
+  objEnd: number;
+  calleeEnd: number;
+  helper: string;
+  cbNode: AstNode | null;
+  cbName: string | null;
+  fn: AstNode | null;
+}
+
+/**
+ * AST 版改写 (主路径)。相比字符扫描版:
+ *   - 只把**真的含 db 调用**的函数改成 async (不再一刀切给所有具名函数加 async,
+ *     那会让纯计算 helper 的调用点也被 await, 在非 async 的箭头回调里直接语法错);
+ *   - 箭头函数/函数表达式也纳入作用域跟踪, 里面的 db 调用同样能 await;
+ *   - 回调变 async 后, `arr.forEach(cb)` 换成 `await __aForEach__(arr, cb)`,
+ *     否则原生 forEach 不等回调, 顺序和结果都是错的;
+ *   - 顶层最后一条表达式语句改成 `return`, 让脚本的"最后一个表达式"成为结果。
+ *
+ * 解析不了 (mongosh 特有语法) 或改写后语法不合法时返回 null, 由调用方回退。
+ */
+function awaitifyViaAst(code: string): string | null {
+  let ast: AstNode;
+  try {
+    ast = Parser.parse(code, {
+      ecmaVersion: "latest",
+      allowAwaitOutsideFunction: true,
+      allowReturnOutsideFunction: true,
+    }) as unknown as AstNode;
+  } catch {
+    return null;
+  }
+
+  const fnByName = new Map<string, AstNode>();
+  const alreadyAsync = new Set<AstNode>();
+  const asyncInsertPos = new Map<AstNode, number>();
+  /** getter/setter 不能加 async */
+  const unmarkable = new Set<AstNode>();
+  const awaitSites: AwaitSite[] = [];
+  const iterSites: IterSite[] = [];
+
+  const walk = (node: AstNode, parent: AstNode | null, fn: AstNode | null): void => {
+    if (node.type === "FunctionDeclaration") {
+      const id = node.id;
+      if (isAstNode(id) && typeof id.name === "string") fnByName.set(id.name, node);
+    } else if (node.type === "VariableDeclarator") {
+      const id = node.id;
+      const init = node.init;
+      if (
+        isAstNode(id) &&
+        id.type === "Identifier" &&
+        typeof id.name === "string" &&
+        isAstNode(init) &&
+        FUNC_TYPES.has(init.type)
+      ) {
+        fnByName.set(id.name, init);
+      }
+    }
+
+    if (FUNC_TYPES.has(node.type)) {
+      if (node.async === true) alreadyAsync.add(node);
+      let pos = node.start;
+      if (parent && (parent.type === "Property" || parent.type === "MethodDefinition")) {
+        const pv = parent.value;
+        const key = parent.key;
+        if (isAstNode(pv) && pv === node) {
+          const kind = typeof parent.kind === "string" ? parent.kind : "";
+          if (kind === "get" || kind === "set") unmarkable.add(node);
+          // 方法简写 `foo() {}`: 节点从参数括号开始, async 要插在方法名前
+          if ((parent.method === true || parent.type === "MethodDefinition") && isAstNode(key)) {
+            pos = key.start;
+          }
+        }
+      }
+      asyncInsertPos.set(node, pos);
+    }
+
+    // db.xxx / db[...]: await 整条链 (await 优先级低于成员/调用, 天然覆盖到链尾)
+    if (
+      node.type === "Identifier" &&
+      node.name === "db" &&
+      parent &&
+      parent.type === "MemberExpression"
+    ) {
+      const po = parent.object;
+      if (isAstNode(po) && po === node) {
+        awaitSites.push({ pos: node.start, fn, calleeName: null });
+      }
+    }
+
+    if (node.type === "CallExpression") {
+      const callee = node.callee;
+      if (isAstNode(callee) && callee.type === "Identifier" && typeof callee.name === "string") {
+        awaitSites.push({ pos: node.start, fn, calleeName: callee.name });
+      } else if (
+        isAstNode(callee) &&
+        callee.type === "MemberExpression" &&
+        callee.computed !== true &&
+        callee.optional !== true &&
+        node.optional !== true
+      ) {
+        const prop = callee.property;
+        const obj = callee.object;
+        const args = Array.isArray(node.arguments) ? node.arguments.filter(isAstNode) : [];
+        const helper =
+          isAstNode(prop) && typeof prop.name === "string"
+            ? ASYNC_ITER_HELPERS[prop.name]
+            : undefined;
+        if (helper && isAstNode(obj) && args.length > 0) {
+          const first = args[0];
+          iterSites.push({
+            callStart: node.start,
+            callEnd: node.end,
+            objStart: obj.start,
+            objEnd: obj.end,
+            calleeEnd: callee.end,
+            helper,
+            cbNode: FUNC_TYPES.has(first.type) ? first : null,
+            cbName:
+              first.type === "Identifier" && typeof first.name === "string" ? first.name : null,
+            fn,
+          });
+        }
+      }
+    }
+
+    const nextFn = FUNC_TYPES.has(node.type) ? node : fn;
+    for (const child of astChildren(node)) walk(child, node, nextFn);
+  };
+  walk(ast, null, null);
+
+  // 谁必须变 async: 含 await 的函数 -> 它的调用点也要 await -> 再传染上去, 迭代到不动为止
+  const asyncFns = new Set<AstNode>(alreadyAsync);
+  const isAsyncName = (name: string): boolean => {
+    const f = fnByName.get(name);
+    return !!f && asyncFns.has(f);
+  };
+  const activeAwait = new Set<AwaitSite>();
+  const activeIter = new Set<IterSite>();
+  for (let guard = 0; guard < 64; guard++) {
+    let changed = false;
+    for (const site of awaitSites) {
+      if (activeAwait.has(site)) continue;
+      if (site.calleeName !== null && !isAsyncName(site.calleeName)) continue;
+      activeAwait.add(site);
+      if (site.fn && !asyncFns.has(site.fn)) {
+        asyncFns.add(site.fn);
+        changed = true;
+      }
+    }
+    for (const site of iterSites) {
+      if (activeIter.has(site)) continue;
+      const cb = site.cbNode ?? (site.cbName ? (fnByName.get(site.cbName) ?? null) : null);
+      if (!cb || !asyncFns.has(cb)) continue;
+      activeIter.add(site);
+      if (site.fn && !asyncFns.has(site.fn)) {
+        asyncFns.add(site.fn);
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+
+  const edits: SrcEdit[] = [];
+  for (const f of asyncFns) {
+    if (alreadyAsync.has(f) || unmarkable.has(f)) continue;
+    const pos = asyncInsertPos.get(f);
+    if (pos === undefined) continue;
+    edits.push({ start: pos, end: pos, text: "async ", order: 0, span: 0 });
+  }
+  for (const site of activeIter) {
+    const parenPos = code.indexOf("(", site.calleeEnd);
+    if (parenPos < 0) continue;
+    // `OBJ.forEach(` -> `await __aForEach__(OBJ, `
+    edits.push({
+      start: site.objStart,
+      end: site.objStart,
+      text: `await ${site.helper}(`,
+      order: 1,
+      span: site.callEnd - site.callStart,
+    });
+    edits.push({ start: site.objEnd, end: parenPos + 1, text: ", ", order: 1, span: 0 });
+  }
+  for (const site of activeAwait) {
+    edits.push({ start: site.pos, end: site.pos, text: "await ", order: 2, span: 0 });
+  }
+  // 顶层最后一条表达式语句 -> return, 脚本的"最后一个表达式"当结果显示
+  const topBody = Array.isArray(ast.body) ? ast.body.filter(isAstNode) : [];
+  const lastStmt = topBody.length > 0 ? topBody[topBody.length - 1] : null;
+  if (lastStmt && lastStmt.type === "ExpressionStatement") {
+    edits.push({ start: lastStmt.start, end: lastStmt.start, text: "return ", order: -1, span: 0 });
+  }
+
+  edits.sort((a, b) => a.start - b.start || a.order - b.order || b.span - a.span);
+  let out = "";
+  let cursor = 0;
+  for (const e of edits) {
+    if (e.start < cursor) return null; // 编辑区间重叠 (不该发生) -> 放弃 AST 版
+    out += code.slice(cursor, e.start) + e.text;
+    cursor = Math.max(cursor, e.end);
+  }
+  out += code.slice(cursor);
+
+  // 保险: 改写后必须还是合法 JS, 否则宁可退回原策略
+  try {
+    Parser.parse(out, {
+      ecmaVersion: "latest",
+      allowAwaitOutsideFunction: true,
+      allowReturnOutsideFunction: true,
+    });
+  } catch {
+    return null;
+  }
+  return out;
+}
+
 /**
  * 让 mongosh 那种同步写法在 webview 沙箱里成立: 把 db 读操作 await 成真正的后端查询。
- *
- * 关键难点是 mongosh 允许在**普通 function 里**同步读写 (`var p=db.x.findOne(...)`),
- * 但沙箱里 db 调用是 async 的, 不 await 就拿到 Promise (`p._id` 变 undefined 报错)。
- * 因此这里做一个轻量 async 改写:
- *   1. 每个**具名** `function foo(){}` 改成 `async function foo(){}`;
- *   2. 函数体内 / 顶层的 db. / db[ 调用一律加 await (所处函数已是 async, 合法);
- *   3. 对这些具名函数的**调用点**也加 await (`foo(...)` -> `await foo(...)`),
- *      这样 `db.x.findOne({k: encrypt(v)})` 里的 helper 调用也能拿到真实返回值,
- *      顶层 `foo(...)` 的写操作也能在脚本收尾前被收集。
- *
- * 只改具名 function + 顶层; 匿名/箭头函数体内的 db 调用维持不 await (避免在非 async
- * 作用域里插 await 造成语法错) —— 迁移脚本极少这么写。
+ * 主路径是 AST 版 (awaitifyViaAst); 解析不了时退回下面的字符扫描版。
  */
-function awaitifyDbCalls(code: string): string {
+export function awaitifyDbCalls(code: string): string {
+  return awaitifyViaAst(code) ?? awaitifyDbCallsScan(code);
+}
+
+/**
+ * 字符扫描版 (兜底): acorn 解析不了整段代码时用。
+ *   1. 每个**具名** `function foo(){}` 改成 `async function foo(){}`;
+ *   2. 函数体内 / 顶层的 db. / db[ 调用一律加 await;
+ *   3. 对这些具名函数的**调用点**也加 await。
+ * 只改具名 function + 顶层; 箭头函数体内不插 await (非 async 作用域里插会语法错)。
+ */
+function awaitifyDbCallsScan(code: string): string {
   const funcNames = collectFunctionNames(code);
   let out = "";
   let i = 0;
@@ -787,6 +1076,22 @@ const print = (...a) => { __out__.push(a.map(__fmt__).join(' ')); };
 const printjson = (x) => { __out__.push(JSON.stringify(x, null, 2)); };
 const __renderArgs__ = (args) =>
   args.map((a) => (a === undefined ? 'undefined' : JSON.stringify(a))).join(', ');
+// 串行版数组方法: awaitify 把含 db 调用的 arr.forEach(cb) 改写成 await __aForEach__(arr, cb),
+// 因为原生 forEach/map 不会等 async 回调 (顺序乱, 结果全是 Promise)。
+const __aForEach__ = async (arr, fn, thisArg) => { const a = Array.from(arr); for (let i = 0; i < a.length; i++) await fn.call(thisArg, a[i], i, a); };
+const __aMap__ = async (arr, fn, thisArg) => { const a = Array.from(arr); const r = []; for (let i = 0; i < a.length; i++) r.push(await fn.call(thisArg, a[i], i, a)); return r; };
+const __aFilter__ = async (arr, fn, thisArg) => { const a = Array.from(arr); const r = []; for (let i = 0; i < a.length; i++) { if (await fn.call(thisArg, a[i], i, a)) r.push(a[i]); } return r; };
+const __aSome__ = async (arr, fn, thisArg) => { const a = Array.from(arr); for (let i = 0; i < a.length; i++) { if (await fn.call(thisArg, a[i], i, a)) return true; } return false; };
+const __aEvery__ = async (arr, fn, thisArg) => { const a = Array.from(arr); for (let i = 0; i < a.length; i++) { if (!(await fn.call(thisArg, a[i], i, a))) return false; } return true; };
+const __aFind__ = async (arr, fn, thisArg) => { const a = Array.from(arr); for (let i = 0; i < a.length; i++) { if (await fn.call(thisArg, a[i], i, a)) return a[i]; } return undefined; };
+const __aFindIndex__ = async (arr, fn, thisArg) => { const a = Array.from(arr); for (let i = 0; i < a.length; i++) { if (await fn.call(thisArg, a[i], i, a)) return i; } return -1; };
+const __aFlatMap__ = async (arr, fn, thisArg) => (await __aMap__(arr, fn, thisArg)).flat(1);
+async function __aReduce__(arr, fn, ...rest) {
+  const a = Array.from(arr); let acc; let i = 0;
+  if (rest.length) acc = rest[0]; else { acc = a[0]; i = 1; }
+  for (; i < a.length; i++) acc = await fn(acc, a[i], i, a);
+  return acc;
+}
 const __ack__ = (method) => {
   if (method === 'insertOne') return { acknowledged: true, insertedId: { $oid: '0'.repeat(24) } };
   if (method === 'insertMany') return { acknowledged: true, insertedIds: {} };
@@ -862,6 +1167,13 @@ const __mkCursor__ = (render, baseMethod, baseArgs) => {
   const cur = new Proxy(function () {}, {
     get(_, m) {
       const mm = String(m);
+      // 让游标本身可 await: await db.coll.find({}) 直接拿文档数组
+      // (不实现 then 的话 await 会把它当 thenable 挂住, 永远不 resolve)
+      if (mm === 'then' || mm === 'catch' || mm === 'finally') {
+        const p = (async () => (await __runRead__(stmt())).documents.map(__hydrate__))();
+        const f = p[mm];
+        return typeof f === 'function' ? f.bind(p) : f;
+      }
       if (mm === 'toArray') return () => __thenableArray__((async () => (await __runRead__(stmt())).documents.map(__hydrate__))());
       if (mm === 'forEach') return async (fn) => { for (const d of (await __runRead__(stmt())).documents) fn(__hydrate__(d)); };
       if (mm === 'map') return (fn) => __thenableArray__((async () => (await __runRead__(stmt())).documents.map(__hydrate__).map(fn))());
@@ -884,6 +1196,10 @@ const __mkColl__ = (render) => new Proxy({}, {
     // find/aggregate 同步返回游标 (这样 .toArray() 能链上去再 await)
     if (method === 'find' || method === 'aggregate') {
       return (...args) => __mkCursor__(render, method, args);
+    }
+    // 索引巡检脚本常用: 走后端 listIndexes, 拿 mongosh 同款索引文档
+    if (method === 'getIndexes' || method === 'listIndexes') {
+      return async () => (await __runRead__(render + '.getIndexes()')).documents.map(__hydrate__);
     }
     // distinct 返回数组: 用 thenableArray 让 .distinct(...).map(...) 也能链式
     if (method === 'distinct') {
@@ -917,19 +1233,26 @@ const db = new Proxy({}, {
     }
     if (prop === 'getSiblingDB') return () => db;
     if (prop === 'getName') return () => '';
+    if (prop === 'getCollectionNames') {
+      return async () => (await __runRead__('db.getCollectionNames()')).documents.map((d) => d.name);
+    }
+    if (prop === 'getCollectionInfos') {
+      return async () => (await __runRead__('db.getCollectionInfos()')).documents;
+    }
     return __mkColl__('db.' + String(prop));
   },
 });
 let __err__ = null;
+let __value__ = undefined;
 try {
   // 包一层 async IIFE: 用户脚本里的顶层 return; 只从这里返回, 不会跳过下面的收尾
-  await (async () => {
+  __value__ = await (async () => {
 ${code}
   })();
 } catch (e) {
   __err__ = e && e.message ? String(e.message) : String(e);
 }
-return { ops: __ops__, output: __out__, error: __err__ };
+return { ops: __ops__, output: __out__, error: __err__, value: __value__ };
 `;
 
   try {
@@ -942,6 +1265,7 @@ return { ops: __ops__, output: __out__, error: __err__ };
       ops?: unknown;
       output?: unknown;
       error?: unknown;
+      value?: unknown;
     };
     const ops: ScriptOp[] = Array.isArray(result?.ops)
       ? result.ops.map((op) => {
@@ -957,7 +1281,7 @@ return { ops: __ops__, output: __out__, error: __err__ };
       ? result.output.map((s) => String(s))
       : [];
     const error = result?.error != null ? String(result.error) : null;
-    return { ops, output, error };
+    return { ops, output, error, value: result?.value };
   } catch (e) {
     // 编译/运行失败时, 用 acorn (纯 JS parser) 重新解析 fullContent, 精确定位行列号.
     // V8 的 new AsyncFunction 编译错时不在 message 里带位置, acorn 的 SyntaxError 带

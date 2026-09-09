@@ -567,6 +567,24 @@ export const useEditorStore = defineStore("editor", () => {
   }
 
   /**
+   * 脚本最后一个表达式 -> 结果文档列表; 不适合当结果 (undefined / 空数组 / 标量) 返回 null。
+   * 对象数组直接当文档; 单个对象包成一条; 标量数组包成 `{ value }`。
+   */
+  function scriptValueDocs(value: unknown): Record<string, unknown>[] | null {
+    if (value === undefined || value === null) return null;
+    if (Array.isArray(value)) {
+      if (value.length === 0) return null;
+      return value.map((v) =>
+        v !== null && typeof v === "object" && !Array.isArray(v)
+          ? (v as Record<string, unknown>)
+          : { value: v },
+      );
+    }
+    if (typeof value === "object") return [value as Record<string, unknown>];
+    return null;
+  }
+
+  /**
    * 脚本模式执行: 命令式脚本在 webview JS 引擎里跑一遍 ——
    * db 读操作真发后端拿数据, 写操作收集后批量执行, print() 输出捕获展示。
    *
@@ -601,7 +619,7 @@ export const useEditorStore = defineStore("editor", () => {
         return { documents: res.documents, count: res.count };
       };
       const codeToRun = execCode ?? tab.content;
-      const { ops, output, error } = await collectScriptOps(codeToRun, loadedHelpers, runRead);
+      const { ops, output, error, value } = await collectScriptOps(codeToRun, loadedHelpers, runRead);
       if (rt.aborted) return;
 
       if (error) {
@@ -640,6 +658,20 @@ export const useEditorStore = defineStore("editor", () => {
 
       // print() 输出单独进 Console 结果页
       if (output.length > 0) appendConsole(tab, output);
+
+      // 脚本最后一个表达式的值 (mongosh 习惯: 末尾写 `results;` 就把它当结果看) ->
+      // 直接当结果文档展示, 比只给一句"写操作 0 条"有用得多
+      const valueDocs = scriptValueDocs(value);
+      if (valueDocs) {
+        rt.result = {
+          documents: valueDocs,
+          count: valueDocs.length,
+          totalCount: valueDocs.length,
+          executionTimeMs: Date.now() - start,
+        };
+        tab.activeResultTabId = rt.id;
+        return;
+      }
 
       // 结果文档: 写操作汇总
       const doc: Record<string, unknown> = {};

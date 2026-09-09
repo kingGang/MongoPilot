@@ -17,6 +17,7 @@ import { useDatabaseStore } from "@/stores/database";
 import * as aiApi from "@/api/ai";
 import { formatMongoShell } from "@/utils/mongo-format";
 import { editorSettings } from "@/utils/editor-settings";
+import { needsPreEvaluation } from "@/utils/query-preeval";
 import { Parser } from "acorn";
 
 const props = defineProps<{
@@ -534,6 +535,28 @@ function extractRange(
   return parts.join("\n");
 }
 
+/** `use x` / `show y` 不是合法 JS, 换成空行 (保持行号) 再交给 acorn */
+function maskMongoshLines(content: string): string {
+  return content
+    .split("\n")
+    .map((line) => (/^\s*(use|show)\s+\S/.test(line) ? "" : line))
+    .join("\n");
+}
+
+/** 整段按 JS 解析: 合法返回 null, 否则返回 acorn 的 SyntaxError (带 loc/pos) */
+function parseWholeScript(content: string): (Error & { loc?: { line: number; column: number } }) | null {
+  try {
+    Parser.parse(maskMongoshLines(content), {
+      ecmaVersion: "latest",
+      allowAwaitOutsideFunction: true,
+      allowReturnOutsideFunction: true,
+    });
+    return null;
+  } catch (e) {
+    return e as Error & { loc?: { line: number; column: number } };
+  }
+}
+
 function lintContent() {
   if (!editor) return;
   const model = editor.getModel();
@@ -549,14 +572,41 @@ function lintContent() {
   const lines = content.split("\n");
   const markers: monaco.editor.IMarkerData[] = [];
 
-  // 先检查非语句行（不以 db./use 开头且不是续行）
-  const statements = parseStatements(content);
-
   // 检查空内容
   if (!content.trim()) {
     monaco.editor.setModelMarkers(model, "mongo-lint", []);
     return;
   }
+
+  // 整段本来就是合法 JS (单条 db 语句 / 整段脚本都算) -> acorn 都过了就没什么可挑的。
+  // 下面那套行级启发式 ("必须以 db. 开头") 遇到真实脚本 (Object.keys(x).forEach(...) /
+  // 嵌套回调 / 多行字符串) 会满屏误报, 所以先短路掉。
+  const scriptErr = parseWholeScript(content);
+  if (!scriptErr) {
+    monaco.editor.setModelMarkers(model, "mongo-lint", []);
+    return;
+  }
+  // 脚本模式 (有 function/const/... 或 load()): 只报 acorn 指出的那一处真语法错,
+  // 不做"必须以 db. 开头"的行级判定 —— 脚本里绝大多数行本来就不是 db 语句。
+  if (needsPreEvaluation(content)) {
+    const line = scriptErr.loc?.line ?? lines.length;
+    const col = (scriptErr.loc?.column ?? 0) + 1;
+    const lineText = lines[line - 1] ?? "";
+    monaco.editor.setModelMarkers(model, "mongo-lint", [
+      {
+        severity: monaco.MarkerSeverity.Error,
+        message: `语法错误: ${scriptErr.message.replace(/\s*\(\d+:\d+\)$/, "")}`,
+        startLineNumber: line,
+        startColumn: col,
+        endLineNumber: line,
+        endColumn: Math.max(col + 1, lineText.length + 1),
+      },
+    ]);
+    return;
+  }
+
+  // 先检查非语句行（不以 db./use 开头且不是续行）
+  const statements = parseStatements(content);
 
   // 标记哪些行属于某个语句或注释
   const coveredLines = new Set<number>();

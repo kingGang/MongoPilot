@@ -337,6 +337,28 @@ pub async fn execute_shell_query(
         });
     }
 
+    // db.getCollectionNames() / db.getCollectionInfos() —— 巡检脚本常用
+    if query.starts_with("getCollectionNames(") || query.starts_with("getCollectionInfos(") {
+        let infos = query.starts_with("getCollectionInfos(");
+        let names = db
+            .list_collection_names()
+            .await
+            .map_err(AppError::Mongo)?;
+        let documents: Vec<Document> = names
+            .into_iter()
+            .map(|n| if infos { doc! { "name": n, "type": "collection" } } else { doc! { "name": n } })
+            .collect();
+        let count = documents.len() as i64;
+        let elapsed = start.elapsed().as_millis() as i64;
+        return Ok(QueryResult {
+            documents,
+            count,
+            total_count: count,
+            execution_time_ms: elapsed,
+            pending_count: None,
+        });
+    }
+
     // 支持 db.getCollection("name.with.dots").method() 和 db.collName.method()
     let (collection_name, rest) = if query.starts_with("getCollection(") {
         // db.getCollection("system.version").find({})
@@ -393,6 +415,8 @@ pub async fn execute_shell_query(
         execute_create_index(&collection, rest).await?
     } else if rest.starts_with("dropIndex(") {
         execute_drop_index(&collection, rest).await?
+    } else if rest.starts_with("getIndexes(") || rest.starts_with("listIndexes(") {
+        execute_get_indexes(&db, &collection_name).await?
     } else {
         return Err(AppError::InvalidInput(format!("不支持的操作: {rest}")));
     };
@@ -643,6 +667,33 @@ async fn execute_aggregate(
 }
 
 // ---- distinct ----
+
+/// `db.coll.getIndexes()` —— 走 listIndexes 命令, 返回和 mongosh 一样的索引文档
+/// (`{v, key, name, unique, ...}`), 巡检脚本靠它比对声明与实际索引。
+async fn execute_get_indexes(
+    db: &mongodb::Database,
+    collection_name: &str,
+) -> Result<QueryResult, AppError> {
+    let result = db
+        .run_command(doc! { "listIndexes": collection_name })
+        .await
+        .map_err(AppError::Mongo)?;
+    // { cursor: { firstBatch: [ {...}, ... ] } }; 索引上限 64 个, 一批就够, 不翻页
+    let documents: Vec<Document> = result
+        .get_document("cursor")
+        .ok()
+        .and_then(|c| c.get_array("firstBatch").ok())
+        .map(|arr| arr.iter().filter_map(|b| b.as_document().cloned()).collect())
+        .unwrap_or_default();
+    let count = documents.len() as i64;
+    Ok(QueryResult {
+        documents,
+        count,
+        total_count: count,
+        execution_time_ms: 0,
+        pending_count: None,
+    })
+}
 
 async fn execute_distinct(
     collection: &mongodb::Collection<Document>,
