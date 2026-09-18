@@ -151,6 +151,8 @@ pub fn run() {
             commands::script::import_script_files,
             commands::script::import_script_directory,
             commands::updater::check_for_updates,
+            commands::updater::download_update,
+            commands::updater::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

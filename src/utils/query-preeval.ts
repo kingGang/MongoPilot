@@ -17,14 +17,18 @@ import { Parser } from "acorn";
 
 /** shell 类型 / Node Buffer 的 stub —— 预求值和脚本模式共用 */
 const TYPE_STUBS = `
-const ObjectId = (x) => ({ $oid: x === undefined || x === null ? '0'.repeat(24) : String(x) });
-const ISODate = (x) => ({ $date: x === undefined || x === null ? new Date().toISOString() : String(x) });
-const NumberLong = (x) => ({ $numberLong: String(x) });
-const NumberInt = (x) => Number(x);
-const NumberDecimal = (x) => ({ $numberDecimal: String(x) });
-const Double = (x) => Number(x);
+// 一律用 function 而不是箭头: mongosh 里 new 可有可无 (new ISODate() / new ObjectId()),
+// 箭头函数不能当构造器, 会报 "is not a constructor"。
+// 返回对象的构造器带不带 new 结果都一样; 返回数字的用 new.target 包一层 Number 对象
+// (JSON.stringify 出来仍是裸数字)。
+function ObjectId(x) { return { $oid: x === undefined || x === null ? '0'.repeat(24) : String(x) }; }
+function ISODate(x) { return { $date: x === undefined || x === null ? new Date().toISOString() : String(x) }; }
+function NumberLong(x) { return { $numberLong: String(x === undefined || x === null ? 0 : x) }; }
+function NumberInt(x) { const n = Number(x === undefined || x === null ? 0 : x); return new.target ? Object(n) : n; }
+function NumberDecimal(x) { return { $numberDecimal: String(x === undefined || x === null ? 0 : x) }; }
+function Double(x) { const n = Number(x === undefined || x === null ? 0 : x); return new.target ? Object(n) : n; }
 // mongosh 的 UUID(): 无参随机生成, 带 .hex() / .toString(); JSON 化时输出 {$uuid:...}
-const UUID = (x) => {
+function UUID(x) {
   let hex;
   if (x === undefined || x === null) {
     hex = '';
@@ -34,7 +38,7 @@ const UUID = (x) => {
   }
   const dashed = hex.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
   return { $uuid: dashed, hex: () => hex, toString: () => dashed };
-};
+}
 // 浏览器没有 Node 的 Buffer; 给一个最小实现, 覆盖 utf8 / base64 / hex 互转
 const Buffer = {
   from(input, encoding) {
@@ -67,6 +71,18 @@ const Buffer = {
   },
 };
 `;
+
+/**
+ * `JSON.stringify`, 但把 Date 实例渲染成 BSON 的 `{"$date": ...}`。
+ * 默认的 stringify 会先调 Date.prototype.toJSON 变成普通字符串, 回灌到后端就
+ * 存成了 String —— `{$set: {t: new Date()}}` 写进去不是日期。
+ */
+function stringifyKeepDates(value: unknown): string {
+  return JSON.stringify(value, function (this: Record<string, unknown>, key: string, val: unknown) {
+    const raw = this[key];
+    return raw instanceof Date ? { $date: raw.toISOString() } : val;
+  });
+}
 
 /** preEvaluateStatement 用的完整 prelude: 类型 stub + load/print/printjson 空操作 */
 const PRELUDE = `
@@ -443,7 +459,7 @@ ${statement}
   }
 
   const renderArgs = (args: unknown[]) =>
-    args.map((a) => (a === undefined ? "undefined" : JSON.stringify(a))).join(", ");
+    args.map((a) => (a === undefined ? "undefined" : stringifyKeepDates(a))).join(", ");
 
   let rebuilt = `${c.collRender}.${c.method}(${renderArgs(c.args)})`;
   for (const ch of c.chain) {
@@ -1074,8 +1090,13 @@ const __ops__ = [];
 const __fmt__ = (x) => (typeof x === 'object' && x !== null ? JSON.stringify(x) : String(x));
 const print = (...a) => { __out__.push(a.map(__fmt__).join(' ')); };
 const printjson = (x) => { __out__.push(JSON.stringify(x, null, 2)); };
+// Date 实例要渲染成 {$date}, 否则 JSON.stringify 把它变成普通字符串, 查询条件就对不上了
+const __keepDates__ = function (key, val) {
+  const raw = this[key];
+  return raw instanceof Date ? { $date: raw.toISOString() } : val;
+};
 const __renderArgs__ = (args) =>
-  args.map((a) => (a === undefined ? 'undefined' : JSON.stringify(a))).join(', ');
+  args.map((a) => (a === undefined ? 'undefined' : JSON.stringify(a, __keepDates__))).join(', ');
 // 串行版数组方法: awaitify 把含 db 调用的 arr.forEach(cb) 改写成 await __aForEach__(arr, cb),
 // 因为原生 forEach/map 不会等 async 回调 (顺序乱, 结果全是 Promise)。
 const __aForEach__ = async (arr, fn, thisArg) => { const a = Array.from(arr); for (let i = 0; i < a.length; i++) await fn.call(thisArg, a[i], i, a); };
@@ -1346,7 +1367,7 @@ return { ops: __ops__, output: __out__, error: __err__, value: __value__ };
 /** 把收集到的脚本操作渲染成后端能执行的 `db.coll.method(JSON...)` 语句 */
 export function scriptOpToStatement(op: ScriptOp): string {
   const renderArgs = op.args
-    .map((a) => (a === undefined ? "undefined" : JSON.stringify(a)))
+    .map((a) => (a === undefined ? "undefined" : stringifyKeepDates(a)))
     .join(", ");
   return `${op.collRender}.${op.method}(${renderArgs})`;
 }

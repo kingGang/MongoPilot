@@ -1514,46 +1514,58 @@ fn convert_shell_types(s: &str) -> String {
 }
 
 /// 尝试从 chars[pos..] 匹配 MongoDB Shell 类型，返回 (替换文本, 消耗的字符数)
+/// 标识符字符 —— 判断构造器名前面是不是粘着别的标识符 (`myDate(` 不该当成 `Date(`)
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$' || c == '.'
+}
+
+/// 当前时刻的 RFC3339 (UTC, 毫秒) —— 无参的 `new Date()` / `ISODate()` 用
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 fn try_match_shell_type(chars: &[char], pos: usize, len: usize) -> Option<(String, usize)> {
-    let remaining: String = chars[pos..std::cmp::min(pos + 20, len)].iter().collect();
+    // 构造器名前面粘着标识符时不算匹配 (`myObjectId(` / `updateDate(` 不能被改写)
+    if pos > 0 && is_ident_char(chars[pos - 1]) {
+        return None;
+    }
 
-    // 匹配的类型列表
-    let type_names: &[(&str, &str)] = &[
-        ("ObjectId(", "$oid"),
-        ("ISODate(", "$date"),
-        ("NumberLong(", "$numberLong"),
-        ("NumberDecimal(", "$numberDecimal"),
-    ];
+    let remaining: String = chars[pos..std::cmp::min(pos + 24, len)].iter().collect();
 
-    // new Date("...")
-    if remaining.starts_with("new ") {
-        let after_new: String = chars[pos + 4..std::cmp::min(pos + 20, len)]
-            .iter()
-            .collect();
-        if after_new.starts_with("Date(") {
-            let paren_start = pos + 9; // "new Date(" = 9 chars
-            if let Some((arg, end)) = extract_paren_arg(chars, paren_start, len) {
-                let val = arg.trim().trim_matches(|c| c == '"' || c == '\'');
-                return Some((format!("{{\"$date\": \"{val}\"}}"), end - pos));
+    // `new Xxx(...)`: mongosh 里 new 可有可无 (new Date() / new ISODate() / new ObjectId()),
+    // 跳过 `new` + 空白后按同一套构造器规则处理 —— 以前只认 `new Date(`,
+    // `new ISODate()` 会把裸 `new` 留在 JSON 里, 报 "expected ident".
+    if remaining.starts_with("new") && !matches!(chars.get(pos + 3), Some(c) if is_ident_char(*c)) {
+        let mut j = pos + 3;
+        while j < len && chars[j].is_whitespace() {
+            j += 1;
+        }
+        if j > pos + 3 {
+            if let Some((replacement, consumed)) = try_match_shell_type(chars, j, len) {
+                return Some((replacement, (j - pos) + consumed));
             }
         }
     }
 
-    // NumberInt(42) → 直接输出数字
-    if remaining.starts_with("NumberInt(") {
-        let paren_start = pos + 10;
-        if let Some((arg, end)) = extract_paren_arg(chars, paren_start, len) {
-            let val = arg.trim().trim_matches(|c| c == '"' || c == '\'');
-            return Some((val.to_string(), end - pos));
-        }
-    }
+    // 输出成 Extended JSON 的构造器
+    let type_names: &[(&str, &str)] = &[
+        ("ObjectId(", "$oid"),
+        ("ISODate(", "$date"),
+        ("Date(", "$date"),
+        ("NumberLong(", "$numberLong"),
+        ("NumberDecimal(", "$numberDecimal"),
+    ];
+    // 输出成裸数字的构造器
+    let numeric_names: &[&str] = &["NumberInt(", "Double("];
 
-    // Double("3.4") / Double(3.4) → 直接输出数字 (serde_json 会当成 f64 解析)
-    if remaining.starts_with("Double(") {
-        let paren_start = pos + 7;
-        if let Some((arg, end)) = extract_paren_arg(chars, paren_start, len) {
-            let val = arg.trim().trim_matches(|c| c == '"' || c == '\'');
-            return Some((val.to_string(), end - pos));
+    for prefix in numeric_names {
+        if remaining.starts_with(prefix) {
+            let paren_start = pos + prefix.len();
+            if let Some((arg, end)) = extract_paren_arg(chars, paren_start, len) {
+                let val = arg.trim().trim_matches(|c| c == '"' || c == '\'');
+                let val = if val.is_empty() { "0" } else { val };
+                return Some((val.to_string(), end - pos));
+            }
         }
     }
 
@@ -1562,6 +1574,16 @@ fn try_match_shell_type(chars: &[char], pos: usize, len: usize) -> Option<(Strin
             let paren_start = pos + prefix.len();
             if let Some((arg, end)) = extract_paren_arg(chars, paren_start, len) {
                 let val = arg.trim().trim_matches(|c| c == '"' || c == '\'');
+                // 无参构造: ISODate()/Date() = 此刻, ObjectId() = 新生成 (跟 mongosh 一致)
+                let val = if val.is_empty() {
+                    match *ejson_key {
+                        "$date" => now_rfc3339(),
+                        "$oid" => mongodb::bson::oid::ObjectId::new().to_hex(),
+                        _ => "0".to_string(),
+                    }
+                } else {
+                    val.to_string()
+                };
                 return Some((format!("{{\"{ejson_key}\": \"{val}\"}}"), end - pos));
             }
         }
@@ -1891,6 +1913,75 @@ mod tests {
     fn convert_new_date() {
         let result = convert_shell_types(r#"{date: new Date("2024-01-01")}"#);
         assert!(result.contains(r#"{"$date": "2024-01-01"}"#));
+    }
+
+    /// `new ISODate()` 以前只认 `new Date(`, 裸 `new` 会被留在 JSON 里 → "expected ident"
+    #[test]
+    fn convert_new_prefix_for_all_ctors() {
+        for (src, expect) in [
+            (r#"{d: new ISODate("2024-01-01")}"#, r#"{"$date": "2024-01-01"}"#),
+            (r#"{_id: new ObjectId("abc123")}"#, r#"{"$oid": "abc123"}"#),
+            (r#"{n: new NumberLong("123")}"#, r#"{"$numberLong": "123"}"#),
+        ] {
+            let result = convert_shell_types(src);
+            assert!(result.contains(expect), "{src} -> {result}");
+            assert!(!result.contains("new"), "残留 new: {result}");
+        }
+    }
+
+    /// 无参构造: ISODate()/new Date() = 此刻, ObjectId() = 新生成
+    #[test]
+    fn convert_empty_ctor_args() {
+        for src in [
+            r#"{t: ISODate()}"#,
+            r#"{t: new ISODate()}"#,
+            r#"{t: new Date()}"#,
+            r#"{t: Date()}"#,
+        ] {
+            let result = convert_shell_types(src);
+            assert!(result.contains(r#""$date""#), "{src} -> {result}");
+            // 不能留下空日期, 否则 BSON 解析报错
+            assert!(!result.contains(r#""$date": """#), "{src} -> {result}");
+            assert!(result.contains("T") && result.contains("Z"), "{src} -> {result}");
+        }
+
+        let oid = convert_shell_types(r#"{_id: ObjectId()}"#);
+        assert!(oid.contains(r#""$oid""#), "{oid}");
+        assert!(!oid.contains(r#""$oid": """#), "{oid}");
+
+        assert!(convert_shell_types(r#"{n: NumberInt()}"#).contains('0'));
+    }
+
+    /// 构造器名粘在别的标识符后面时不能改写 (字段名叫 updateDate / myObjectId 之类)
+    #[test]
+    fn ctor_needs_identifier_boundary() {
+        for src in [
+            r#"{v: updateDate("2024-01-01")}"#,
+            r#"{v: myObjectId("abc")}"#,
+            r#"{v: a.ISODate("x")}"#,
+        ] {
+            let result = convert_shell_types(src);
+            assert!(!result.contains("$date"), "{src} -> {result}");
+            assert!(!result.contains("$oid"), "{src} -> {result}");
+        }
+    }
+
+    /// 完整复现用户那条语句: 点号字段名 + new ISODate() 一起用
+    #[test]
+    fn update_with_dotted_keys_and_new_isodate_parses() {
+        let src = r#"{
+    $set: {
+      playerId: "65c3312c97f568b92c11d6f2",
+      "tokenInfo.owner": "cfx:aamzekx",
+      updateAt: new ISODate()
+    }
+  }"#;
+        let cleaned = strip_trailing_commas(&relax_json(&convert_shell_types(&strip_comments(src))));
+        let doc: Document = serde_json::from_str(&cleaned)
+            .unwrap_or_else(|e| panic!("应能解析: {e}\n{cleaned}"));
+        let set = doc.get_document("$set").unwrap();
+        assert_eq!(set.get_str("tokenInfo.owner").unwrap(), "cfx:aamzekx");
+        assert!(set.get("updateAt").is_some());
     }
 
     #[test]

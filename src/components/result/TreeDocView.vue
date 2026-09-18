@@ -144,6 +144,16 @@ watch(
 const expanded = ref<Set<string>>(new Set());
 const selectedPath = ref<string | null>(null);
 
+// 新结果到达 (执行 / 翻页 / 刷新): 默认展开第一条 —— 跑完查询基本都是先看第一条
+// 长什么样, 每次都手动点开一下太烦。其余仍保持折叠, 免得几十条一起铺开。
+watch(
+  () => props.documents,
+  (docs) => {
+    expanded.value = docs.length > 0 ? new Set(["doc:0"]) : new Set();
+  },
+  { immediate: true },
+);
+
 // 值详情 (ValueDetail 弹窗)
 const showDetail = ref(false);
 const detailField = ref("");

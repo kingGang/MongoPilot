@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onBeforeUnmount } from "vue";
 import {
   NLayout, NLayoutSider, NLayoutContent, NMessageProvider, NSplit, NModal, NIcon,
-  NInput, NTree, NButton, useMessage,
+  NInput, NTree, NButton, NProgress, useMessage,
 } from "naive-ui";
 import { h, type VNodeChild } from "vue";
 import {
@@ -47,7 +47,14 @@ import { useAiStore } from "@/stores/ai";
 import { createDefaultConnection } from "@/types/connection";
 import type { ConnectionConfig } from "@/types/connection";
 import type { EditorTab } from "@/types/database";
-import { checkForUpdates, type UpdateInfo } from "@/api/updater";
+import {
+  checkForUpdates,
+  downloadUpdate,
+  installUpdate,
+  type UpdateInfo,
+  type DownloadProgress,
+} from "@/api/updater";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 
 const connStore = useConnectionStore();
@@ -402,6 +409,21 @@ const updateInfo = ref<UpdateInfo | null>(null);
 const showUpdateModal = ref(false);
 const checkingUpdate = ref(false);
 const downloadingUpdate = ref(false);
+const installingUpdate = ref(false);
+/** 下载进度 (字节); total = 0 表示服务端没给长度 */
+const updateProgress = ref<DownloadProgress>({ downloaded: 0, total: 0 });
+/** 下载完成后的本地安装包路径 */
+const downloadedInstaller = ref<string | null>(null);
+
+const updatePercent = computed(() => {
+  const { downloaded, total } = updateProgress.value;
+  if (!total) return 0;
+  return Math.min(100, Math.round((downloaded / total) * 100));
+});
+
+function mb(bytes: number): string {
+  return (bytes / 1024 / 1024).toFixed(1);
+}
 
 /** 短版 markdown → 纯文本 (只处理换行/#/* 之类, 不引全套 markdown parser) */
 function shortenNotes(notes: string, maxLines = 15): string {
@@ -427,18 +449,54 @@ async function doCheckUpdate(opts: { silent: boolean }) {
   }
 }
 
+/**
+ * 应用内下载安装包 (带进度)。
+ * 该平台在这个 release 里没有对应安装包时 (例如 CI 某个平台构建挂了),
+ * 退回浏览器打开发布页, 让用户自己挑。
+ */
 async function handleDownloadUpdate() {
-  if (!updateInfo.value) return;
-  const url = updateInfo.value.assetUrl || updateInfo.value.releaseUrl;
+  const info = updateInfo.value;
+  if (!info) return;
+  if (!info.assetUrl || !info.assetName) {
+    try {
+      await openUrl(info.releaseUrl);
+      msg.info("该版本没有当前平台的安装包, 已打开发布页");
+      showUpdateModal.value = false;
+    } catch (e) {
+      msg.error(`打开发布页失败: ${e}`);
+    }
+    return;
+  }
+
   downloadingUpdate.value = true;
+  updateProgress.value = { downloaded: 0, total: info.assetSize ?? 0 };
+  let unlisten: UnlistenFn | null = null;
   try {
-    await openUrl(url);
-    msg.info("已在浏览器打开下载, 下载完成后运行安装包即可覆盖升级");
-    showUpdateModal.value = false;
+    unlisten = await listen<DownloadProgress>("update-download-progress", (ev) => {
+      updateProgress.value = ev.payload;
+    });
+    downloadedInstaller.value = await downloadUpdate(info.assetUrl, info.assetName);
+    msg.success("下载完成, 点「立即安装」开始升级");
   } catch (e) {
-    msg.error(`打开下载失败: ${e}`);
+    downloadedInstaller.value = null;
+    msg.error(`下载失败: ${e}`);
   } finally {
+    if (unlisten) unlisten();
     downloadingUpdate.value = false;
+  }
+}
+
+/** 启动安装程序 —— Windows 上应用会自动退出 (占用着文件装不上) */
+async function handleInstallUpdate() {
+  const path = downloadedInstaller.value;
+  if (!path) return;
+  installingUpdate.value = true;
+  try {
+    await installUpdate(path);
+    msg.info("安装程序已启动, MongoPilot 即将退出");
+  } catch (e) {
+    msg.error(`启动安装程序失败: ${e}`);
+    installingUpdate.value = false;
   }
 }
 
@@ -1025,20 +1083,50 @@ function handleMenuAction(key: string) {
           <pre>{{ shortenNotes(updateInfo.notes) }}</pre>
         </div>
         <div v-else style="color: #999; font-size: 13px">该版本无更新日志</div>
+        <div v-if="!updateInfo.assetUrl" style="color: #d97706; font-size: 12px; margin-top: 10px">
+          该版本没有当前平台的安装包 (发布构建可能失败了), 只能去发布页手动下载。
+        </div>
+        <div v-if="downloadingUpdate || downloadedInstaller" style="margin-top: 12px">
+          <n-progress
+            type="line"
+            :percentage="downloadedInstaller ? 100 : updatePercent"
+            :status="downloadedInstaller ? 'success' : 'default'"
+            :height="14"
+            indicator-placement="inside"
+          />
+          <div style="font-size: 12px; color: #666; margin-top: 4px">
+            <span v-if="downloadingUpdate">
+              下载中... {{ mb(updateProgress.downloaded) }} MB
+              <template v-if="updateProgress.total"> / {{ mb(updateProgress.total) }} MB</template>
+            </span>
+            <span v-else>已下载到临时目录, 点「立即安装」启动安装程序 (应用会自动退出)</span>
+          </div>
+        </div>
       </template>
       <template #action>
         <div style="display: flex; justify-content: flex-end; gap: 8px">
-          <n-button size="small" @click="showUpdateModal = false">稍后</n-button>
+          <n-button size="small" :disabled="downloadingUpdate" @click="showUpdateModal = false">
+            稍后
+          </n-button>
           <n-button size="small" @click="handleViewReleasePage">查看详情</n-button>
           <n-button
-            v-if="updateInfo"
+            v-if="downloadedInstaller"
+            size="small"
+            type="primary"
+            :loading="installingUpdate"
+            @click="handleInstallUpdate"
+          >
+            立即安装
+          </n-button>
+          <n-button
+            v-else-if="updateInfo"
             size="small"
             type="primary"
             :loading="downloadingUpdate"
             :disabled="!updateInfo.assetUrl && !updateInfo.releaseUrl"
             @click="handleDownloadUpdate"
           >
-            {{ updateInfo.assetUrl ? "下载安装包" : "打开发布页" }}
+            {{ updateInfo.assetUrl ? "下载并安装" : "打开发布页" }}
           </n-button>
         </div>
       </template>

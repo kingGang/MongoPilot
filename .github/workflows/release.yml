@@ -74,12 +74,38 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build Tauri bundle
+        id: build
+        uses: tauri-apps/tauri-action@v0
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: 'MongoPilot ${{ github.event.inputs.tag || github.ref_name }}'
+          releaseBody: ${{ github.event.head_commit.message }}
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      # 打包器 (NSIS / WiX) 是构建时现下载的, GitHub 偶发 5xx 会让整个 release
+      # 少掉一个平台的安装包 (v0.1.41 的 Windows 包就是这么丢的)。
+      # Rust 编译产物已被 cache 命中, 重试基本只重跑打包, 代价很小。
+      - name: Build Tauri bundle (retry)
+        id: build_retry
+        if: steps.build.outcome == 'failure'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: 'MongoPilot ${{ github.event.inputs.tag || github.ref_name }}'
+          releaseBody: ${{ github.event.head_commit.message }}
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Fail if both attempts failed
+        if: steps.build.outcome == 'failure' && steps.build_retry.outcome != 'success'
+        run: |
+          echo "tauri build failed twice - see logs above"
+          exit 1

@@ -1,9 +1,15 @@
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter};
+use tokio::io::AsyncWriteExt;
 
 use crate::error::AppError;
 
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/kingGang/MongoPilot/releases/latest";
+
+/// 只允许下载本仓库 Release 下的资源 —— URL 是前端传回来的, 不能拿来下任意文件
+const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/kingGang/MongoPilot/releases/download/";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,6 +146,176 @@ pub async fn check_for_updates(app_handle: tauri::AppHandle) -> Result<UpdateInf
     })
 }
 
+/// 下载进度事件 `update-download-progress` 的载荷
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgress {
+    downloaded: u64,
+    /// 0 表示服务端没给 Content-Length
+    total: u64,
+}
+
+/// 下载安装包到临时目录, 边下边 emit `update-download-progress`; 返回本地文件路径。
+#[tauri::command]
+pub async fn download_update(
+    app: AppHandle,
+    url: String,
+    file_name: String,
+) -> Result<String, AppError> {
+    if !url.starts_with(RELEASE_DOWNLOAD_PREFIX) {
+        return Err(AppError::InvalidInput(
+            "下载地址不是 MongoPilot 的 Release 资源, 已拒绝".into(),
+        ));
+    }
+    // 只取最后一段文件名, 防目录穿越
+    let safe_name = std::path::Path::new(&file_name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("MongoPilot-update")
+        .to_string();
+
+    let dir = std::env::temp_dir().join("MongoPilot-update");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| AppError::InvalidInput(format!("创建下载目录失败: {e}")))?;
+    let path = dir.join(&safe_name);
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        // 安装包上百 MB, 不设总超时, 靠连接超时兜底
+        .build()
+        .map_err(|e| AppError::Connection(format!("HTTP 客户端初始化失败: {e}")))?;
+
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "MongoPilot-Updater")
+        .send()
+        .await
+        .map_err(|e| AppError::Connection(format!("下载失败: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(AppError::Connection(format!(
+            "下载失败: HTTP {}",
+            resp.status()
+        )));
+    }
+
+    let total = resp.content_length().unwrap_or(0);
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| AppError::InvalidInput(format!("写入下载文件失败: {e}")))?;
+
+    let mut downloaded: u64 = 0;
+    let mut last_emit: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AppError::Connection(format!("下载中断: {e}")))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| AppError::InvalidInput(format!("写入下载文件失败: {e}")))?;
+        downloaded += chunk.len() as u64;
+        // 每 512KB 报一次, 别把事件通道刷爆
+        if downloaded - last_emit >= 512 * 1024 {
+            last_emit = downloaded;
+            let _ = app.emit("update-download-progress", DownloadProgress { downloaded, total });
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|e| AppError::InvalidInput(format!("写入下载文件失败: {e}")))?;
+    drop(file);
+
+    if total > 0 && downloaded != total {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(AppError::Connection(format!(
+            "下载不完整 ({downloaded}/{total} 字节), 请重试"
+        )));
+    }
+    let _ = app.emit(
+        "update-download-progress",
+        DownloadProgress {
+            downloaded,
+            total: total.max(downloaded),
+        },
+    );
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 启动下载好的安装程序。
+/// Windows: 直接跑 setup.exe (msi 走 msiexec), 然后退出自己 —— 不退出的话文件被占用装不上;
+/// macOS: `open` 打开 dmg, 用户拖进 Applications;
+/// Linux: AppImage 加可执行位后打开所在目录 (发行版装法不一, 不代劳)。
+#[tauri::command]
+pub async fn install_update(app: AppHandle, path: String) -> Result<(), AppError> {
+    let p = std::path::PathBuf::from(&path);
+    if !p.exists() {
+        return Err(AppError::NotFound("安装包不存在, 请重新下载".into()));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        /// 独立进程组: 本进程退出后安装程序继续活着
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+        let ext = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let mut cmd = if ext == "msi" {
+            let mut c = std::process::Command::new("msiexec");
+            c.arg("/i").arg(&p);
+            c
+        } else {
+            std::process::Command::new(&p)
+        };
+        cmd.creation_flags(DETACHED_PROCESS);
+        cmd.spawn()
+            .map_err(|e| AppError::InvalidInput(format!("启动安装程序失败: {e}")))?;
+
+        // 等安装程序窗口起来再退出自己
+        let handle = app.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            handle.exit(0);
+        });
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = &app;
+        std::process::Command::new("open")
+            .arg(&p)
+            .spawn()
+            .map_err(|e| AppError::InvalidInput(format!("打开安装包失败: {e}")))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = &app;
+        // AppImage 下载下来没有可执行位, 先补上
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&p) {
+                let mut perm = meta.permissions();
+                perm.set_mode(perm.mode() | 0o111);
+                let _ = std::fs::set_permissions(&p, perm);
+            }
+        }
+        let dir = p.parent().unwrap_or(&p).to_path_buf();
+        std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| AppError::InvalidInput(format!("打开下载目录失败: {e}")))?;
+        return Ok(());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +328,23 @@ mod tests {
         assert!(!is_newer("0.1.27", "0.1.27"));
         assert!(!is_newer("0.1.27", "0.1.28"));
         assert!(!is_newer("0.1.5", "0.1.10"));
+    }
+
+    #[test]
+    fn only_repo_release_urls_allowed() {
+        assert!(RELEASE_DOWNLOAD_PREFIX.starts_with("https://github.com/kingGang/MongoPilot/"));
+        // download_update 的第一道闸: 非本仓库 Release 前缀一律拒绝
+        for bad in [
+            "https://evil.example.com/setup.exe",
+            "https://github.com/other/repo/releases/download/v1/setup.exe",
+            "http://github.com/kingGang/MongoPilot/releases/download/v1/setup.exe",
+        ] {
+            assert!(!bad.starts_with(RELEASE_DOWNLOAD_PREFIX), "应拒绝: {bad}");
+        }
+        assert!(
+            "https://github.com/kingGang/MongoPilot/releases/download/v0.1.41/MongoPilot_0.1.41_x64-setup.exe"
+                .starts_with(RELEASE_DOWNLOAD_PREFIX)
+        );
     }
 
     #[test]
